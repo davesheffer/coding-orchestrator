@@ -25,14 +25,16 @@ copied into that home or into this repository.
 | Claude native installation diagnostic | Passed; exit 0 | `claude doctor` reported no installation issues using the disposable `CLAUDE_CONFIG_DIR`; authenticated policy checks were unavailable in that empty home |
 | Windows read-only sandbox probe | Passed | Repository reads succeeded and writes failed with `PermissionError` |
 | Windows command network isolation | Failed on this host | External TCP connections succeeded because the active firewall profile was disabled; no claim of offline isolation is made |
+| Independent Codex critic | SHIP; exit 0, medium confidence | Read-only review with a user-authorized exception for network isolation; no external requests. The legacy-handoff regression found in the first review was fixed and rechecked. Full suite and native diagnostics were verified by the main session, not independently rerun by the critic |
+| Hosted platform CI | All five jobs passed | [Run 35695608637](https://github.com/davesheffer/coding-orchestrator/actions/runs/35695608637), commit `85e2bd6`: Linux Python 3.11/3.12/3.13, macOS 3.12, Windows 3.12 |
 
 The Codex configuration check emitted a warning that PATH helper aliases cannot
 be created beneath the Windows temporary directory. It still loaded the installed
 configuration successfully. This diagnostic is not a full native session test.
 
-Linux/macOS shell execution and platform tests are required by the
-[CI workflow](../.github/workflows/ci.yml). Use the workflow result for the exact
-commit being recommended; adding a matrix entry does not establish that it passed.
+Linux/macOS shell execution and platform tests passed in the recorded run and
+remain required by the [CI workflow](../.github/workflows/ci.yml). For later
+commits, check their own workflow results before recommending them.
 
 No full native discovery/delegation matrix, live model-access matrix, native
 compaction run, or editor-session-opening test has been completed. These remain
