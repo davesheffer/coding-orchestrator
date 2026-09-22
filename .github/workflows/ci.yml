@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile Python
-        run: python -m compileall -q claude codex relay tests bin/pr-status
+        run: python -m compileall -q claude codex relay tests bin/pr-status bin/agent-run.py
       - name: Check shell syntax
         if: runner.os != 'Windows'
         run: bash -n install.sh codex/install.sh

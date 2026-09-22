@@ -33,6 +33,8 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(config["model"], "gpt-6-astra")
         self.assertTrue(config["agents"]["enabled"])
         self.assertEqual(config["agents"]["max_concurrent_threads_per_session"], 6)
+        self.assertEqual(config["agents"]["default_subagent_model"], "gpt-5.6-luna")
+        self.assertEqual(config["agents"]["default_subagent_reasoning_effort"], "low")
         for role in ("scout", "runner", "builder", "critic"):
             self.assertEqual(tomllib.loads((self.home / "agents" / f"{role}.toml").read_text(encoding="utf-8"))["name"], role)
         builder = tomllib.loads((self.home / "agents" / "builder.toml").read_text(encoding="utf-8"))
@@ -61,6 +63,10 @@ class CodexInstallTests(unittest.TestCase):
         self.assertNotIn(b"<!-- CODEX-CRITIC-NETWORK-FALLBACK:START -->", installed_instructions)
         helper = self.home / "bin" / "pr-status"
         self.assertEqual(helper.read_bytes(), (ROOT / "bin" / "pr-status").read_bytes())
+        self.assertEqual((self.home / "bin" / "agent-run.py").read_bytes(),
+                         (ROOT / "bin" / "agent-run.py").read_bytes())
+        self.assertEqual((self.home / "agent-routing.json").read_bytes(),
+                         b'{"network_fallback_roles": []}\n')
         if os.name == "posix":
             self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
         self.assertFalse((self.home.parent / ".claude").exists())
@@ -262,7 +268,7 @@ class CodexInstallTests(unittest.TestCase):
         self.home.mkdir()
         outside = Path(self.temp.name) / "outside"
         outside.write_text("do not touch")
-        for relative in ("AGENTS.md", "config.toml", "agents/scout.toml", "bin/pr-status"):
+        for relative in ("AGENTS.md", "config.toml", "agents/scout.toml", "bin/pr-status", "bin/agent-run.py", "agent-routing.json"):
             with self.subTest(path=relative):
                 target = self.home / relative
                 target.parent.mkdir(exist_ok=True)
@@ -273,6 +279,115 @@ class CodexInstallTests(unittest.TestCase):
                 self.assertEqual(self.snapshot(), before)
                 self.assertEqual(outside.read_text(encoding="utf-8"), "do not touch")
                 target.unlink()
+
+    def test_configure_routing_adds_only_missing_defaults(self):
+        self.home.mkdir()
+        original = (b'model = "local"\n[agents]\nenabled = false\n'
+                    b'default_subagent_model = "custom"\n[agents.custom]\nname = "kept"\n')
+        self.home.joinpath("config.toml").write_bytes(original)
+        dry = self.run_install("--configure-routing", "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(self.home.joinpath("config.toml").read_bytes(), original)
+        result = self.run_install("--configure-routing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = self.home.joinpath("config.toml").read_bytes()
+        self.assertIn(b'default_subagent_model = "custom"', updated)
+        self.assertIn(b'default_subagent_reasoning_effort = "low"', updated)
+        self.assertIn(b'[agents.custom]\nname = "kept"', updated)
+        self.assertEqual(self.home.joinpath("config.toml.bak").read_bytes(), original)
+        before = self.snapshot()
+        self.assertEqual(self.run_install("--configure-routing").returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_configure_routing_handles_implicit_agents_parent(self):
+        self.home.mkdir()
+        self.home.joinpath("config.toml").write_bytes(b'[agents.custom]\nmodel = "custom"\n')
+        result = self.run_install("--configure-routing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import tomllib
+        config = tomllib.loads(self.home.joinpath("config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(config["agents"]["custom"]["model"], "custom")
+        self.assertEqual(config["agents"]["default_subagent_model"], "gpt-5.6-luna")
+
+    def test_configure_routing_preserves_eof_and_line_endings(self):
+        import tomllib
+        base = self.home
+        for index, original in enumerate((b'model="local"', b'[agents]',
+                                          b'model="local"\r\n[agents]\r\nenabled=false\r\n',
+                                          b'[agents.reviewer]\nmodel="custom"\n')):
+            with self.subTest(original=original):
+                self.home = base / str(index)
+                self.home.mkdir(parents=True)
+                (self.home / 'config.toml').write_bytes(original)
+                result = self.run_install('--configure-routing')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                updated = (self.home / 'config.toml').read_bytes()
+                before = tomllib.loads(original.decode())
+                expected = dict(before)
+                expected['agents'] = dict(before.get('agents', {}))
+                expected['agents'].update(default_subagent_model='gpt-5.6-luna', default_subagent_reasoning_effort='low')
+                self.assertEqual(tomllib.loads(updated.decode()), expected)
+                if b'\r\n' in original:
+                    self.assertNotIn(b'\n', updated.replace(b'\r\n', b''))
+
+    def test_configure_routing_refuses_unsafe_syntax_without_changes(self):
+        self.home.mkdir()
+        config = self.home / 'config.toml'
+        for original in (b'agents = {enabled = true}\n', b'["agents"]\nenabled=true\n',
+                         b'agents.enabled=true\n'):
+            with self.subTest(original=original):
+                config.write_bytes(original)
+                before = self.snapshot()
+                result = self.run_install('--configure-routing', '--force')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_configure_routing_preserves_complete_inline_choices(self):
+        self.home.mkdir()
+        original = b'agents = {default_subagent_model="custom", default_subagent_reasoning_effort="high"}\n'
+        (self.home / 'config.toml').write_bytes(original)
+        result = self.run_install('--configure-routing')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'config.toml').read_bytes(), original)
+
+    def test_invalid_routing_policy_is_never_mutated(self):
+        self.home.mkdir()
+        policy = self.home / "agent-routing.json"
+        for invalid in (b"not json", b"[]", b"{}", b'{"network_fallback_roles": "scout"}',
+                        b'{"network_fallback_roles": ["scout", 1]}',
+                        b'{"network_fallback_roles": ["unknown"]}',
+                        b'{"network_fallback_roles": ["scout", "scout"]}'):
+            with self.subTest(policy=invalid):
+                policy.write_bytes(invalid)
+                before = self.snapshot()
+                result = self.run_install("--force")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_existing_routing_approval_is_preserved(self):
+        self.home.mkdir()
+        policy = self.home / "agent-routing.json"
+        approved = b'{"network_fallback_roles": ["scout"]}\n'
+        policy.write_bytes(approved)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(policy.read_bytes(), approved)
+
+    def test_forced_upgrade_preserves_policy_approval_and_refusal(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        policy = self.home / 'agent-routing.json'
+        for original in (b'{"network_fallback_roles": [], "note":"refused"}\n',
+                         b'{"network_fallback_roles": ["scout", "critic"], "note":"approved"}\n'):
+            with self.subTest(policy=original):
+                policy.write_bytes(original)
+                helper = self.home / 'bin/agent-run.py'
+                helper.write_bytes(helper.read_bytes() + b'\n# local edit\n')
+                result = self.run_install('--force')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(policy.read_bytes(), original)
+                before = self.snapshot()
+                self.assertEqual(self.run_install().returncode, 0)
+                self.assertEqual(self.snapshot(), before)
 
     def test_internal_directory_and_broken_symlinks_are_refused(self):
         self.home.mkdir()

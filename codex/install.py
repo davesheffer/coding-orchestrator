@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Install the bundled Codex orchestration files.
 
-Usage: install.py [--force] [--dry-run]
+Usage: install.py [--force] [--dry-run] [--configure-routing]
 """
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -24,6 +27,11 @@ ROLE_SANDBOX = {
 REQUIRED_ROLE_FIELDS = {
     "name", "description", "model", "model_reasoning_effort", "sandbox_mode",
     "approval_policy", "developer_instructions",
+}
+ROUTING_POLICY = b'{"network_fallback_roles": []}\n'
+ROUTING_FIELDS = {
+    "default_subagent_model": "gpt-5.6-luna",
+    "default_subagent_reasoning_effort": "low",
 }
 
 
@@ -49,6 +57,59 @@ def parse_toml(path: Path, data: bytes) -> dict:
     if not isinstance(value, dict):
         fail(f"invalid TOML in {path}")
     return value
+
+
+def validate_routing_policy(path: Path, data: bytes) -> None:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid routing policy in {path}: {exc}")
+    roles = value.get("network_fallback_roles") if isinstance(value, dict) else None
+    if not isinstance(roles, list):
+        fail(f"invalid routing policy in {path}: network_fallback_roles must be a list")
+    if any(not isinstance(role, str) for role in roles):
+        fail(f"invalid routing policy in {path}: role names must be strings")
+    if len(set(roles)) != len(roles) or any(role not in ROLE_NAMES for role in roles):
+        fail(f"invalid routing policy in {path}: unknown or duplicate role name")
+
+
+def configure_routing_defaults(path: Path, data: bytes) -> bytes:
+    config = parse_toml(path, data)
+    agents = config.get("agents")
+    if agents is None:
+        agents = {}
+    if not isinstance(agents, dict):
+        fail(f"cannot safely configure routing defaults in {path}: agents is not a table")
+    missing = {key: value for key, value in ROUTING_FIELDS.items() if key not in agents}
+    if not missing:
+        return data
+
+    text = data.decode("utf-8")
+    lines = text.splitlines(keepends=True)
+    table = re.compile(r"^\s*\[agents\]\s*(?:#.*)?(?:\r?\n)?$")
+    custom = re.compile(r"^\s*\[agents\.")
+    table_indexes = [index for index, line in enumerate(lines) if table.match(line)]
+    custom_indexes = [index for index, line in enumerate(lines) if custom.match(line)]
+    newline = "\r\n" if "\r\n" in text else "\n"
+    additions = [f'{key} = "{value}"{newline}' for key, value in missing.items()]
+    if len(table_indexes) == 1:
+        if not lines[table_indexes[0]].endswith("\n"):
+            lines[table_indexes[0]] += newline
+        lines[table_indexes[0] + 1:table_indexes[0] + 1] = additions
+    elif not table_indexes and custom_indexes:
+        lines[custom_indexes[0]:custom_indexes[0]] = ["[agents]" + newline, *additions, newline]
+    elif not table_indexes and "agents" not in config:
+        if text and not text.endswith(("\n", "\r")):
+            lines.append(newline)
+        lines.extend(["[agents]" + newline, *additions])
+    else:
+        fail(f"cannot safely configure routing defaults in {path}: unsupported agents table syntax")
+    updated = "".join(lines).encode("utf-8")
+    expected = copy.deepcopy(config)
+    expected.setdefault("agents", {}).update(missing)
+    if parse_toml(path, updated) != expected:
+        fail(f"cannot safely configure routing defaults in {path}: semantic preservation check failed")
+    return updated
 
 
 def validate_role(path: Path, data: bytes, name: str) -> None:
@@ -157,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--force", action="store_true", help="replace differing managed files after backing them up")
     parser.add_argument("--dry-run", action="store_true", help="validate and list actions without changing the destination")
+    parser.add_argument("--configure-routing", action="store_true", help="add missing default subagent routing settings to config.toml")
     args = parser.parse_args(argv)
 
     here = Path(__file__).resolve().parent
@@ -170,8 +232,10 @@ def main(argv: list[str] | None = None) -> int:
         sources[dest / "agents" / f"{name}.toml"] = data
     config_source = read_regular(here / "config.example.toml")
     helper_source = read_regular(here.parent / "bin" / "pr-status")
-    assert config_source is not None and helper_source is not None
+    agent_run_source = read_regular(here.parent / "bin" / "agent-run.py")
+    assert config_source is not None and helper_source is not None and agent_run_source is not None
     sources[dest / "bin" / "pr-status"] = helper_source
+    sources[dest / "bin" / "agent-run.py"] = agent_run_source
     parse_toml(here / "config.example.toml", config_source)
     managed_block(sources[dest / "AGENTS.md"], here / "AGENTS.md")
 
@@ -189,6 +253,10 @@ def main(argv: list[str] | None = None) -> int:
     config_existing = read_regular(config)
     if config_existing is not None:
         parse_toml(config, config_existing)
+    routing_policy = dest / "agent-routing.json"
+    routing_existing = read_regular(routing_policy)
+    if routing_existing is not None:
+        validate_routing_policy(routing_policy, routing_existing)
     override = dest / "AGENTS.override.md"
     if override.is_symlink():
         fail(f"refusing symlink: {override}")
@@ -197,13 +265,18 @@ def main(argv: list[str] | None = None) -> int:
     desired[dest / "AGENTS.md"] = merge_instructions(existing[dest / "AGENTS.md"], sources[dest / "AGENTS.md"], dest / "AGENTS.md")
     if config_existing is None:
         desired[config] = config_source
+    elif args.configure_routing:
+        desired[config] = configure_routing_defaults(config, config_existing)
+    if routing_existing is None:
+        desired[routing_policy] = ROUTING_POLICY
 
     changes: list[tuple[Path, bytes, bytes | None]] = []
     for target, data in desired.items():
         prior = existing.get(target, config_existing if target == config else None)
         if prior != data:
             changes.append((target, data, prior))
-    conflicts = [path for path, _, prior in changes if prior is not None and path.name != "AGENTS.md"]
+    conflicts = [path for path, _, prior in changes
+                 if prior is not None and path.name not in ("AGENTS.md", "config.toml", "agent-routing.json")]
     if conflicts and not args.force:
         fail("differing managed files (use --force): " + ", ".join(map(str, conflicts)))
 
