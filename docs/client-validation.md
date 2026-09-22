@@ -78,6 +78,14 @@ can be verified. Do not weaken settings to obtain a passing run. For Claude,
 record effective permission mode and tool availability; a prompt is not an OS
 sandbox. Each role must return RESULT, EVIDENCE, CONFIDENCE, and UNVERIFIED.
 
+For the [optional critic fallback](critic-network-fallback.md), additionally verify
+that an isolated launch is attempted first, missing consent prompts for a choice,
+remembered refusal prevents fallback, and remembered approval is used only after
+isolation fails. A failed read-only or disabled-tool check must prevent fallback
+even with approval. Record fallback reviews separately: they do not pass the
+network-isolation acceptance check. Installer tests verify strict defaults and
+preference preservation; they cannot establish that a live agent follows this flow.
+
 ## Relay and completion
 
 In Claude, verify a GREEN/AMBER/RED measurement with representative transcripts,
