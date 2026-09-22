@@ -174,6 +174,14 @@ the orchestrator must report that limitation and keep the work in the main
 session, unless you explicitly authorize a different boundary. The installer
 does not change firewall settings. See the [Windows sandbox documentation](https://learn.chatgpt.com/docs/windows/windows-sandbox).
 
+For critic reviews only, an [optional last-resort fallback](docs/critic-network-fallback.md)
+can continue without network isolation after the available isolated launch paths
+fail. The orchestrator explains the tradeoff and asks for your approval; you can
+remember approval or refusal locally. Read-only filesystem enforcement and disabled
+web/browser/MCP/app tools remain mandatory. Installation grants no exception, and
+every later review still tries isolation first. This is an agent-instruction
+workflow; the bundle does not install an automatic fallback launcher.
+
 Codex uses native compaction. A transcript-based gauge is documented in
 [the proposal](codex/CONTEXT-GAUGE.md); it is **not implemented or installed**.
 The Claude relay remains Claude-specific.

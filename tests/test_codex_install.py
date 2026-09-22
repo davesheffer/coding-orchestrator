@@ -47,6 +47,18 @@ class CodexInstallTests(unittest.TestCase):
         self.assertFalse(runner["sandbox_workspace_write"]["network_access"])
         self.assertEqual(set(runner["features"]), {"apps"})
         self.assertFalse(runner["agents"]["enabled"])
+        critic = tomllib.loads((self.home / "agents" / "critic.toml").read_text(encoding="utf-8"))
+        self.assertEqual(critic["sandbox_mode"], "read-only")
+        self.assertFalse(critic["sandbox_workspace_write"]["network_access"])
+        self.assertEqual(critic["approval_policy"], "never")
+        self.assertEqual(critic["web_search"], "disabled")
+        self.assertFalse(critic["features"]["apps"])
+        self.assertFalse(critic["agents"]["enabled"])
+        self.assertTrue(all(server["enabled"] is False for server in critic["mcp_servers"].values()))
+        self.assertNotIn("default_permissions", config)
+        self.assertEqual(list(self.home.glob("*.config.toml")), [])
+        installed_instructions = (self.home / "AGENTS.md").read_bytes()
+        self.assertNotIn(b"<!-- CODEX-CRITIC-NETWORK-FALLBACK:START -->", installed_instructions)
         helper = self.home / "bin" / "pr-status"
         self.assertEqual(helper.read_bytes(), (ROOT / "bin" / "pr-status").read_bytes())
         if os.name == "posix":
@@ -74,6 +86,48 @@ class CodexInstallTests(unittest.TestCase):
         before = self.snapshot()
         self.assertEqual(self.run_install().returncode, 0)
         self.assertEqual(self.snapshot(), before)
+
+    def test_upgrade_preserves_local_critic_choice_without_enabling_fallback(self):
+        import tomllib
+        base_home = self.home
+        for decision in ("allow-after-isolation-failure", "deny"):
+            with self.subTest(decision=decision):
+                self.home = base_home / decision
+                shutil.copytree(ROOT / "tests/fixtures/previous-release/codex/agents",
+                                self.home / "agents")
+                preference = ("\r\n<!-- CODEX-CRITIC-NETWORK-FALLBACK:START -->\r\n"
+                              f"decision: {decision}\r\n"
+                              "<!-- CODEX-CRITIC-NETWORK-FALLBACK:END -->\r\n").encode()
+                original = (b"private instructions\r\n<!-- CODEX-ORCHESTRATOR:START -->\n"
+                            b"old rules\n<!-- CODEX-ORCHESTRATOR:END -->" + preference)
+                (self.home / "AGENTS.md").write_bytes(original)
+                config = b'model = "local-model"\n'
+                (self.home / "config.toml").write_bytes(config)
+                profile = self.home / "critic-network-fallback.config.toml"
+                profile_bytes = (b'default_permissions = "local-critic"\n'
+                                 b'[permissions.local-critic]\nextends = ":read-only"\n'
+                                 b'[permissions.local-critic.network]\nenabled = true\n')
+                profile.write_bytes(profile_bytes)
+                before = self.snapshot()
+                dry = self.run_install("--force", "--dry-run")
+                self.assertEqual(dry.returncode, 0, dry.stderr)
+                self.assertEqual(self.snapshot(), before)
+                installed = self.run_install("--force")
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                actual = (self.home / "AGENTS.md").read_bytes()
+                self.assertTrue(actual.startswith(b"private instructions\r\n"))
+                self.assertTrue(actual.endswith(preference))
+                self.assertEqual(actual.count(b"<!-- CODEX-CRITIC-NETWORK-FALLBACK:START -->"), 1)
+                self.assertEqual((self.home / "AGENTS.md.bak").read_bytes(), original)
+                self.assertEqual((self.home / "config.toml").read_bytes(), config)
+                self.assertEqual(profile.read_bytes(), profile_bytes)
+                critic = tomllib.loads((self.home / "agents/critic.toml").read_text(encoding="utf-8"))
+                self.assertEqual(critic["sandbox_mode"], "read-only")
+                self.assertFalse(critic["sandbox_workspace_write"]["network_access"])
+                before = self.snapshot()
+                repeat = self.run_install()
+                self.assertEqual(repeat.returncode, 0, repeat.stderr)
+                self.assertEqual(self.snapshot(), before)
 
     @unittest.skipUnless(os.name == "posix", "shell entry points require POSIX process execution")
     def test_actual_shell_entry_point_runs(self):
