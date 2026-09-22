@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   publish:
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, '[publisher-skip]')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -563,8 +564,9 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$PATCH_B64" | base64 --decode --ignore-garbage | gzip --decompress > "$RUNNER_TEMP/orchestrator-fixes.patch"
+          cp .github/workflows/ci.yml "$RUNNER_TEMP/ci.yml"
           git apply --binary "$RUNNER_TEMP/orchestrator-fixes.patch"
-          rm .github/workflows/publish-fixes.yml
+          cp "$RUNNER_TEMP/ci.yml" .github/workflows/ci.yml
           python3 -m compileall -q claude codex relay tests bin/pr-status
           bash -n install.sh codex/install.sh
           python3 -m unittest discover -s tests -q
@@ -572,5 +574,5 @@ jobs:
           git add -A
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Fix release upgrades, relay paths, and hook ownership'
+          git commit -m '[publisher-skip] Fix release upgrades, relay paths, and hook ownership'
           git push origin HEAD:main
