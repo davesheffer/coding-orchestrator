@@ -562,7 +562,7 @@ jobs:
             juwjh7Cke7RXYZpiwimdizmOxOJoiWZ8OLaeBRVgtByQMc4TRqX9LyIOoRXwwgEA
         run: |
           set -euo pipefail
-          printf '%s' "$PATCH_B64" | base64 --decode | gzip --decompress > "$RUNNER_TEMP/orchestrator-fixes.patch"
+          printf '%s' "$PATCH_B64" | base64 --decode --ignore-garbage | gzip --decompress > "$RUNNER_TEMP/orchestrator-fixes.patch"
           git apply --binary "$RUNNER_TEMP/orchestrator-fixes.patch"
           rm .github/workflows/publish-fixes.yml
           python3 -m compileall -q claude codex relay tests bin/pr-status
