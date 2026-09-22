@@ -2,6 +2,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,33 +23,34 @@ class CodexInstallTests(unittest.TestCase):
 
     def run_install(self, *args):
         env = os.environ | {"CODEX_HOME": str(self.home)}
-        return subprocess.run(["python3", str(INSTALL), *args], env=env, text=True, capture_output=True)
+        return subprocess.run([sys.executable, str(INSTALL), *args], env=env, text=True, capture_output=True)
 
     def test_fresh_install_parses_and_installs_helper(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         import tomllib
-        config = tomllib.loads((self.home / "config.toml").read_text())
+        config = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
         self.assertEqual(config["model"], "gpt-6-astra")
         self.assertTrue(config["agents"]["enabled"])
         self.assertEqual(config["agents"]["max_concurrent_threads_per_session"], 6)
         for role in ("scout", "runner", "builder", "critic"):
-            self.assertEqual(tomllib.loads((self.home / "agents" / f"{role}.toml").read_text())["name"], role)
-        builder = tomllib.loads((self.home / "agents" / "builder.toml").read_text())
+            self.assertEqual(tomllib.loads((self.home / "agents" / f"{role}.toml").read_text(encoding="utf-8"))["name"], role)
+        builder = tomllib.loads((self.home / "agents" / "builder.toml").read_text(encoding="utf-8"))
         boundary = builder["sandbox_workspace_write"]
         self.assertEqual(builder["sandbox_mode"], "workspace-write")
         self.assertEqual(boundary["writable_roots"], [])
         self.assertFalse(boundary["network_access"])
         self.assertTrue(boundary["exclude_slash_tmp"])
         self.assertTrue(boundary["exclude_tmpdir_env_var"])
-        runner = tomllib.loads((self.home / "agents" / "runner.toml").read_text())
+        runner = tomllib.loads((self.home / "agents" / "runner.toml").read_text(encoding="utf-8"))
         self.assertEqual(runner["sandbox_mode"], "workspace-write")
         self.assertFalse(runner["sandbox_workspace_write"]["network_access"])
         self.assertEqual(set(runner["features"]), {"apps"})
         self.assertFalse(runner["agents"]["enabled"])
         helper = self.home / "bin" / "pr-status"
         self.assertEqual(helper.read_bytes(), (ROOT / "bin" / "pr-status").read_bytes())
-        self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
+        if os.name == "posix":
+            self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
         self.assertFalse((self.home.parent / ".claude").exists())
 
     def test_previous_release_upgrade_requires_force_then_preserves_backups(self):
@@ -73,6 +75,7 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(self.run_install().returncode, 0)
         self.assertEqual(self.snapshot(), before)
 
+    @unittest.skipUnless(os.name == "posix", "shell entry points require POSIX process execution")
     def test_actual_shell_entry_point_runs(self):
         result = subprocess.run([str(ROOT / "codex/install.sh"), "--dry-run"],
                                 env=os.environ | {"CODEX_HOME": str(self.home)},
@@ -85,8 +88,8 @@ class CodexInstallTests(unittest.TestCase):
         shutil.copytree(ROOT / "codex", bundle / "codex")
         shutil.copytree(ROOT / "bin", bundle / "bin")
         source = bundle / "codex/agents/scout.toml"
-        source.write_text(source.read_text().replace("apps = false", "apps = true"))
-        result = subprocess.run(["python3", str(bundle / "codex/install.py"), "--force"],
+        source.write_text(source.read_text(encoding="utf-8").replace("apps = false", "apps = true"), encoding="utf-8")
+        result = subprocess.run([sys.executable, str(bundle / "codex/install.py"), "--force"],
                                 env=os.environ | {"CODEX_HOME": str(self.home)},
                                 text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
@@ -105,7 +108,7 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(self.run_install().returncode, 0)
         self.assertEqual(self.home.joinpath("AGENTS.md").read_bytes(), first)
         self.assertEqual(list(self.home.glob("*.bak*")), [])
-        self.assertEqual(self.home.joinpath("config.toml").read_text(), "model = 'local'\n")
+        self.assertEqual(self.home.joinpath("config.toml").read_text(encoding="utf-8"), "model = 'local'\n")
 
     def test_append_conflicts_backups_and_dry_run(self):
         self.home.mkdir(parents=True)
@@ -149,7 +152,7 @@ class CodexInstallTests(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("shadows global AGENTS", result.stderr)
-        self.assertEqual(override.read_text(), "local override\n")
+        self.assertEqual(override.read_text(encoding="utf-8"), "local override\n")
 
     def snapshot(self):
         return {
@@ -214,7 +217,7 @@ class CodexInstallTests(unittest.TestCase):
                 result = self.run_install("--force")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.snapshot(), before)
-                self.assertEqual(outside.read_text(), "do not touch")
+                self.assertEqual(outside.read_text(encoding="utf-8"), "do not touch")
                 target.unlink()
 
     def test_internal_directory_and_broken_symlinks_are_refused(self):
