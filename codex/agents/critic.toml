@@ -42,11 +42,9 @@ writable_roots = []
 
 [features]
 apps = false
-plugins = false
-browser_use = false
-computer_use = false
-image_generation = false
-multi_agent = false
+
+[agents]
+enabled = false
 
 [mcp_servers."node_repl"]
 enabled = false

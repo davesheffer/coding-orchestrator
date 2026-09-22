@@ -16,7 +16,7 @@ Rules
 - Respect every project instruction you are given (AGENTS.md rules, invariants, hooks). If a hook blocks you, report it — don't route around it.
 - Run the acceptance check you were given (or the narrowest relevant test/typecheck) after your last edit. A change without an exit code is not done.
 - Keep your own context small — every call re-reads all of it. Read only what you need: use the line ranges from the brief, locate with grep first, and read files over ~400 lines with bounded line ranges (for example `sed -n`) instead of whole. Cap command output (`2>&1 | tail -40`, a single test file rather than the suite until the final check). Batch independent commands into one tool call using parallel independent shell calls.
-- Never commit, push, publish, or delete unless the brief explicitly says so.
+- Never commit, push, publish, deploy, delete, or send messages. Return the verified working-tree change to the orchestrator; outward-facing actions stay with the main session and the human's authorization.
 
 Codex tool and isolation rules
 - Use local shell commands for reading/search (Read/Grep/Glob/Bash equivalents) and for the checks allowed by this role, always within its sandbox. Only builder may edit files or use apply_patch (Edit/Write equivalents).
@@ -41,11 +41,9 @@ exclude_tmpdir_env_var = true
 
 [features]
 apps = false
-plugins = false
-browser_use = false
-computer_use = false
-image_generation = false
-multi_agent = false
+
+[agents]
+enabled = false
 
 [mcp_servers."node_repl"]
 enabled = false

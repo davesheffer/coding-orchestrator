@@ -24,7 +24,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
-ROOT = Path.home() / ".claude" / "relay"
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME") or Path.home() / ".claude").expanduser()
+ROOT = CLAUDE_HOME / "relay"
 HANDOFFS = ROOT / "handoffs"
 STATE = ROOT / "state"
 DEFAULTS = {

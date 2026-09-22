@@ -17,6 +17,10 @@ from pathlib import Path
 START = b"<!-- CODEX-ORCHESTRATOR:START -->"
 END = b"<!-- CODEX-ORCHESTRATOR:END -->"
 ROLE_NAMES = ("scout", "runner", "builder", "critic")
+ROLE_SANDBOX = {
+    "scout": "read-only", "runner": "workspace-write",
+    "builder": "workspace-write", "critic": "read-only",
+}
 REQUIRED_ROLE_FIELDS = {
     "name", "description", "model", "model_reasoning_effort", "sandbox_mode",
     "approval_policy", "developer_instructions",
@@ -52,6 +56,16 @@ def validate_role(path: Path, data: bytes, name: str) -> None:
     missing = REQUIRED_ROLE_FIELDS - role.keys()
     if missing or role.get("name") != name:
         fail(f"invalid role {path}: missing fields or wrong name")
+    if role.get("sandbox_mode") != ROLE_SANDBOX[name] or role.get("approval_policy") != "never":
+        fail(f"invalid role boundary in {path}")
+    if role.get("web_search") != "disabled":
+        fail(f"web search must be disabled in {path}")
+    if role.get("features") != {"apps": False}:
+        fail(f"unsupported or enabled role features in {path}")
+    if role.get("agents") != {"enabled": False}:
+        fail(f"nested agents must be disabled in {path}")
+    if role.get("sandbox_workspace_write", {}).get("network_access") is not False:
+        fail(f"network must be disabled in {path}")
 
 
 def managed_block(data: bytes, path: Path) -> bytes:

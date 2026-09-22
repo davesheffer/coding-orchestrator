@@ -3,6 +3,9 @@ name: critic
 description: Top tier (Fable), read-only. An independent adversarial second opinion with FRESH context, unanchored by the orchestrator's reasoning — reviews a diff, plan, or root-cause claim and tries to break it. Use before finishing anything non-trivial or risky (data loss, security, migrations, concurrency, public API), or when the orchestrator's own confidence is below high. Give it the diff/plan and the claim to attack; it must not see the orchestrator's reasoning as settled.
 model: fable
 tools: Read, Grep, Glob, Bash
+disallowedTools: mcp__*
+permissionMode: plan
+maxTurns: 16
 color: red
 ---
 

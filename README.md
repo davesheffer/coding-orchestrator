@@ -37,17 +37,24 @@ assistant homes; neither installer implicitly configures a project's local files
 ./install.sh
 ```
 
-Requires Claude Code and Python 3. The existing installer installs `CLAUDE.md`,
-the four Markdown personas, the Claude relay, and `pr-status` under
-`${CLAUDE_HOME:-$HOME/.claude}`. It merges relay hooks into `settings.json`,
-preserves an existing relay configuration, and leaves a differing `CLAUDE.md`
-alone unless you pass `--force` (which keeps `CLAUDE.md.bak`). Agent files,
-`relay.py`, and the helper are refreshed on each run; copy any customizations
-back into your checkout before updating.
+Requires Claude Code and Python 3. The transactional installer places the marked
+orchestrator block, four Markdown roles, relay, and `pr-status` under
+`${CLAUDE_HOME:-$HOME/.claude}`. It validates every source and destination before
+writing, refuses symlinks and malformed JSON/markers, preserves instructions
+outside its managed block, migrates old relay hooks to the selected
+`CLAUDE_HOME`, keeps a tuned `relay/config.json`, and writes unique backups.
+
+Use `./install.sh --dry-run` to inspect an installation. Bundle-managed files
+update automatically when their installed hash still matches the manifest; a
+local modification is never overwritten unless you review it and pass
+`--force`. The installer is idempotent and does not copy credentials.
 
 Start a new Claude Code session after installation. The existing relay handles
 the GREEN/AMBER/RED context gauge and session handoffs; see `relay/config.json`
-for its thresholds.
+for its thresholds. Roles have bounded turns, explicit permission modes, narrow
+tool allowlists, and no MCP tools. Claude Code can still apply a stronger parent
+permission mode, so use `/tasks` and `/status` to confirm the effective model and
+settings when validating a new machine.
 
 ### Codex
 
@@ -102,10 +109,10 @@ route bounded work to the appropriate role. See the official documentation for
 
 #### Codex permission limits
 
-Scout, runner, and critic use `read-only`; builder uses `workspace-write`.
-Subagent network access is disabled unless explicitly authorized. Runner cannot
-execute a test that writes build artifacts or contacts services: use builder for
-authorized local checks that write, or the orchestrator for network work.
+Scout and critic use `read-only`; runner and builder use `workspace-write`.
+Runner is allowed to create artifacts from the exact test/build command it was
+given, but it may not edit source, install dependencies, or repair failures.
+Subagent network access is disabled unless explicitly authorized.
 
 **Parent runtime overrides can supersede a role's sandbox settings.** Native
 roles are not a universal isolation boundary. The instructions require checking
@@ -131,7 +138,7 @@ The shared helper prints one compact table of open PRs and their checks:
 PATH="${CODEX_HOME:-$HOME/.codex}/bin:$PATH" pr-status
 
 # Claude Code installation
-~/.claude/bin/pr-status --failed
+"${CLAUDE_HOME:-$HOME/.claude}/bin/pr-status" --failed
 ```
 
 It requires an authenticated `gh`. When executable, `~/.hunch/agent-gh` is used
@@ -143,25 +150,30 @@ runner. No credentials are included.
 
 | Files | Purpose |
 |---|---|
-| `CLAUDE.md`, `agents/*.md`, `install.sh` | Existing Claude orchestrator and installer |
+| `CLAUDE.md`, `agents/*.md` | Claude orchestrator and bounded native roles |
+| `install.sh`, `claude/install.py` | Transactional Claude installer |
 | `relay/`, `hooks.json` | Claude-only context relay |
 | `codex/AGENTS.md`, `codex/agents/*.toml` | Codex orchestrator and native roles |
 | `codex/install.sh`, `codex/install.py`, `codex/config.example.toml` | Codex installation and new-home defaults |
 | `codex/PROMPT.md`, `codex/CONTEXT-GAUGE.md` | Validation brief and optional gauge proposal |
 | `bin/pr-status` | Shared PR/CI helper |
-| `tests/test_codex_install.py` | Disposable-home installer checks |
+| `tests/` | Bundle contracts, both installers, and relay behavior |
+| `.github/workflows/ci.yml` | Python 3.11–3.13 CI, compilation, shell syntax, and tests |
 
 ## Update and verify
 
-After `git pull`, rerun the installer for the assistant you use. Review conflicts
-before using `--force`. The old Claude installer retains its existing behavior;
-the Codex installer has the preservation rules described above.
+After `git pull`, rerun the installer for the assistant you use. Start with
+`--dry-run`; review any local managed-file conflict before using `--force`.
 
-Run the Codex installer checks without touching your real assistant homes:
+Run the complete verification suite without touching your real assistant homes:
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+The suite exercises clean installs, upgrades, idempotency, unique backups,
+custom home paths, malformed inputs, symlink attacks, role parity, JSON/TOML
+contracts, relay token zones, hook failure safety, and handoff persistence.
 
 Credentials, personal MCP configuration, per-project assistant configuration,
 personal status lines, and permission allowlists do not belong in this bundle.

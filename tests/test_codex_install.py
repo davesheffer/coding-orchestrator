@@ -27,7 +27,10 @@ class CodexInstallTests(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         import tomllib
-        self.assertEqual(tomllib.loads((self.home / "config.toml").read_text())["model"], "gpt-6-astra")
+        config = tomllib.loads((self.home / "config.toml").read_text())
+        self.assertEqual(config["model"], "gpt-6-astra")
+        self.assertTrue(config["agents"]["enabled"])
+        self.assertEqual(config["agents"]["max_concurrent_threads_per_session"], 6)
         for role in ("scout", "runner", "builder", "critic"):
             self.assertEqual(tomllib.loads((self.home / "agents" / f"{role}.toml").read_text())["name"], role)
         builder = tomllib.loads((self.home / "agents" / "builder.toml").read_text())
@@ -37,6 +40,11 @@ class CodexInstallTests(unittest.TestCase):
         self.assertFalse(boundary["network_access"])
         self.assertTrue(boundary["exclude_slash_tmp"])
         self.assertTrue(boundary["exclude_tmpdir_env_var"])
+        runner = tomllib.loads((self.home / "agents" / "runner.toml").read_text())
+        self.assertEqual(runner["sandbox_mode"], "workspace-write")
+        self.assertFalse(runner["sandbox_workspace_write"]["network_access"])
+        self.assertEqual(set(runner["features"]), {"apps"})
+        self.assertFalse(runner["agents"]["enabled"])
         helper = self.home / "bin" / "pr-status"
         self.assertEqual(helper.read_bytes(), (ROOT / "bin" / "pr-status").read_bytes())
         self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)

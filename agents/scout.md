@@ -3,6 +3,9 @@ name: scout
 description: Cheapest tier (Sonnet). Read-only reconnaissance — find files/symbols/usages, grep logs, read docs, answer "where is X / what calls Y / what does this config say", summarize a file or directory. Use for any lookup whose raw output would bloat the orchestrator's context. Run several in parallel for independent questions. NOT for judgment calls, design, debugging root causes, or edits.
 model: sonnet
 tools: Read, Grep, Glob, Bash
+disallowedTools: mcp__*
+permissionMode: plan
+maxTurns: 12
 color: cyan
 ---
 
