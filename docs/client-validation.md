@@ -7,8 +7,38 @@ native compatibility verdict.
 
 Run this protocol on an authenticated test machine before claiming support for
 a client release. Record client version, OS, bundle commit, actual model, effective
-permissions, check output, and any unverified field. This review environment has
-neither client installed; native results remain **NOT RUN**.
+permissions, check output, and any unverified field. The experimental release
+record below distinguishes offline configuration checks from live agent behavior.
+
+## Experimental release validation — 2026-09-22
+
+Local environment: Windows, Python 3.12, Codex CLI 0.155.1, Claude Code 2.1.278.
+Each installer was run against a disposable assistant home; no credentials were
+copied into that home or into this repository.
+
+| Check | Observed result | Scope |
+|---|---|---|
+| Python suite on Windows | 51 tests: 48 passed, 3 POSIX-shell tests skipped; exit 0 | Both installers, legacy upgrades, backups, UTF-8 and legacy-encoding handoffs, marker validation, PR helper |
+| Python compilation | Passed; exit 0 | `python -m compileall -q claude codex relay tests bin/pr-status` |
+| Shell syntax | Passed with Git Bash; exit 0 | `bash -n install.sh codex/install.sh`; syntax only on Windows |
+| Codex native configuration | Passed; exit 0 | A clean install was loaded by `codex debug prompt-input` using its disposable `CODEX_HOME`; this does not prove live role discovery or delegation |
+| Claude native installation diagnostic | Passed; exit 0 | `claude doctor` reported no installation issues using the disposable `CLAUDE_CONFIG_DIR`; authenticated policy checks were unavailable in that empty home |
+| Windows read-only sandbox probe | Passed | Repository reads succeeded and writes failed with `PermissionError` |
+| Windows command network isolation | Failed on this host | External TCP connections succeeded because the active firewall profile was disabled; no claim of offline isolation is made |
+| Independent Codex critic | SHIP; exit 0, medium confidence | Read-only review with a user-authorized exception for network isolation; no external requests. The legacy-handoff regression found in the first review was fixed and rechecked. Full suite and native diagnostics were verified by the main session, not independently rerun by the critic |
+| Hosted platform CI | All five jobs passed | [Run 35695608637](https://github.com/davesheffer/coding-orchestrator/actions/runs/35695608637), commit `85e2bd6`: Linux Python 3.11/3.12/3.13, macOS 3.12, Windows 3.12 |
+
+The Codex configuration check emitted a warning that PATH helper aliases cannot
+be created beneath the Windows temporary directory. It still loaded the installed
+configuration successfully. This diagnostic is not a full native session test.
+
+Linux/macOS shell execution and platform tests passed in the recorded run and
+remain required by the [CI workflow](../.github/workflows/ci.yml). For later
+commits, check their own workflow results before recommending them.
+
+No full native discovery/delegation matrix, live model-access matrix, native
+compaction run, or editor-session-opening test has been completed. These remain
+release limitations and are why the public bundle is labeled experimental.
 
 ## Install and upgrade
 
@@ -58,12 +88,13 @@ Save a handoff, follow the printed relay prompt in a fresh session, and verify
 its exact content is recovered. Record whether the helper actually opened an
 editor session or merely copied/printed a prompt; these are different outcomes.
 
-Use an evidence table for the result:
+Use the following table for full native behavior results; the diagnostic checks
+above do not fill these cells automatically:
 
 | Client/version | Discovery | Roles/models | Effective boundaries | Upgrade | Handoff | Evidence |
 |---|---|---|---|---|---|---|
-| Codex | NOT RUN | NOT RUN | NOT RUN | NOT RUN | Native compaction: NOT RUN | Pending authenticated client |
-| Claude | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | Pending authenticated client |
+| Codex 0.155.1 / Windows | NOT RUN | NOT RUN | Read-only probe passed; offline networking failed on this host | Installer tests passed; native-session upgrade NOT RUN | Native compaction: NOT RUN | Offline configuration diagnostic passed |
+| Claude 2.1.278 / Windows | NOT RUN | NOT RUN | NOT RUN | Installer tests passed; native-session upgrade NOT RUN | Script round-trip passed; editor opening NOT RUN | Native `doctor` diagnostic passed |
 
 Replace NOT RUN only with observed results. A missing client, unavailable model,
 or unobservable permission boundary is an explicit verification gap.

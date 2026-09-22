@@ -69,26 +69,22 @@ def validate_role(path: Path, data: bytes, name: str) -> None:
 
 
 def managed_block(data: bytes, path: Path) -> bytes:
-    starts = [i for i in range(len(data)) if data.startswith(START, i)]
-    ends = [i for i in range(len(data)) if data.startswith(END, i)]
-    if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
+    start, end = data.find(START), data.find(END)
+    if data.count(START) != 1 or data.count(END) != 1 or start > end:
         fail(f"invalid managed markers in {path}")
-    end = ends[0] + len(END)
-    return data[starts[0]:end]
+    return data[start:end + len(END)]
 
 
 def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> bytes:
     block = managed_block(source, Path("source AGENTS.md"))
     if existing is None:
         return source
-    starts = [i for i in range(len(existing)) if existing.startswith(START, i)]
-    ends = [i for i in range(len(existing)) if existing.startswith(END, i)]
-    if not starts and not ends:
+    start, end = existing.find(START), existing.find(END)
+    if start == end == -1:
         return existing + (b"" if not existing or existing.endswith(b"\n") else b"\n") + block
-    if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
+    if existing.count(START) != 1 or existing.count(END) != 1 or start > end:
         fail(f"invalid managed markers in {path}")
-    end = ends[0] + len(END)
-    return existing[:starts[0]] + block + existing[end:]
+    return existing[:start] + block + existing[end + len(END):]
 
 
 def validate_destination_root(dest: Path) -> None:

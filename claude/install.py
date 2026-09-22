@@ -82,7 +82,7 @@ def parse_json(path: Path, data: bytes) -> dict:
 
 def validate_role(path: Path, data: bytes, name: str) -> None:
     try:
-        text = data.decode("utf-8")
+        text = data.decode("utf-8").replace("\r\n", "\n")
     except UnicodeDecodeError as exc:
         fail(f"invalid UTF-8 in {path}: {exc}")
     if not text.startswith("---\n") or "\n---\n" not in text[4:]:
@@ -96,26 +96,23 @@ def validate_role(path: Path, data: bytes, name: str) -> None:
 
 
 def managed_block(data: bytes, path: Path) -> bytes:
-    starts = [i for i in range(len(data)) if data.startswith(START, i)]
-    ends = [i for i in range(len(data)) if data.startswith(END, i)]
-    if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
+    start, end = data.find(START), data.find(END)
+    if data.count(START) != 1 or data.count(END) != 1 or start > end:
         fail(f"invalid managed markers in {path}")
-    return data[starts[0]:ends[0] + len(END)]
+    return data[start:end + len(END)]
 
 
 def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> bytes:
     block = managed_block(source, Path("source CLAUDE.md"))
-    if existing is None or digest(existing) in LEGACY_CLAUDE_HASHES:
+    if existing is None or digest(existing.replace(b"\r\n", b"\n")) in LEGACY_CLAUDE_HASHES:
         return source
-    starts = [i for i in range(len(existing)) if existing.startswith(START, i)]
-    ends = [i for i in range(len(existing)) if existing.startswith(END, i)]
-    if not starts and not ends:
+    start, end = existing.find(START), existing.find(END)
+    if start == end == -1:
         separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
         return existing + separator + block + b"\n"
-    if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
+    if existing.count(START) != 1 or existing.count(END) != 1 or start > end:
         fail(f"invalid managed markers in {path}")
-    end = ends[0] + len(END)
-    return existing[:starts[0]] + block + existing[end:]
+    return existing[:start] + block + existing[end + len(END):]
 
 
 def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
@@ -277,16 +274,21 @@ def main(argv: list[str] | None = None) -> int:
     conflicts = []
     for path, data in managed_sources.items():
         prior = existing[path]
-        rel = str(path.relative_to(dest))
+        rel = path.relative_to(dest).as_posix()
         prior_hash = digest(prior) if prior is not None else None
-        recognized = previous_hashes.get(rel) == prior_hash or prior_hash in LEGACY_MANAGED_HASHES.get(rel, set())
+        # Older Windows manifests used backslashes. Keep their exact-byte hashes
+        # valid, while normalizing line endings only for known legacy releases.
+        recognized = any(previous_hashes.get(key) == prior_hash
+                         for key in (rel, rel.replace("/", "\\")))
+        if prior is not None:
+            recognized |= digest(prior.replace(b"\r\n", b"\n")) in LEGACY_MANAGED_HASHES.get(rel, set())
         if prior is not None and prior != data and not recognized:
             conflicts.append(path)
     if conflicts and not args.force:
         fail("locally modified managed files (review, then use --force): " + ", ".join(map(str, conflicts)))
 
     new_manifest = {"schema": 1, "files": {
-        str(path.relative_to(dest)): digest(data) for path, data in managed_sources.items()
+        path.relative_to(dest).as_posix(): digest(data) for path, data in managed_sources.items()
     }}
     desired[manifest_path] = (json.dumps(new_manifest, indent=2, sort_keys=True) + "\n").encode()
 

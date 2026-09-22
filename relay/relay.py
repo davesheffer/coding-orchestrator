@@ -15,6 +15,7 @@ Subcommands:
 Hooks must never break a prompt: every hook path swallows errors and exits 0.
 """
 import json
+import locale
 import os
 import re
 import secrets
@@ -50,7 +51,7 @@ URI_SCHEMES = {
 def config():
     cfg = dict(DEFAULTS)
     try:
-        cfg.update(json.loads((ROOT / "config.json").read_text()))
+        cfg.update(json.loads((ROOT / "config.json").read_text(encoding="utf-8")))
     except Exception:
         pass
     return cfg
@@ -115,7 +116,7 @@ def k(n):
 
 def load_state(session_id):
     try:
-        return json.loads((STATE / f"{session_id}.json").read_text())
+        return json.loads((STATE / f"{session_id}.json").read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -124,7 +125,7 @@ def save_state(session_id, state):
     STATE.mkdir(parents=True, exist_ok=True)
     path = STATE / f"{session_id}.json"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state))
+    tmp.write_text(json.dumps(state), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -151,6 +152,19 @@ def emit_context(text):
         "hookEventName": "UserPromptSubmit", "additionalContext": text}}))
 
 
+def read_handoff(path):
+    data = path.read_bytes()
+    try:
+        body = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # Before UTF-8 was explicit, Windows handoffs used the local code page.
+        encoding = (locale.getencoding() if hasattr(locale, "getencoding")
+                    else locale.getpreferredencoding(False))
+        body = data.decode(encoding)
+    # Match the universal-newline behavior used by the original text reader.
+    return body.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def cmd_prompt():
     data = json.load(sys.stdin)
     cfg = config()
@@ -161,11 +175,18 @@ def cmd_prompt():
     if m:
         path = HANDOFFS / f"{m.group(1)}.md"
         if path.exists():
+            try:
+                body = read_handoff(path)
+            except UnicodeDecodeError:
+                emit_context(f"[relay] Handoff {m.group(1)} could not be decoded as UTF-8 or the "
+                             "local legacy encoding. Ask the user to convert that handoff file "
+                             "to UTF-8 using its original encoding, then retry. Do not infer its contents.")
+                return
             emit_context(
                 "[relay] This session CONTINUES earlier work. The previous session's handoff follows; "
                 "treat it as your working memory. Re-verify anything it lists as UNVERIFIED before relying "
                 "on it. If it has a NEXT PROMPT section, that is the user's actual request — act on it now.\n\n"
-                + path.read_text())
+                + body)
             os.utime(path)
         else:
             emit_context(f"[relay] Handoff {m.group(1)} was not found (expired or deleted). Tell the user.")
@@ -255,14 +276,14 @@ def cmd_handoff(argv):
     HANDOFFS.mkdir(parents=True, exist_ok=True)
     path = HANDOFFS / f"{hid}.md"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(header + "\n" + body + "\n")
+    tmp.write_text(header + "\n" + body + "\n", encoding="utf-8")
     tmp.replace(path)
     if session_id != "unknown":
         state = load_state(session_id)
         state["handoff_done"] = hid
         save_state(session_id, state)
 
-    next_prompt = f"relay:{hid} continue \"{title}\" from the handoff."  # ASCII only: pbcopy mangles non-ASCII
+    next_prompt = f"relay:{hid} continue \"{title}\" from the handoff."
     print(f"handoff saved: {path}")
     scheme = URI_SCHEMES.get(os.environ.get("__CFBundleIdentifier", ""))
     in_ide = os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-vscode" and scheme
@@ -274,7 +295,7 @@ def cmd_handoff(argv):
             return
         print(f"could not open {uri} (exit {rc}); falling back to clipboard.")
     if sys.platform == "darwin":
-        subprocess.run(["pbcopy"], input=next_prompt, text=True)
+        subprocess.run(["pbcopy"], input=next_prompt, text=True, encoding="utf-8")
         print("relay prompt copied to the clipboard.")
     print(f"tell the user: start a new session (/clear, or a new Claude tab) and send:\n  {next_prompt}")
 
@@ -286,6 +307,10 @@ def cmd_status(argv):
 
 
 def main():
+    # Hooks and piped handoffs use UTF-8, independent of the Windows code page.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     cmd, rest = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
     if cmd in ("prompt", "stop"):
         try:

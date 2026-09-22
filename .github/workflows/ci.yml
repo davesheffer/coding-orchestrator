@@ -10,10 +10,16 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +28,7 @@ jobs:
       - name: Compile Python
         run: python -m compileall -q claude codex relay tests bin/pr-status
       - name: Check shell syntax
+        if: runner.os != 'Windows'
         run: bash -n install.sh codex/install.sh
       - name: Test installers, executable entry points, release upgrades, and relay
         run: python -m unittest discover -s tests -v
