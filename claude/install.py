@@ -9,7 +9,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shlex
 import stat
 import tempfile
@@ -19,14 +18,36 @@ from pathlib import Path
 START = b"<!-- CLAUDE-ORCHESTRATOR:START -->"
 END = b"<!-- CLAUDE-ORCHESTRATOR:END -->"
 ROLE_NAMES = ("scout", "runner", "builder", "critic")
-LEGACY_CLAUDE_HASHES = {"2d4152d9c33d2f7b98c85a0a06e697afc2c5ebf5bac9d7faf1a6cf09e266aaf0"}
+# Accept upstream bytes and the earlier reconstruction with one extra newline.
+LEGACY_CLAUDE_HASHES = {
+    "2d088cea485f8163401de27809757fe692c647278234a5fc5f353f9af10270c9",
+    "2d4152d9c33d2f7b98c85a0a06e697afc2c5ebf5bac9d7faf1a6cf09e266aaf0",
+}
 LEGACY_MANAGED_HASHES = {
-    "agents/scout.md": {"9907a085d3e07a0e702e05600ee9462f0c9ea144039f9350ec083dbe025a2f8f"},
-    "agents/runner.md": {"6941c6bc00d1f5888c63a84d1011572e0646ffcd6e0d3c477ab01f1161b01b25"},
-    "agents/builder.md": {"3af20d8ab64a00c3f45958502601f62b8d4ea9661e2f7e32ea0375e780fc8ac1"},
-    "agents/critic.md": {"c24feddae163daddc687b26d644ac51891bbfa41af526e855a918247743c435b"},
-    "relay/relay.py": {"41d9b40baa8f7a017ab891aa2373cdc739f66e3296dd71e34dc9317b1f3232da"},
-    "bin/pr-status": {"c42240257b2f1bb7165a322bed1dc236a39ade26f951dd1c67ece7a0281e1222"},
+    "agents/scout.md": {
+        "78ca73f152fe1ee5d667c6453fc61232f09162d0bb82fbc5e969add1264a6f75",
+        "9907a085d3e07a0e702e05600ee9462f0c9ea144039f9350ec083dbe025a2f8f",
+    },
+    "agents/runner.md": {
+        "16e25ca5c9cbc91d05fe6bc46203630089e6e866fea911f36055c38aad69f439",
+        "6941c6bc00d1f5888c63a84d1011572e0646ffcd6e0d3c477ab01f1161b01b25",
+    },
+    "agents/builder.md": {
+        "1ebb340d30f283b09ff6dae2eef11ba71144eaf77b34aa28c251a0b32adaec72",
+        "3af20d8ab64a00c3f45958502601f62b8d4ea9661e2f7e32ea0375e780fc8ac1",
+    },
+    "agents/critic.md": {
+        "bc144bc1a55c98a62221325bdf1e10af419649612c25cf3be9ab64baa51edaca",
+        "c24feddae163daddc687b26d644ac51891bbfa41af526e855a918247743c435b",
+    },
+    "relay/relay.py": {
+        "41d9b40baa8f7a017ab891aa2373cdc739f66e3296dd71e34dc9317b1f3232da",
+        "72e2b5ee3581002ae55a09e94f9215fd82ebbdcf3b916e0412621468b51ee484",
+    },
+    "bin/pr-status": {
+        "625443e5093e28ae735305d7a37f821e54ce4a714181b870b1dee734abd0166a",
+        "c42240257b2f1bb7165a322bed1dc236a39ade26f951dd1c67ece7a0281e1222",
+    },
 }
 MANIFEST = ".coding-orchestrator-manifest.json"
 
@@ -97,10 +118,22 @@ def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> byt
     return existing[:starts[0]] + block + existing[end:]
 
 
-def is_old_relay_hook(command: object) -> bool:
-    return isinstance(command, str) and bool(re.search(
-        r"relay/relay\.py['\"]?\s+(?:prompt|stop)\b", command
-    ))
+def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
+    """Match only complete commands emitted by our current/legacy template."""
+    if not isinstance(command, str):
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    owned_paths = {
+        str(relay), str(Path.home() / ".claude/relay/relay.py"),
+        "$HOME/.claude/relay/relay.py", "${HOME}/.claude/relay/relay.py",
+        "~/.claude/relay/relay.py",
+    }
+    return (len(parts) >= 3 and parts[0] == "python3"
+            and parts[1] in owned_paths and parts[2] == action
+            and parts[3:] in ([], ["2>/dev/null", "||", "true"]))
 
 
 def merge_hooks(existing: dict, template: dict, relay: Path) -> dict:
@@ -109,6 +142,7 @@ def merge_hooks(existing: dict, template: dict, relay: Path) -> dict:
     if not isinstance(hooks, dict):
         fail("settings.json hooks must be an object")
     for event, wanted_groups in template["hooks"].items():
+        action = {"UserPromptSubmit": "prompt", "Stop": "stop"}[event]
         have = hooks.setdefault(event, [])
         if not isinstance(have, list):
             fail(f"settings.json hooks.{event} must be an array")
@@ -117,8 +151,9 @@ def merge_hooks(existing: dict, template: dict, relay: Path) -> dict:
             if not isinstance(group, dict) or not isinstance(group.get("hooks", []), list):
                 fail(f"settings.json hooks.{event} contains an invalid group")
             kept = [h for h in group.get("hooks", [])
-                    if not is_old_relay_hook(h.get("command") if isinstance(h, dict) else None)]
-            if kept:
+                    if not (isinstance(h, dict) and h.get("type") == "command"
+                            and is_old_relay_hook(h.get("command"), relay, action))]
+            if kept or not group.get("hooks"):
                 copy = dict(group)
                 copy["hooks"] = kept
                 cleaned.append(copy)
@@ -192,6 +227,9 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[1]
     dest = Path(os.environ.get("CLAUDE_HOME") or Path.home() / ".claude").expanduser().absolute()
     source_claude = (root / "CLAUDE.md").read_bytes()
+    source_claude = source_claude.replace(
+        b"__RELAY__", shlex.quote(str(dest / "relay/relay.py")).encode()
+    ).replace(b"__PR_STATUS__", shlex.quote(str(dest / "bin/pr-status")).encode())
     managed_block(source_claude, root / "CLAUDE.md")
     hook_template = parse_json(root / "hooks.json", (root / "hooks.json").read_bytes())
 

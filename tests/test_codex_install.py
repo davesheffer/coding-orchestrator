@@ -1,4 +1,5 @@
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -49,6 +50,48 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(helper.read_bytes(), (ROOT / "bin" / "pr-status").read_bytes())
         self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
         self.assertFalse((self.home.parent / ".claude").exists())
+
+    def test_previous_release_upgrade_requires_force_then_preserves_backups(self):
+        fixture = ROOT / "tests/fixtures/previous-release/codex/agents"
+        shutil.copytree(fixture, self.home / "agents")
+        originals = {p.name: p.read_bytes() for p in fixture.glob("*.toml")}
+        before = self.snapshot()
+        refused = self.run_install()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("use --force", refused.stderr)
+        self.assertEqual(self.snapshot(), before)
+        dry = self.run_install("--force", "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(self.snapshot(), before)
+        upgraded = self.run_install("--force")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+        for name, data in originals.items():
+            self.assertEqual((self.home / "agents" / (name + ".bak")).read_bytes(), data)
+            self.assertEqual((self.home / "agents" / name).read_bytes(),
+                             (ROOT / "codex/agents" / name).read_bytes())
+        before = self.snapshot()
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_actual_shell_entry_point_runs(self):
+        result = subprocess.run([str(ROOT / "codex/install.sh"), "--dry-run"],
+                                env=os.environ | {"CODEX_HOME": str(self.home)},
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.home.exists())
+
+    def test_force_still_rejects_unsafe_incoming_role(self):
+        bundle = Path(self.temp.name) / "bundle"
+        shutil.copytree(ROOT / "codex", bundle / "codex")
+        shutil.copytree(ROOT / "bin", bundle / "bin")
+        source = bundle / "codex/agents/scout.toml"
+        source.write_text(source.read_text().replace("apps = false", "apps = true"))
+        result = subprocess.run(["python3", str(bundle / "codex/install.py"), "--force"],
+                                env=os.environ | {"CODEX_HOME": str(self.home)},
+                                text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("role features", result.stderr)
+        self.assertFalse(self.home.exists())
 
     def test_repeat_is_stable_and_merges_existing_instructions(self):
         self.home.mkdir(parents=True)

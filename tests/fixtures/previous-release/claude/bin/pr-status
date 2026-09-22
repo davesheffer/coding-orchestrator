@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""pr-status — every open PR and its CI state in ONE compact table.
+
+Replaces a series of `gh pr view` / `gh pr checks` / `gh run list` calls, so an
+agent pays for one small tool result instead of many round trips.
+
+  pr-status                 all open PRs in the current repo
+  pr-status 356 358         only these PRs
+  pr-status --author app/hunch-agent
+  pr-status --failed        also list the names of failing/pending checks
+  pr-status -R owner/repo   another repo
+
+Uses ~/.hunch/agent-gh (the agent GitHub identity) when present, else `gh`.
+"""
+import json
+import os
+import subprocess
+import sys
+
+FIELDS = "number,title,headRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,author"
+BAD = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def gh(*args):
+    wrapper = os.path.expanduser("~/.hunch/agent-gh")
+    exe = wrapper if os.access(wrapper, os.X_OK) else "gh"
+    r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        sys.exit(f"pr-status: {' '.join(args[:3])} failed: {r.stderr.strip()[:300]}")
+    return r.stdout
+
+
+def checks(rollup):
+    ok = bad = pending = 0
+    names = []
+    for c in rollup or []:
+        state = (c.get("conclusion") or c.get("state") or c.get("status") or "").upper()
+        name = c.get("name") or c.get("context") or "?"
+        if state in OK:
+            ok += 1
+        elif state in BAD:
+            bad += 1
+            names.append(f"FAIL {name}")
+        else:
+            pending += 1
+            names.append(f"wait {name}")
+    if not (ok or bad or pending):
+        return "none", names
+    verdict = "FAIL" if bad else ("wait" if pending else "green")
+    return f"{verdict} {ok}ok/{bad}bad/{pending}wait", names
+
+
+def main():
+    argv = sys.argv[1:]
+    repo, author, show_failed, numbers = [], [], False, []
+    it = iter(argv)
+    for a in it:
+        if a in ("-h", "--help"):
+            sys.exit(__doc__)
+        elif a == "-R":
+            repo = ["-R", next(it, "")]
+        elif a == "--author":
+            author = ["--author", next(it, "")]
+        elif a == "--failed":
+            show_failed = True
+        elif a.lstrip("#").isdigit():
+            numbers.append(a.lstrip("#"))
+    if numbers:
+        prs = [json.loads(gh("pr", "view", n, *repo, "--json", FIELDS)) for n in numbers]
+    else:
+        prs = json.loads(gh("pr", "list", *repo, *author, "--state", "open", "--limit", "100", "--json", FIELDS))
+    if not prs:
+        print("no open PRs")
+        return
+    print(f"{'PR':>5} {'CI':22} {'merge':12} {'review':10} {'branch':24} title")
+    for p in sorted(prs, key=lambda p: p["number"]):
+        ci, names = checks(p.get("statusCheckRollup"))
+        merge = (p.get("mergeStateStatus") or p.get("mergeable") or "?").lower()
+        if p.get("isDraft"):
+            merge = "draft"
+        review = (p.get("reviewDecision") or "-").lower().replace("_", " ")[:10]
+        print(f"#{p['number']:>4} {ci:22} {merge[:12]:12} {review:10} {p['headRefName'][:24]:24} {p['title'][:60]}")
+        if show_failed:
+            for n in names[:8]:
+                print(f"        {n[:90]}")
+
+
+if __name__ == "__main__":
+    main()

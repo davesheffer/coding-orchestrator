@@ -18,16 +18,13 @@ import json
 import os
 import re
 import secrets
-import shlex
 import subprocess
 import sys
 import time
 import urllib.parse
 from pathlib import Path
 
-ROOT = (Path(os.environ["CLAUDE_HOME"]).expanduser() / "relay"
-        if os.environ.get("CLAUDE_HOME") else Path(__file__).resolve().parent)
-CLAUDE_HOME = ROOT.parent
+ROOT = Path.home() / ".claude" / "relay"
 HANDOFFS = ROOT / "handoffs"
 STATE = ROOT / "state"
 DEFAULTS = {
@@ -38,7 +35,6 @@ DEFAULTS = {
     "auto_open": True,
 }
 RELAY_RE = re.compile(r"\brelay:([a-f0-9]{8})\b")
-MAX_TRANSCRIPT_BYTES = 8 << 20
 URI_SCHEMES = {
     "com.microsoft.VSCode": "vscode",
     "com.microsoft.VSCodeInsiders": "vscode-insiders",
@@ -57,45 +53,32 @@ def config():
 
 
 def context_tokens(transcript_path):
-    """Scan backward in 1 MiB chunks, reading at most 8 MiB total."""
+    """Tokens in the main thread's context = the last non-sidechain assistant
+    turn's input + cache read + cache creation. Reads only the file's tail."""
     try:
-        with open(transcript_path, "rb") as f:
-            cursor = os.fstat(f.fileno()).st_size
-            remaining = MAX_TRANSCRIPT_BYTES
-            partial = b""
-            while cursor > 0 and remaining > 0:
-                amount = min(cursor, remaining, 1 << 20)
-                cursor -= amount
-                remaining -= amount
-                f.seek(cursor)
-                lines = (f.read(amount) + partial).split(b"\n")
-                # Carry the oldest partial record into the next chunk. Discard it
-                # if the scan budget is exhausted; a JSON-looking suffix is unsafe.
-                partial = lines.pop(0) if cursor else b""
-                for line in reversed(lines):
-                    if b'"usage"' not in line and b'"compact_boundary"' not in line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except (ValueError, UnicodeDecodeError):
-                        continue
-                    if not isinstance(entry, dict) or entry.get("isSidechain"):
-                        continue
-                    if entry.get("type") == "system" and entry.get("subtype") == "compact_boundary":
-                        return None
-                    if entry.get("type") != "assistant":
-                        continue
-                    message = entry.get("message")
-                    usage = message.get("usage") if isinstance(message, dict) else None
-                    if not isinstance(usage, dict) or "input_tokens" not in usage:
-                        continue
-                    counts = [usage.get(key, 0) for key in (
-                        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
-                    if any(type(count) is not int or count < 0 for count in counts):
-                        return None
-                    return sum(counts)
+        size = os.path.getsize(transcript_path)
     except OSError:
         return None
+    for window in (1 << 20, 8 << 20, size):
+        with open(transcript_path, "rb") as f:
+            f.seek(max(0, size - window))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        for line in reversed(lines):
+            if '"usage"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue  # partial first line of the window
+            if entry.get("type") != "assistant" or entry.get("isSidechain"):
+                continue
+            usage = (entry.get("message") or {}).get("usage") or {}
+            total = sum(int(usage.get(k) or 0) for k in (
+                "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+            if total:
+                return total
+        if window >= size:
+            break
     return None
 
 
@@ -139,11 +122,9 @@ def sweep(cfg):
                 pass
 
 
-HOW = ("To roll over: write GOAL, STATE, DECISIONS & CONSTRAINTS, FILES, VERIFIED vs UNVERIFIED, "
-       "NEXT STEP and NEXT PROMPT; pipe the handoff to "
-       f"`python3 {shlex.quote(str(Path(__file__).resolve()))} handoff --title \"<short title>\"` "
-       "(body on stdin via quoted heredoc). Report the script's actual result; if it only saves/copies "
-       "a relay prompt, tell the user how to start the new session. Then stop here.")
+HOW = ("To roll over: write the handoff per the Relay protocol in ~/.claude/CLAUDE.md and pipe it to "
+       "`python3 ~/.claude/relay/relay.py handoff --title \"<short title>\"` (body on stdin via heredoc), "
+       "then tell the user the new session is open and stop working in this one.")
 
 
 def emit_context(text):
@@ -173,12 +154,7 @@ def cmd_prompt():
 
     tokens = context_tokens(data.get("transcript_path") or "")
     z = zone(tokens, cfg)
-    if z == "unknown":
-        if data.get("transcript_path"):
-            emit_context("[relay] Context usage is unknown; no recent main-thread usage was available "
-                         "within the 8 MiB scan limit. Do not infer a zone or force rollover.")
-        return
-    if tokens < cfg["task_shift_min_tokens"]:
+    if z in ("unknown",) or tokens < cfg["task_shift_min_tokens"]:
         return  # fresh session: zero overhead
     if load_state(session_id).get("handoff_done"):
         emit_context(f"[relay] context ~{k(tokens)}. This session was already handed off — if the user is "

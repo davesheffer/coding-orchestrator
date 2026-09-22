@@ -186,7 +186,9 @@ def main(argv: list[str] | None = None) -> int:
         prior = read_regular(target)
         existing[target] = prior
         if target.suffix == ".toml" and prior is not None:
-            validate_role(target, prior, target.stem)
+            # Installed roles can follow an older schema. Validate their syntax,
+            # then let conflict/--force handling preserve and replace them.
+            parse_toml(target, prior)
     config = dest / "config.toml"
     config_existing = read_regular(config)
     if config_existing is not None:

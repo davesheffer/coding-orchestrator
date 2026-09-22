@@ -37,10 +37,10 @@ assistant homes; neither installer implicitly configures a project's local files
 ./install.sh
 ```
 
-Requires Claude Code and Python 3. The transactional installer places the marked
+Requires Claude Code and Python 3. The installer places the marked
 orchestrator block, four Markdown roles, relay, and `pr-status` under
-`${CLAUDE_HOME:-$HOME/.claude}`. It validates every source and destination before
-writing, refuses symlinks and malformed JSON/markers, preserves instructions
+`${CLAUDE_HOME:-$HOME/.claude}`. It validates roles, JSON, markers, and destination
+conflicts before writing, refuses symlinks, preserves instructions
 outside its managed block, migrates old relay hooks to the selected
 `CLAUDE_HOME`, keeps a tuned `relay/config.json`, and writes unique backups.
 
@@ -49,12 +49,25 @@ update automatically when their installed hash still matches the manifest; a
 local modification is never overwritten unless you review it and pass
 `--force`. The installer is idempotent and does not copy credentials.
 
+Hooks and installed instructions contain quoted absolute helper paths. The relay
+finds its config, state, and handoffs next to its installed script, so an
+installation-only `CLAUDE_HOME` does not need to remain in your shell. An explicit
+runtime `CLAUDE_HOME` overrides this location. Hook migration matches complete
+bundle commands and preserves other projects' relays and user-added commands.
+Writes are atomic per file, not across the installation; an unexpected I/O error
+can leave a partial install. Inspect backups and rerun after resolving the error.
+
 Start a new Claude Code session after installation. The existing relay handles
 the GREEN/AMBER/RED context gauge and session handoffs; see `relay/config.json`
 for its thresholds. Roles have bounded turns, explicit permission modes, narrow
 tool allowlists, and no MCP tools. Claude Code can still apply a stronger parent
 permission mode, so use `/tasks` and `/status` to confirm the effective model and
 settings when validating a new machine.
+
+Each relay measurement reads at most the last **8 MiB** of the transcript. Missing
+usage or a compaction boundary without subsequent usage yields **unknown**, never
+a guessed zone or forced rollover. The relay's transcript format is a heuristic;
+live client validation remains necessary after client upgrades.
 
 ### Codex
 
@@ -64,7 +77,8 @@ settings when validating a new machine.
 ```
 
 Requires Python **3.11+** (`tomllib`) and a Codex version supporting native
-`~/.codex/agents/*.toml` roles. This setup was exercised with **Codex CLI 0.154.0**.
+`~/.codex/agents/*.toml` roles. Earlier work targeted **Codex CLI 0.154.0**;
+Python tests do not establish native client compatibility or effective permissions.
 
 The Codex installer:
 
@@ -79,6 +93,8 @@ The Codex installer:
 - Validates TOML, markers, and conflicts before writing. Differing role/helper
   files require `--force`, which saves unique backups. Malformed inputs and
   symlink destinations are refused, including with `--force`.
+  Valid older role schemas can be upgraded with `--force`; the new role contract
+  is enforced on incoming bundle files, not on files being replaced.
 - Uses atomic replacement per file. Validation failures make no changes;
   unexpected I/O failures during installation can leave an incomplete install.
   Inspect the reported files and backups before rerunning.
@@ -151,11 +167,12 @@ runner. No credentials are included.
 | Files | Purpose |
 |---|---|
 | `CLAUDE.md`, `agents/*.md` | Claude orchestrator and bounded native roles |
-| `install.sh`, `claude/install.py` | Transactional Claude installer |
+| `install.sh`, `claude/install.py` | Claude installer with per-file atomic writes |
 | `relay/`, `hooks.json` | Claude-only context relay |
 | `codex/AGENTS.md`, `codex/agents/*.toml` | Codex orchestrator and native roles |
 | `codex/install.sh`, `codex/install.py`, `codex/config.example.toml` | Codex installation and new-home defaults |
 | `codex/PROMPT.md`, `codex/CONTEXT-GAUGE.md` | Validation brief and optional gauge proposal |
+| `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
 | `bin/pr-status` | Shared PR/CI helper |
 | `tests/` | Bundle contracts, both installers, and relay behavior |
 | `.github/workflows/ci.yml` | Python 3.11–3.13 CI, compilation, shell syntax, and tests |
@@ -174,6 +191,13 @@ python3 -m unittest discover -s tests -v
 The suite exercises clean installs, upgrades, idempotency, unique backups,
 custom home paths, malformed inputs, symlink attacks, role parity, JSON/TOML
 contracts, relay token zones, hook failure safety, and handoff persistence.
+It also executes both shell entry points, upgrades previous-release Claude and Codex files,
+preserves unrelated hooks, exercises custom-home handoffs without installation
+environment variables, and verifies bounded transcript reads.
+
+Before claiming compatibility with a client release, complete the
+[native client acceptance checks](docs/client-validation.md). Those require
+installed, authenticated clients and are separate from the offline Python suite.
 
 Credentials, personal MCP configuration, per-project assistant configuration,
 personal status lines, and permission allowlists do not belong in this bundle.

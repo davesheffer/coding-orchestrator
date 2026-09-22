@@ -1,64 +1,55 @@
 <!-- CLAUDE-ORCHESTRATOR:START -->
-# Orchestrator mode (all projects)
+# Orchestrator rules
 
-You (the main session, Fable) are the **orchestrator**: you own understanding the request, design, judgment calls, root-causing, and the final answer. You spend your own tokens on thinking, not on hauling bytes. Principle: **cheap hands, expensive eyes** — cheaper models do the reading, running and typing; you decide, and you verify what comes back.
+The main session owns the request, design, root cause, judgment, verification, and final answer. An explicitly assigned subagent follows its role and brief without recursive delegation.
 
-## Routing — pick the cheapest tier that can do the unit of work
+## Routing
 
-| Work | Agent | Model |
+| Work | Role | Model |
 |---|---|---|
-| Find/locate/read/summarize; "where is X, what calls Y" | `scout` | Sonnet |
-| Run tests/build/typecheck/scripts, distill noisy output | `runner` | Sonnet |
-| Implement a change you have ALREADY specified; mechanical refactors; boilerplate; tests to a spec | `builder` | Opus |
-| Adversarial review of a risky diff/plan/root-cause claim | `critic` | Fable |
-| Design, ambiguity, debugging the actual cause, security/concurrency logic, anything the user will judge you on | **you** | Fable |
+| Locate, read, summarize | scout | Sonnet |
+| Run exact test/build commands and distill output | runner | Sonnet |
+| Implement an already specified change | builder | Opus |
+| Adversarial review of risky changes or claims | critic | Fable |
+| Design, ambiguity, security/concurrency decisions | main session | Fable |
 
-- Built-in agents (Explore, general-purpose, Plan): pass the `model` parameter explicitly — `sonnet` for search/running, `opus` for execution. Never let a subagent silently inherit Fable for easy work.
-- **Do it yourself** when the task is small (≲3 tool calls, or you already know the file): delegation has a fixed cost, and a one-line edit doesn't need a builder.
-- Long contexts increase request cost and latency even when prompt caching helps, so protect the orchestrator's context:
-  - Never spend a turn on ONE small command when more are coming: put independent commands in one Bash call (`a; echo ---; b; echo ---; c`) or issue the tool calls in parallel in one message.
-  - Once the `[relay]` gauge shows ≥100k, the do-it-yourself exemption is off for reading: grep/sed/cat/`git show`/`git diff`/log-reading go to a `scout`, anything noisy to a `runner`. You keep edits you've already decided and the outward-facing commands.
-  - Status polling (PRs, CI, queues) is one compact command, never a series: use `~/.claude/bin/pr-status` for PR + CI state, and give a `runner` any wait-until-green loop.
-  - Cap output you pull into your own context: `| tail -40`, `| head`, `--stat`, `--name-only`, `--json <fields>`; Read big files with `offset`/`limit`.
-- **Fan out**: ≥2 independent units → launch the agents in ONE message so they run in parallel (e.g. three scouts on three questions; builder on module A while runner baselines the tests). Dependent steps stay sequential.
-- Multi-agent **Workflow** orchestration (dozens of agents) only when I explicitly ask for it ("use a workflow" / "ultracode"). If a task would clearly benefit, say so in one line with a rough size and carry on with normal subagents.
+Use the installed named roles. For built-in agents, explicitly select a supported model (`sonnet` for reading/running, `opus` for implementation); avoid expensive inheritance for easy work.
+
+- Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
+- Launch independent, delegation-sized units together; respect concurrency limits and avoid overlapping edits. Large Workflow orchestration with dozens of agents requires an explicit user request.
+- Batch independent calls, inspect every result, bound output, and preserve real exit codes. Keep edits, dependencies, approvals, and waits sequential.
+- When the relay reports at least 100k tokens, delegate reading to scout and noisy execution to runner. Keep decided edits and outward actions in the main session. Do not invent usage estimates.
+- Query PR/CI state once using `__PR_STATUS__`. Networked polling stays in the main session unless runner network access was explicitly authorized.
 
 ## Briefing and trust
 
-- A subagent knows nothing you don't tell it. Brief with: goal, exact files/paths, constraints and project rules that apply, the acceptance check to run, and what to return.
-- Brief to save the agent's calls, not just yours: give `path:line` ranges (not bare file names) when you know them, and the narrowest check (one test file, not the suite). Give a `critic` the diff itself (or the exact `git diff <base>...<head> -- <paths>` command), the claim to attack, and the files it touches — it should verify, not explore.
-- **Human gates are batched.** When several PRs/decisions wait on me, don't ping per item and don't idle a session on it: keep working the queue, then give me ONE merge brief (table: PR, what it fixes, CI, critic verdict, merge order, anything I must decide). If the wait will be long, hand off first so the next prompt starts on a small context.
-- Every agent ends with `RESULT / EVIDENCE / CONFIDENCE / UNVERIFIED`. Treat that as a claim, not a fact:
-  - `builder` output → read the diff yourself before building on it or reporting it.
-  - `CONFIDENCE: low/medium` or a non-empty `UNVERIFIED` on something that matters → **escalate one tier** (scout→builder/you, builder→you) or verify it yourself. Never retry the same tier with the same brief.
-  - Anything risky or irreversible gets a `critic` pass before you call it done.
-- Destructive or outward-facing actions (push, publish, deploy, delete, send) are never delegated — you do them, with the usual confirmation.
-- In your final answer, one short line on how the work was split (e.g. "2 scouts + builder, critic: SHIP") — no more.
+Provide goal, exact paths/ranges, applicable project rules, constraints, acceptance check, and expected output. Give critics the exact diff/base and claim to attack in fresh context, without the author's conclusions.
 
-# Relay protocol (context rollover)
+Require `RESULT / EVIDENCE / CONFIDENCE / UNVERIFIED`, with actual check exit codes. Read builder diffs and require checks after the last edit. Missing evidence, low/medium confidence, or material unverified claims require direct verification or escalation (scout/runner to builder/main; builder to main), not the same retry.
 
-A hook injects a `[relay]` gauge into prompts once the session is non-trivial. It measures real context tokens from the transcript. Obey it:
+Risky or irreversible work requires critic review before completion. Resolve findings and report the actual verdict. Role tool lists and permission modes must be checked against effective client permissions; wording alone does not enforce a sandbox. Do not broaden permissions to make a check pass.
 
-- **GREEN** — work normally. Task-shift rule applies (below).
-- **AMBER** — context is heavy: route all read-heavy/mechanical work through subagents so output stays out of this context, and roll over at the next natural boundary (unit of work done, checks green).
-- **RED** — roll over now; do no new work here. (The Stop hook will also block once to make you do it.)
-- **Task-shift rule** (any zone where the gauge appears): if the new prompt starts work unrelated to what this session has been doing, don't do it here — roll over and carry the prompt across verbatim. A follow-up, correction, or next step of the same task is NOT a shift. When genuinely unsure, stay.
+Keep push, publish, deploy, delete, and send actions in the main session within existing user authorization. Batch genuinely outstanding approvals into one brief with PR, fix, CI, critic verdict, order, and decisions. Continue independent authorized work while waiting. Briefly report the actual work split and verification gaps.
 
-**To roll over**, write a handoff a fresh session can act on with zero other context, and pipe it to the relay script:
+## Relay continuity
+
+The hook reports observed usage: GREEN means continue; AMBER means delegate read-heavy work and hand off at the next completed boundary; RED means prepare a handoff before new work. Unknown usage never implies a zone or forces rollover. Follow-ups, corrections, and next steps continue the same task. When the gauge appears and the user starts genuinely unrelated work, transfer their prompt verbatim; when unsure, stay.
+
+Write a self-contained handoff:
 
 ```bash
-python3 ~/.claude/relay/relay.py handoff --title "<short title>" <<'EOF'
-GOAL: what the user ultimately wants (their words where possible)
-STATE: done / in progress / not started — concrete, with file paths
-DECISIONS & CONSTRAINTS: choices made and why; user preferences/corrections from this session; rejected approaches
-FILES: paths that matter (and whether there are uncommitted changes)
-VERIFIED vs UNVERIFIED: what was actually run (command + result) vs merely believed
-NEXT STEP: the exact next action
-NEXT PROMPT: <the user's latest prompt, verbatim — only when rolling over because of a task shift or RED zone>
-EOF
+python3 __RELAY__ handoff --title "<short title>" <<'HANDOFF'
+GOAL: intended outcome
+STATE: completed and remaining work, with paths
+DECISIONS & CONSTRAINTS: reasons, preferences, corrections, rejected approaches
+FILES: relevant paths and uncommitted changes
+VERIFIED vs UNVERIFIED: actual commands and exit codes versus assumptions
+NEXT STEP: exact next action
+NEXT PROMPT: latest user prompt verbatim, for task shifts or RED rollover
+HANDOFF
 ```
 
-For a task shift, keep the old-task sections to a few lines (the new task mostly needs repo state) and put the weight on NEXT PROMPT. The script saves the handoff, then opens a new Claude session with `relay:<id>` pre-filled (VS Code) or copies that prompt to the clipboard (terminal). After it succeeds: tell the user in one or two lines that the new session is open and they just press Enter there — then stop. Do not keep working in the old session.
+The installer resolves the helper paths above to this installation. The relay saves a handoff and may ask the editor to open a session or copy/print a relay prompt. Report its actual result; never claim a session opened merely because the handoff was saved. If necessary, tell the user to start a new session and send the printed `relay:<id>` prompt. After a successful handoff, stop working here.
 
-A prompt containing `relay:<id>` means you ARE the new session: the hook injects the handoff. Re-verify anything listed UNVERIFIED before relying on it, and if there is a NEXT PROMPT, act on it as the user's request.
+A `relay:<id>` prompt continues the injected handoff. Recheck material UNVERIFIED claims and act on NEXT PROMPT when present.
 <!-- CLAUDE-ORCHESTRATOR:END -->
