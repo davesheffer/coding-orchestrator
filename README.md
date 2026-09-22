@@ -103,14 +103,19 @@ Python tests do not establish native client compatibility or effective permissio
 
 The Codex installer:
 
-- Installs four native TOML roles and a standalone copy of `bin/pr-status` under
+- Installs four native TOML roles, `bin/pr-status` and the restricted Windows
+  `bin/agent-run.py` launcher under
   `${CODEX_HOME:-$HOME/.codex}`. Claude Code does not need to be installed.
 - Merges the marked orchestrator section into global `AGENTS.md`, preserving
   content outside that section. Existing instructions receive a backup when
   changed. A global `AGENTS.override.md` is left alone and reported because it
   can shadow `AGENTS.md`.
 - Creates `config.toml` from `codex/config.example.toml` only when absent.
-  An existing configuration, including its model choices, is preserved exactly.
+  Fresh installs default generic subagents to Luna/low. Existing configurations
+  are preserved exactly unless `--configure-routing` is selected; that option
+  fills missing generic model/effort defaults while preserving explicit choices.
+- Creates a user-owned `agent-routing.json` with no network-fallback approvals.
+  Existing policies are validated and preserved, including on forced upgrades.
 - Validates TOML, markers, and conflicts before writing. Differing role/helper
   files require `--force`, which saves unique backups. Malformed inputs and
   symlink destinations are refused, including with `--force`.
@@ -161,11 +166,12 @@ roles are not a universal isolation boundary. The instructions require checking
 effective permissions and using a separately restricted `codex exec` process
 when the host cannot enforce them. For builder, that process clears extra
 writable roots and excludes temporary directories outside the workspace.
-The orchestrator must disable every effective MCP server for an isolated launch;
-the known names in the role files are not a wildcard for future servers.
-This repository does not ship a permission-enforcing launcher, and a prompt
-alone does not replace a sandbox. See `codex/AGENTS.md` for the launch requirements
-and refusal behavior.
+The bundled Windows launcher probes the filesystem boundary, checks effective
+MCP/tool restrictions, and records actual model usage. The known MCP names in role
+files are not a wildcard for future servers. The launcher remains dependent on
+the host's Codex sandbox; a prompt alone does not replace enforcement. Other
+platforms retain the verified native/manual launch workflow. See
+[routing and fallbacks](docs/agent-routing.md) for commands and limitations.
 
 On native Windows, verify the sandbox and the active Windows Firewall profile.
 The `unelevated` sandbox provides weaker network isolation; the `elevated`
@@ -174,13 +180,13 @@ the orchestrator must report that limitation and keep the work in the main
 session, unless you explicitly authorize a different boundary. The installer
 does not change firewall settings. See the [Windows sandbox documentation](https://learn.chatgpt.com/docs/windows/windows-sandbox).
 
-For critic reviews only, an [optional last-resort fallback](docs/critic-network-fallback.md)
-can continue without network isolation after the available isolated launch paths
-fail. The orchestrator explains the tradeoff and asks for your approval; you can
-remember approval or refusal locally. Read-only filesystem enforcement and disabled
-web/browser/MCP/app tools remain mandatory. Installation grants no exception, and
-every later review still tries isolation first. This is an agent-instruction
-workflow; the bundle does not install an automatic fallback launcher.
+An [optional last-resort network fallback](docs/agent-routing.md#optional-network-exception)
+can be approved per role. The launcher tries isolation first on every run and
+retains file-access limits and disabled external tools. Installation grants no
+exception. Model-unavailable errors before any work can try Luna -> Terra -> Sol
+for scout/runner and Terra -> Sol for builder. Tests, partial work and unknown
+errors are never blindly retried. The older
+[critic-only manual workflow](docs/critic-network-fallback.md) remains available.
 
 Codex uses native compaction. A transcript-based gauge is documented in
 [the proposal](codex/CONTEXT-GAUGE.md); it is **not implemented or installed**.
@@ -217,6 +223,7 @@ runner. No credentials are included.
 | `codex/PROMPT.md`, `codex/CONTEXT-GAUGE.md` | Validation brief and optional gauge proposal |
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
 | `bin/pr-status` | Shared PR/CI helper |
+| `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `tests/` | Bundle contracts, both installers, and relay behavior |
 | `.github/workflows/ci.yml` | Python 3.11–3.13 Linux CI plus Windows/macOS 3.12, compilation, shell syntax, and tests |
 

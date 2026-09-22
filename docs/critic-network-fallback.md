@@ -1,12 +1,17 @@
 # Optional Codex critic network fallback
 
+This page describes the legacy manual critic-only workflow. The bundle now also
+includes a [restricted Windows launcher](agent-routing.md) with per-role opt-in
+approval. Existing instruction-block decisions are preserved; they are not
+automatically imported into its separate, deny-by-default JSON policy.
+
 The normal critic requires enforced read-only filesystem access and network
 isolation. Some environments can enforce the filesystem boundary but cannot
 block command networking. On those hosts, the orchestrator can offer a
 user-approved fallback instead of repeatedly abandoning independent review.
 
-This is a workflow in the installed agent instructions, not a permission-enforcing
-launcher or an installer switch. The orchestrator must configure and verify a
+This manual route is a workflow in the installed agent instructions. The
+orchestrator must configure and verify a
 supported restricted runtime on the actual host. The bundle never ships a user's
 approval, enables a fallback profile by default, or changes firewall settings.
 

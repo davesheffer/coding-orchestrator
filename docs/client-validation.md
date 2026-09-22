@@ -42,6 +42,27 @@ release limitations and are why the public bundle is labeled experimental.
 
 ## Install and upgrade
 
+### Cheap-routing launcher follow-up — 2026-09-22
+
+The local Windows prototype ran Luna scouts/runners, a Terra builder and Astra
+critics through separate restricted CLI processes. The bundled launcher was also
+exercised directly on this repository: a Luna/low scout read the new defaults and
+installer policy and returned exact file references with CLI exit 0. Its thread
+database recorded Luna/low, rather than inferring the model from the requested
+flag. Both Windows backend probes permitted outbound TCP on this host; the run
+used the author's explicitly approved local network exception. Workspace and
+outside-workspace write probes passed, and effective MCP/external-tool checks
+showed the required tools disabled. No personal approval is included in the bundle.
+
+These observations validate the separate Windows launcher, not native child-agent
+inheritance or Linux/macOS runtime support. Model-unavailable fallback is covered
+by simulated event-stream tests; no real provider outage was induced. The new
+installer tests cover deny-by-default policy creation, preserving approvals and
+refusals, and opt-in routing updates without overwriting explicit model choices.
+Use this change's own CI results for its final test counts and platform status.
+
+### Procedure
+
 1. Record `codex --version` and `claude --version` for the clients being tested.
 2. Use a disposable work repository and an isolated client configuration through
    that client's supported mechanism. Do not copy credentials into this bundle.
