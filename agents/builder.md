@@ -1,7 +1,7 @@
 ---
 name: builder
-description: Mid tier (Opus). Implements a WELL-SPECIFIED change — the orchestrator has already decided what and where. Good for writing a function/test to a given spec, mechanical refactors and renames across files, boilerplate, migrations following an existing pattern, doc updates, applying review fixes. Give it exact files, the acceptance check to run, and constraints. NOT for ambiguous design, architecture, subtle concurrency/security logic, or root-causing a bug — the orchestrator keeps those.
-model: opus
+description: Implement a specified change in assigned files and run its acceptance check. Use for mechanical edits and clear briefs; leave design and root cause to the main session.
+model: sonnet
 tools: Read, Edit, Write, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: acceptEdits

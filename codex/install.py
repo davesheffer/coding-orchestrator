@@ -24,13 +24,19 @@ ROLE_SANDBOX = {
     "scout": "read-only", "runner": "workspace-write",
     "builder": "workspace-write", "critic": "read-only",
 }
+DISABLED_FEATURES = (
+    'apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_external',
+    'browser_use_full_cdp_access', 'in_app_browser', 'computer_use',
+    'image_generation', 'multi_agent', 'multi_agent_v2',
+    'skill_mcp_dependency_install',
+)
 REQUIRED_ROLE_FIELDS = {
     "name", "description", "model", "model_reasoning_effort", "sandbox_mode",
     "approval_policy", "developer_instructions",
 }
 ROUTING_POLICY = b'{"network_fallback_roles": []}\n'
 ROUTING_FIELDS = {
-    "default_subagent_model": "gpt-5.6-luna",
+    "default_subagent_model": "gpt-6-luna",
     "default_subagent_reasoning_effort": "low",
 }
 
@@ -121,7 +127,7 @@ def validate_role(path: Path, data: bytes, name: str) -> None:
         fail(f"invalid role boundary in {path}")
     if role.get("web_search") != "disabled":
         fail(f"web search must be disabled in {path}")
-    if role.get("features") != {"apps": False}:
+    if role.get("features") != {name: False for name in DISABLED_FEATURES}:
         fail(f"unsupported or enabled role features in {path}")
     if role.get("agents") != {"enabled": False}:
         fail(f"nested agents must be disabled in {path}")
@@ -233,9 +239,12 @@ def main(argv: list[str] | None = None) -> int:
     config_source = read_regular(here / "config.example.toml")
     helper_source = read_regular(here.parent / "bin" / "pr-status")
     agent_run_source = read_regular(here.parent / "bin" / "agent-run.py")
-    assert config_source is not None and helper_source is not None and agent_run_source is not None
+    report_source = read_regular(here.parent / "bin" / "agent-report.py")
+    assert all(source is not None for source in
+               (config_source, helper_source, agent_run_source, report_source))
     sources[dest / "bin" / "pr-status"] = helper_source
     sources[dest / "bin" / "agent-run.py"] = agent_run_source
+    sources[dest / "bin" / "agent-report.py"] = report_source
     parse_toml(here / "config.example.toml", config_source)
     managed_block(sources[dest / "AGENTS.md"], here / "AGENTS.md")
 

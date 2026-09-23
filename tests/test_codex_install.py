@@ -28,12 +28,14 @@ class CodexInstallTests(unittest.TestCase):
     def test_fresh_install_parses_and_installs_helper(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.home / "bin/agent-report.py").is_file())
         import tomllib
         config = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
-        self.assertEqual(config["model"], "gpt-6-astra")
+        self.assertEqual(config["model"], "gpt-6-sol")
+        self.assertEqual(config["model_reasoning_effort"], "medium")
         self.assertTrue(config["agents"]["enabled"])
         self.assertEqual(config["agents"]["max_concurrent_threads_per_session"], 6)
-        self.assertEqual(config["agents"]["default_subagent_model"], "gpt-5.6-luna")
+        self.assertEqual(config["agents"]["default_subagent_model"], "gpt-6-luna")
         self.assertEqual(config["agents"]["default_subagent_reasoning_effort"], "low")
         for role in ("scout", "runner", "builder", "critic"):
             self.assertEqual(tomllib.loads((self.home / "agents" / f"{role}.toml").read_text(encoding="utf-8"))["name"], role)
@@ -47,7 +49,12 @@ class CodexInstallTests(unittest.TestCase):
         runner = tomllib.loads((self.home / "agents" / "runner.toml").read_text(encoding="utf-8"))
         self.assertEqual(runner["sandbox_mode"], "workspace-write")
         self.assertFalse(runner["sandbox_workspace_write"]["network_access"])
-        self.assertEqual(set(runner["features"]), {"apps"})
+        self.assertEqual(set(runner["features"]), {
+            "apps", "plugins", "remote_plugin", "browser_use", "browser_use_external",
+            "browser_use_full_cdp_access", "in_app_browser", "computer_use",
+            "image_generation", "multi_agent", "multi_agent_v2",
+            "skill_mcp_dependency_install",
+        })
         self.assertFalse(runner["agents"]["enabled"])
         critic = tomllib.loads((self.home / "agents" / "critic.toml").read_text(encoding="utf-8"))
         self.assertEqual(critic["sandbox_mode"], "read-only")
@@ -60,6 +67,7 @@ class CodexInstallTests(unittest.TestCase):
         self.assertNotIn("default_permissions", config)
         self.assertEqual(list(self.home.glob("*.config.toml")), [])
         installed_instructions = (self.home / "AGENTS.md").read_bytes()
+        self.assertIn(b'python "$env:USERPROFILE/.codex/bin/pr-status"', installed_instructions)
         self.assertNotIn(b"<!-- CODEX-CRITIC-NETWORK-FALLBACK:START -->", installed_instructions)
         helper = self.home / "bin" / "pr-status"
         self.assertEqual(helper.read_bytes(), (ROOT / "bin" / "pr-status").read_bytes())
@@ -307,7 +315,7 @@ class CodexInstallTests(unittest.TestCase):
         import tomllib
         config = tomllib.loads(self.home.joinpath("config.toml").read_text(encoding="utf-8"))
         self.assertEqual(config["agents"]["custom"]["model"], "custom")
-        self.assertEqual(config["agents"]["default_subagent_model"], "gpt-5.6-luna")
+        self.assertEqual(config["agents"]["default_subagent_model"], "gpt-6-luna")
 
     def test_configure_routing_preserves_eof_and_line_endings(self):
         import tomllib
@@ -325,7 +333,7 @@ class CodexInstallTests(unittest.TestCase):
                 before = tomllib.loads(original.decode())
                 expected = dict(before)
                 expected['agents'] = dict(before.get('agents', {}))
-                expected['agents'].update(default_subagent_model='gpt-5.6-luna', default_subagent_reasoning_effort='low')
+                expected['agents'].update(default_subagent_model='gpt-6-luna', default_subagent_reasoning_effort='low')
                 self.assertEqual(tomllib.loads(updated.decode()), expected)
                 if b'\r\n' in original:
                     self.assertNotIn(b'\n', updated.replace(b'\r\n', b''))

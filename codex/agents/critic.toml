@@ -1,6 +1,6 @@
 # Codex role translated from the bundled agents/critic.md.
 name = "critic"
-description = "Top tier (GPT-6 Astra), read-only. An independent adversarial second opinion with FRESH context, unanchored by the orchestrator's reasoning — reviews a diff, plan, or root-cause claim and tries to break it. Use before finishing anything non-trivial or risky (data loss, security, migrations, concurrency, public API), or when the orchestrator's own confidence is below high. Give it the diff/plan and the claim to attack; it must not see the orchestrator's reasoning as settled."
+description = "Fresh, read-only adversarial review of a risky diff or unresolved claim. Reserve for security, migrations, concurrency, data-loss risk, public APIs, or low-confidence conclusions."
 model = "gpt-6-astra"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
@@ -44,6 +44,17 @@ writable_roots = []
 
 [features]
 apps = false
+plugins = false
+remote_plugin = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+in_app_browser = false
+computer_use = false
+image_generation = false
+multi_agent = false
+multi_agent_v2 = false
+skill_mcp_dependency_install = false
 
 [agents]
 enabled = false

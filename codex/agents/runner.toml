@@ -1,7 +1,7 @@
 # Codex role translated from the bundled agents/runner.md.
 name = "runner"
-description = "Cheapest tier (GPT-5.6 Luna). Runs commands and reports results verbatim — test suites, typecheck, build, lint, a script, a git/gh status query — and distills long output into pass/fail plus the exact failing lines. Use whenever a command's output is long or noisy and the orchestrator only needs the verdict. NOT for fixing what fails, and not for anything destructive or outward-facing (push, publish, deploy, delete)."
-model = "gpt-5.6-luna"
+description = "Run an exact command and report its exit code and relevant failures. Use for noisy offline tests and builds; do not diagnose or repair failures."
+model = "gpt-6-luna"
 model_reasoning_effort = "low"
 sandbox_mode = "workspace-write"
 approval_policy = "never"
@@ -38,6 +38,17 @@ writable_roots = []
 
 [features]
 apps = false
+plugins = false
+remote_plugin = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+in_app_browser = false
+computer_use = false
+image_generation = false
+multi_agent = false
+multi_agent_v2 = false
+skill_mcp_dependency_install = false
 
 [agents]
 enabled = false

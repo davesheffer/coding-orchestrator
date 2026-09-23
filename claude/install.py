@@ -224,9 +224,12 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[1]
     dest = Path(os.environ.get("CLAUDE_HOME") or Path.home() / ".claude").expanduser().absolute()
     source_claude = (root / "CLAUDE.md").read_bytes()
+    pr_status = shlex.quote(str(dest / "bin/pr-status"))
+    if os.name == "nt":
+        pr_status = "python " + pr_status
     source_claude = source_claude.replace(
         b"__RELAY__", shlex.quote(str(dest / "relay/relay.py")).encode()
-    ).replace(b"__PR_STATUS__", shlex.quote(str(dest / "bin/pr-status")).encode())
+    ).replace(b"__PR_STATUS__", pr_status.encode())
     managed_block(source_claude, root / "CLAUDE.md")
     hook_template = parse_json(root / "hooks.json", (root / "hooks.json").read_bytes())
 

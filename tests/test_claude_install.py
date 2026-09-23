@@ -48,6 +48,9 @@ class ClaudeInstallTests(unittest.TestCase):
         for role in ("scout", "runner", "builder", "critic"):
             self.assertTrue((self.home / "agents" / f"{role}.md").exists())
         helper = self.home / "bin/pr-status"
+        instructions = (self.home / "CLAUDE.md").read_text(encoding="utf-8")
+        expected_command = ("python " if os.name == "nt" else "") + shlex.quote(str(helper))
+        self.assertIn(f"using `{expected_command}`", instructions)
         if os.name == "posix":
             self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
         before = self.snapshot()

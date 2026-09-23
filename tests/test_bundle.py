@@ -22,9 +22,9 @@ def frontmatter(path):
 class BundleContractTests(unittest.TestCase):
     def test_role_names_models_boundaries_and_reports_match(self):
         expected = {
-            "scout": ("sonnet", "gpt-5.6-luna", "read-only"),
-            "runner": ("sonnet", "gpt-5.6-luna", "workspace-write"),
-            "builder": ("opus", "gpt-5.6-terra", "workspace-write"),
+            "scout": ("haiku", "gpt-6-luna", "read-only"),
+            "runner": ("sonnet", "gpt-6-luna", "workspace-write"),
+            "builder": ("sonnet", "gpt-6-sol", "workspace-write"),
             "critic": ("fable", "gpt-6-astra", "read-only"),
         }
         for name in ROLES:
@@ -38,8 +38,8 @@ class BundleContractTests(unittest.TestCase):
                 self.assertEqual(codex["sandbox_mode"], expected[name][2])
                 self.assertEqual(codex["web_search"], "disabled")
                 self.assertFalse(codex["sandbox_workspace_write"]["network_access"])
-                self.assertFalse(codex["features"]["apps"])
-                self.assertEqual(set(codex["features"]), {"apps"})
+                self.assertTrue(all(value is False for value in codex["features"].values()))
+                self.assertIn("skill_mcp_dependency_install", codex["features"])
                 self.assertFalse(codex["agents"]["enabled"])
                 self.assertEqual(claude["disallowedTools"], "mcp__*")
                 for field in ("RESULT:", "EVIDENCE:", "CONFIDENCE:", "UNVERIFIED:"):
@@ -47,8 +47,8 @@ class BundleContractTests(unittest.TestCase):
                     self.assertIn(field, codex["developer_instructions"])
 
     def test_instruction_markers_and_hook_template(self):
-        claude = (ROOT / "CLAUDE.md").read_text()
-        codex = (ROOT / "codex/AGENTS.md").read_text()
+        claude = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+        codex = (ROOT / "codex/AGENTS.md").read_text(encoding="utf-8")
         self.assertEqual(claude.count("CLAUDE-ORCHESTRATOR:START"), 1)
         self.assertEqual(claude.count("CLAUDE-ORCHESTRATOR:END"), 1)
         self.assertEqual(codex.count("CODEX-ORCHESTRATOR:START"), 1)

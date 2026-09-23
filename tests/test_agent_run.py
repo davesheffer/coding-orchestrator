@@ -15,7 +15,7 @@ spec.loader.exec_module(agent)
 
 class RoutingTests(unittest.TestCase):
     def test_only_model_unavailability_before_work_retries(self):
-        error = {'type': 'error', 'message': "The 'gpt-5.6-luna' model is not supported for this account"}
+        error = {'type': 'error', 'message': "The 'gpt-6-luna' model is not supported for this account"}
         self.assertTrue(agent.retryable_model_error([{'type': 'thread.started'}, error], 1))
         self.assertFalse(agent.retryable_model_error([error], 0))
         for kind in ('item.started', 'item.completed', 'item.updated'):
@@ -57,8 +57,8 @@ class RoutingTests(unittest.TestCase):
              patch.object(Path, 'read_text', side_effect=['[mcp_servers.docs]\nurl="https://example.invalid"\n',
                                                         '[mcp_servers.new_server]\ncommand="node"\n']):
             settings = agent.settings_for(root, False, False, 'elevated', 'test-policy', 'brief')
-        self.assertEqual(settings['mcp_servers']['docs'], {'enabled': False})
-        self.assertEqual(settings['mcp_servers']['new_server'], {'enabled': False})
+        self.assertEqual(settings['mcp_servers']['docs'], {'enabled': False, 'url': 'https://example.invalid'})
+        self.assertEqual(settings['mcp_servers']['new_server'], {'enabled': False, 'command': 'node'})
         self.assertEqual(settings['permissions.test-policy']['filesystem'], {str(root): 'read'})
         self.assertFalse(settings['permissions.test-policy']['network']['enabled'])
 

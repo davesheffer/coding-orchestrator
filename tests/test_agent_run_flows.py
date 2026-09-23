@@ -22,13 +22,13 @@ LEAK = dict(GOOD, filesystem_ok=False)
 
 
 class FlowTests(unittest.TestCase):
-    def run_flow(self, responses, probes, approved=True):
+    def run_flow(self, responses, probes, approved=True, extra_args=()):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TEST_TMPDIR')) as temp:
             root = Path(temp)
             workspace = root / 'workspace'
             workspace.mkdir()
             (root / 'agents').mkdir()
-            (root / 'agents/scout.toml').write_text('model="gpt-5.6-luna"\nmodel_reasoning_effort="low"\ndeveloper_instructions="Read-only scout"\n')
+            (root / 'agents/scout.toml').write_text('model="gpt-6-luna"\nmodel_reasoning_effort="low"\ndeveloper_instructions="Read-only scout"\n')
             (root / 'agent-routing.json').write_text(json.dumps({'network_fallback_roles': ['scout'] if approved else []}))
             brief = root / 'brief.txt'
             brief.write_text('Bounded local test task')
@@ -53,17 +53,19 @@ class FlowTests(unittest.TestCase):
                  patch.object(agent, 'actual_model', side_effect=observed), \
                  patch.object(agent.subprocess, 'run', side_effect=fake_exec), \
                  contextlib.redirect_stdout(io.StringIO()):
-                code = agent.main(['scout', '--cd', str(workspace), '--brief', str(brief)])
+                code = agent.main(['scout', '--cd', str(workspace), '--brief', str(brief), *extra_args])
             report = json.loads(next((root / 'agent-runs').glob('*/report.json')).read_text())
             return code, calls, report, probe.call_count
 
-    def test_model_unavailable_falls_back_once_to_terra(self):
+    def test_model_unavailable_falls_back_once_to_sol(self):
         first = '{"type":"thread.started","thread_id":"first"}\n{"type":"error","message":"model_not_found"}\n'
         second = '{"type":"thread.started","thread_id":"second"}\n{"type":"turn.completed"}\n'
         code, calls, report, _ = self.run_flow([(1, first), (0, second)], [GOOD, GOOD, GOOD])
         self.assertEqual(code, 0)
-        self.assertEqual(calls, ['gpt-5.6-luna', 'gpt-5.6-terra'])
-        self.assertEqual(report['attempts'][1]['observed']['model'], 'gpt-5.6-terra')
+        self.assertEqual(calls, ['gpt-6-luna', 'gpt-6-sol'])
+        self.assertEqual(report['attempts'][1]['observed']['model'], 'gpt-6-sol')
+        self.assertGreaterEqual(report['preflight_ms'], 0)
+        self.assertGreaterEqual(report['attempts'][1]['duration_ms'], 0)
 
     def test_corrupt_partial_work_stops_without_retry(self):
         bad = '{"type":"item.started",\n{"type":"error","message":"model_not_found"}\n'
@@ -71,6 +73,18 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(len(calls), 1)
         self.assertEqual(report['status'], 'failed-no-retry')
+
+    def test_trial_model_uses_one_configured_candidate(self):
+        stream = '{"type":"thread.started","thread_id":"trial"}\n{"type":"turn.completed"}\n'
+        code, calls, report, _ = self.run_flow([(0, stream)], [ISOLATED],
+                                                extra_args=('--trial-model', 'gpt-6-sol'))
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ['gpt-6-sol'])
+        self.assertEqual(report['trial_model'], 'gpt-6-sol')
+
+    def test_empty_trial_model_is_rejected_before_launch(self):
+        with self.assertRaisesRegex(RuntimeError, 'Trial model is not configured'):
+            self.run_flow([], [], extra_args=('--trial-model', ''))
 
     def test_started_work_stops_without_retry(self):
         stream = '{"type":"item.started"}\n{"type":"error","message":"model_not_found"}\n'

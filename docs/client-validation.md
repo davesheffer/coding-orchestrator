@@ -40,6 +40,30 @@ No full native discovery/delegation matrix, live model-access matrix, native
 compaction run, or editor-session-opening test has been completed. These remain
 release limitations and are why the public bundle is labeled experimental.
 
+### Routing optimization follow-up — 2026-09-23
+
+The same Windows clients were checked after the routing update. A fresh disposable
+Codex install completed and `codex debug prompt-input` loaded its configuration
+(exit 0). The local, selectively synced Codex roles parsed with all 12 prohibited
+feature flags disabled. A synced launcher scout probe passed filesystem/tool checks;
+both sandbox modes still permitted outbound TCP on this host, so live runs used the
+saved user-approved network fallback. A Luna/low scout and a Sol/low trial scout
+both returned observed model identities from the CLI thread database with exit 0.
+
+Claude's installed role directory passed `claude plugin validate` (exit 0). Native
+`--agent scout` and `--agent builder` read-only calls selected Haiku 4.5 and
+Sonnet 5 respectively, without permission denials (exit 0). These confirm two
+installed role selections, not a full delegation or permission matrix. The
+repository's Windows offline suite ran 91 tests with 3 shell skips and exit 0.
+The temporary local benchmark results and launcher reports remain in the user's
+private `~/.codex/agent-runs/` directory; see `benchmarks/README.md` for the
+comparison protocol.
+
+Codex native child-role discovery, live runner/critic role selection, upgrade in
+a native session, compaction, and editor session-opening remain untested. Network
+isolation also remains unavailable on this host. Do not substitute the above
+configuration and launcher results for those checks.
+
 ## Install and upgrade
 
 ### Cheap-routing launcher follow-up — 2026-09-22
@@ -122,8 +146,8 @@ above do not fill these cells automatically:
 
 | Client/version | Discovery | Roles/models | Effective boundaries | Upgrade | Handoff | Evidence |
 |---|---|---|---|---|---|---|
-| Codex 0.155.1 / Windows | NOT RUN | NOT RUN | Read-only probe passed; offline networking failed on this host | Installer tests passed; native-session upgrade NOT RUN | Native compaction: NOT RUN | Offline configuration diagnostic passed |
-| Claude 2.1.278 / Windows | NOT RUN | NOT RUN | NOT RUN | Installer tests passed; native-session upgrade NOT RUN | Script round-trip passed; editor opening NOT RUN | Native `doctor` diagnostic passed |
+| Codex 0.155.1 / Windows | Native child-role discovery NOT RUN | Launcher observed Luna scout and Sol builder; native child-role selection NOT RUN | Read-only and workspace-write probes passed; network isolation failed, authorized fallback used | Installer tests passed; native-session upgrade NOT RUN | Native compaction: NOT RUN | Fresh config loaded; disposable builder edit passed 4 tests |
+| Claude 2.1.278 / Windows | All four installed roles accepted by native `--agent` selection | Haiku scout, Sonnet runner/builder, Fable critic observed | Read-only tool-limited role probes ran; OS isolation NOT VERIFIED | Installer tests passed; native-session upgrade NOT RUN | Script round-trip passed; editor opening NOT RUN | Role validator and native CLI role probes passed |
 
 Replace NOT RUN only with observed results. A missing client, unavailable model,
 or unobservable permission boundary is an explicit verification gap.
