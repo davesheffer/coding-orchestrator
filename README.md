@@ -21,13 +21,21 @@ sending messages stay with the orchestrator and the user's authorization.
 
 | Role | Responsibility | Claude Code | Codex model / reasoning |
 |---|---|---|---|
-| Orchestrator | Design, ambiguity, root causes, final verification | Fable | GPT-6 Sol / medium |
-| `scout` | Read-only lookup and reconnaissance | Haiku | GPT-6 Luna / low |
+| Orchestrator | Design, ambiguity, root causes, final verification | Opus 5.5 | GPT-6 Sol / medium |
+| `scout` | Read-only lookup and reconnaissance | Sonnet | GPT-6 Luna / low |
 | `runner` | Exact commands; exit codes and verbatim failures | Sonnet | GPT-6 Luna / low |
 | `builder` | A specified change, then its acceptance check | Sonnet | GPT-6 Sol / medium |
 | `critic` | Fresh-context adversarial review | Fable | GPT-6 Astra / high |
 
-These are the author's model selections, not a promise of access on every plan.
+The cross-client tier mapping is **Sol → Opus 5.5**, **Astra → Fable**,
+**Tera → Sonnet**, and **Luna → Sonnet**. Tera has no separate bundled role;
+the mapping applies if that tier is used for a future role.
+
+The Claude installer sets `claude-opus-5-5` as the main-session default when no
+model is already selected in user settings; existing explicit choices remain
+untouched. Its named scout, runner, and builder roles use Sonnet, and its critic
+uses Fable. [Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
+is required for Opus 5.5. These are routing defaults, not a promise of access on every plan.
 Check your model picker and adjust the role definitions for your account.
 
 ## Install

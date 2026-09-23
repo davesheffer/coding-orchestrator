@@ -41,6 +41,7 @@ class ClaudeInstallTests(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings["model"], "claude-opus-5-5")
         commands = [h["command"] for groups in settings["hooks"].values()
                     for group in groups for h in group["hooks"]]
         self.assertTrue(all(str(self.home / "relay/relay.py") in command for command in commands))
@@ -62,7 +63,7 @@ class ClaudeInstallTests(unittest.TestCase):
         self.home.mkdir(parents=True)
         self.home.joinpath("CLAUDE.md").write_text("private instructions\n")
         self.home.joinpath("settings.json").write_text(json.dumps({
-            "theme": "dark", "hooks": {"Stop": [{"hooks": [{
+            "theme": "dark", "model": "custom-model", "hooks": {"Stop": [{"hooks": [{
                 "type": "command", "command": "printf private"
             }]}]}
         }))
@@ -76,6 +77,7 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(instructions.count("CLAUDE-ORCHESTRATOR:START"), 1)
         settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
         self.assertEqual(settings["theme"], "dark")
+        self.assertEqual(settings["model"], "custom-model")
         stop_commands = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
         self.assertIn("printf private", stop_commands)
         self.assertEqual(json.loads(self.home.joinpath("relay/config.json").read_text(encoding="utf-8")), config)
@@ -108,6 +110,8 @@ class ClaudeInstallTests(unittest.TestCase):
                 self.assertTrue(instructions.startswith("<!-- CLAUDE-ORCHESTRATOR:START -->"))
                 self.assertNotIn("cheap hands, expensive eyes", instructions)
                 self.assertEqual(self.home.joinpath("CLAUDE.md.bak").read_bytes(), previous)
+                upgraded_settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
+                self.assertEqual(upgraded_settings["model"], "claude-opus-5-5")
                 for name in ("scout", "runner", "builder", "critic"):
                     path = self.home / "agents" / f"{name}.md"
                     self.assertEqual(path.read_bytes(), (ROOT / "agents" / path.name).read_bytes())

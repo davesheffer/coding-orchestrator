@@ -1,7 +1,7 @@
 ---
 name: scout
 description: Read-only file and symbol lookup. Use for bounded searches and summaries that would fill the main context. Escalate ambiguous analysis to the main session.
-model: haiku
+model: sonnet
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: plan

@@ -268,9 +268,9 @@ def main(argv: list[str] | None = None) -> int:
 
     desired = dict(managed_sources)
     desired[claude_path] = merge_instructions(claude_existing, source_claude, claude_path)
-    desired[settings_path] = (json.dumps(
-        merge_hooks(settings, hook_template, dest / "relay" / "relay.py"), indent=2
-    ) + "\n").encode()
+    merged_settings = merge_hooks(settings, hook_template, dest / "relay" / "relay.py")
+    merged_settings.setdefault("model", "claude-opus-5-5")
+    desired[settings_path] = (json.dumps(merged_settings, indent=2) + "\n").encode()
     if config_existing is None:
         desired[config_path] = (root / "relay" / "config.json").read_bytes()
 
