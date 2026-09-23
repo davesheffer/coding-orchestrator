@@ -46,7 +46,7 @@ Module._load = originalLoad;
     fs.mkdirSync(workspace);
     const handoff = path.join(root, 'handoff.md');
     fs.writeFileSync(handoff, 'GOAL: continue\n');
-    fs.mkdirSync(path.join(root, 'launches'));
+    fs.mkdirSync(path.join(root, 'launches-v2'));
     tabs.push({ input: { uri: {
       scheme: 'openai-codex', toString: () => 'openai-codex://route/extension/panel/new',
     } } });
@@ -54,37 +54,37 @@ Module._load = originalLoad;
     assert.equal(calls[0][0], 'registered');
 
     const id = 'a'.repeat(32);
-    fs.writeFileSync(path.join(root, 'launches', `${id}.json`), JSON.stringify({
+    fs.writeFileSync(path.join(root, 'launches-v2', `${id}.json`), JSON.stringify({
       client: 'codex', handoff, workspace, prompt: 'Continue from handoff',
       created_at: Date.now() / 1000,
     }));
     mockVscode.workspace.workspaceFolders = [{ uri: { scheme: 'file', fsPath: root } }];
     await bridge.handleUri({ path: '/open', query: `id=${id}` });
-    assert.equal(fs.existsSync(path.join(root, 'acks', `${id}.json`)), false);
-    assert.equal(fs.existsSync(path.join(root, 'launches', `${id}.json`)), true);
+    assert.equal(fs.existsSync(path.join(root, 'acks-v2', `${id}.json`)), false);
+    assert.equal(fs.existsSync(path.join(root, 'launches-v2', `${id}.json`)), true);
     mockVscode.workspace.workspaceFolders = [{ uri: { scheme: 'file', fsPath: workspace } }];
     await bridge.scanPending();
     assert.deepEqual(calls.slice(1).map(call => call[0]),
                      ['vscode.openWith', 'clipboard']);
     assert.equal(calls[1][2], 'chatgpt.conversationEditor');
     assert.match(calls[2][1], /GOAL: continue/);
-    const ack = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${id}.json`)));
+    const ack = JSON.parse(fs.readFileSync(path.join(root, 'acks-v2', `${id}.json`)));
     assert.equal(ack.status, 'opened');
     assert.equal(ack.editorWorkspace, workspace);
     assert.equal(ack.tab, `openai-codex://route/extension/panel/new#${id}`);
     assert.equal(tabs.length, 2);
-    assert.equal(fs.existsSync(path.join(root, 'launches', `${id}.json`)), false);
+    assert.equal(fs.existsSync(path.join(root, 'launches-v2', `${id}.json`)), false);
 
     calls.length = 0;
     const claudeId = 'b'.repeat(32);
-    fs.writeFileSync(path.join(root, 'launches', `${claudeId}.json`), JSON.stringify({
+    fs.writeFileSync(path.join(root, 'launches-v2', `${claudeId}.json`), JSON.stringify({
       client: 'claude', handoff, workspace, prompt: 'relay:1234abcd continue',
       created_at: Date.now() / 1000,
     }));
     await bridge.scanPending();
     assert.equal(calls[0][0], 'claude-vscode.primaryEditor.open');
     assert.equal(calls[0][2], 'relay:1234abcd continue');
-    const claudeAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${claudeId}.json`)));
+    const claudeAck = JSON.parse(fs.readFileSync(path.join(root, 'acks-v2', `${claudeId}.json`)));
     assert.equal(claudeAck.status, 'opened');
     assert.equal(claudeAck.tab, 'mainThreadWebview-claudeVSCodePanel');
     console.log('handoff bridge tests passed');

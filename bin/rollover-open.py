@@ -67,11 +67,11 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
               else f"Continue from the saved handoff below (source: {handoff}). Verify the listed state before acting.")
     root = home()
     workspace = workspace_root(workspace)
-    write_json(root / "launches" / f"{request_id}.json", {
+    write_json(root / "launches-v2" / f"{request_id}.json", {
         "client": client, "handoff": str(handoff), "prompt": prompt,
         "workspace": str(workspace), "created_at": time.time(),
     })
-    ack = root / "acks" / f"{request_id}.json"
+    ack = root / "acks-v2" / f"{request_id}.json"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:

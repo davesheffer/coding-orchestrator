@@ -27,7 +27,7 @@ class RolloverOpenTests(unittest.TestCase):
             handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
 
             def acknowledge(_):
-                request_file = next((Path(temp) / "launches").glob("*.json"))
+                request_file = next((Path(temp) / "launches-v2").glob("*.json"))
                 request_id = request_file.stem
                 self.assertRegex(request_id, r"^[0-9a-f]{32}$")
                 request = json.loads(request_file.read_text())
@@ -36,7 +36,7 @@ class RolloverOpenTests(unittest.TestCase):
                 self.assertEqual(request["workspace"], str(Path.cwd().resolve()))
                 self.assertIn("saved handoff below", request["prompt"])
                 self.assertNotIn("attached", request["prompt"])
-                rollover.write_json(Path(temp) / "acks" / f"{request_id}.json",
+                rollover.write_json(Path(temp) / "acks-v2" / f"{request_id}.json",
                                     {"status": "opened", "workspace": request["workspace"]})
 
             with patch.object(rollover.time, "sleep", side_effect=acknowledge):
@@ -60,8 +60,8 @@ class RolloverOpenTests(unittest.TestCase):
             handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
 
             def acknowledge(_):
-                request_id = next((Path(temp) / "launches").glob("*.json")).stem
-                rollover.write_json(Path(temp) / "acks" / f"{request_id}.json",
+                request_id = next((Path(temp) / "launches-v2").glob("*.json")).stem
+                rollover.write_json(Path(temp) / "acks-v2" / f"{request_id}.json",
                                     {"status": "opened", "workspace": temp})
 
             with patch.object(rollover.time, "sleep", side_effect=acknowledge):

@@ -8,7 +8,7 @@ function handoffHome() {
 }
 
 function writeAck(root, id, result) {
-  const folder = path.join(root, 'acks');
+  const folder = path.join(root, 'acks-v2');
   fs.mkdirSync(folder, { recursive: true });
   const file = path.join(folder, `${id}.json`);
   const temporary = `${file}.tmp`;
@@ -54,7 +54,7 @@ async function waitForNewTab(previous, client, id, timeoutMs = 8000) {
 async function tryHandleId(id) {
   if (!/^[0-9a-f]{32}$/.test(id || '')) return;
   const root = handoffHome();
-  const source = path.join(root, 'launches', `${id}.json`);
+  const source = path.join(root, 'launches-v2', `${id}.json`);
   let request;
   try { request = JSON.parse(fs.readFileSync(source, 'utf8')); } catch { return; }
   if (Math.abs(Date.now() / 1000 - request.created_at) > 30) return;
@@ -62,7 +62,7 @@ async function tryHandleId(id) {
   if (!editorWorkspace) return;
   if (vscode.window.state && !vscode.window.state.focused &&
       Date.now() / 1000 - request.created_at < 2) return;
-  const claims = path.join(root, 'claims');
+  const claims = path.join(root, 'claims-v2');
   fs.mkdirSync(claims, { recursive: true });
   const claimed = path.join(claims, `${id}.json`);
   try { fs.renameSync(source, claimed); } catch { return; }
@@ -100,7 +100,7 @@ async function tryHandleId(id) {
 
 async function scanPending() {
   let files;
-  try { files = fs.readdirSync(path.join(handoffHome(), 'launches')); } catch { return; }
+  try { files = fs.readdirSync(path.join(handoffHome(), 'launches-v2')); } catch { return; }
   for (const file of files) {
     if (/^[0-9a-f]{32}\.json$/.test(file)) await tryHandleId(file.slice(0, -5));
   }
