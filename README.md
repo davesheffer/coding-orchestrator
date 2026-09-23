@@ -207,7 +207,10 @@ use the same `bin/rollover-open.py` launch protocol and the local
 supplies its saved handoff to that bridge; Codex supplies a self-contained
 handoff when asked to roll over.
 
-Install the bridge once in VS Code, then reload existing VS Code windows:
+Install the bridge once in VS Code, then run **Developer: Reload Window** in
+each existing VS Code window where you use Codex or Claude. The bridge starts
+in each window and accepts a request only when its workspace matches the
+handoff's working directory:
 
 ```sh
 cd vscode/handoff-bridge
@@ -219,9 +222,11 @@ From Codex in a VS Code project, ask it to save a handoff and open a fresh tab.
 The installed global instructions tell it to pipe the state into the helper.
 On Windows the direct helper is `python "$env:USERPROFILE/.codex/bin/rollover-open.py" handoff --client codex --title "task"`;
 it reads the handoff from standard input. The bridge opens a new Codex tab and
-copies the complete handoff with its continuation prompt; paste it and press Enter.
+copies the complete handoff with its continuation prompt; paste it and press Enter
+to start the new Codex conversation.
 Claude's relay opens a new Claude tab with its resume prompt prefilled; press
-Enter. The helper reports whether VS Code acknowledged opening the tab, and
+Enter to start the new Claude conversation. The helper reports whether a
+matching workspace window acknowledged opening the tab, and
 prints a manual continuation prompt when it cannot confirm the launch. The
 bridge requires the corresponding Claude Code or Codex VS Code extension.
 
