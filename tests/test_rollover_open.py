@@ -52,6 +52,7 @@ class RolloverOpenTests(unittest.TestCase):
             result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
             self.assertIn("No matching VS Code workspace tab was confirmed", result)
             self.assertIn("relay:1234abcd", result)
+            self.assertEqual(list((Path(temp) / "launches-v2").glob("*.json")), [])
 
     def test_ack_from_different_workspace_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp, \

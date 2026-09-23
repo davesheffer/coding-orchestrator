@@ -239,13 +239,17 @@ def git(cwd, *args):
 
 
 def cmd_handoff(argv):
-    title, do_open = "continue", True
+    title, do_open, workspace = "continue", True, None
     it = iter(argv)
     for a in it:
         if a == "--title":
             title = next(it, title)
         elif a == "--no-open":
             do_open = False
+        elif a == "--workspace":
+            workspace = next(it, None)
+            if not workspace:
+                sys.exit("relay: --workspace requires a path")
     body = sys.stdin.read().strip()
     if len(body) < 40:
         sys.exit("relay: handoff body is empty/too short — pipe the handoff on stdin.")
@@ -278,10 +282,16 @@ def cmd_handoff(argv):
     print(f"handoff saved: {path}")
     helper = CLAUDE_HOME / "bin" / "rollover-open.py"
     if do_open and cfg["auto_open"] and helper.is_file():
-        result = subprocess.run([sys.executable, str(helper), "open", "--client", "claude",
-                                 "--handoff", str(path), "--resume-token", f"relay:{hid}"],
+        command = [sys.executable, str(helper), "open", "--client", "claude",
+                   "--handoff", str(path), "--resume-token", f"relay:{hid}"]
+        if workspace:
+            command.extend(["--workspace", workspace])
+        result = subprocess.run(command,
                                 capture_output=True, text=True, encoding="utf-8")
         if result.returncode == 0:
+            print(result.stdout.strip())
+            return
+        if "tab launch is still pending" in result.stdout:
             print(result.stdout.strip())
             return
         print(f"handoff bridge failed (exit {result.returncode}): "

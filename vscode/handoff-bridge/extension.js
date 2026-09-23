@@ -60,8 +60,7 @@ async function tryHandleId(id) {
   if (Math.abs(Date.now() / 1000 - request.created_at) > 30) return;
   const editorWorkspace = matchingWorkspace(request.workspace);
   if (!editorWorkspace) return;
-  if (vscode.window.state && !vscode.window.state.focused &&
-      Date.now() / 1000 - request.created_at < 2) return;
+  if (vscode.window.state && !vscode.window.state.focused) return;
   const claims = path.join(root, 'claims-v2');
   fs.mkdirSync(claims, { recursive: true });
   const claimed = path.join(claims, `${id}.json`);

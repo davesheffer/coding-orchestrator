@@ -76,6 +76,16 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("bridge acknowledged test launch", result.stdout)
 
+    def test_handoff_forwards_explicit_workspace(self):
+        helper = self.home / "bin" / "rollover-open.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text('import sys; print(" ".join(sys.argv))\n', encoding="utf-8")
+        body = "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks"
+        result = self.run_relay("handoff", "--workspace", str(ROOT.parent),
+                                input_text=body, cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"--workspace {ROOT.parent}", result.stdout)
+
     def test_failed_bridge_only_reports_manual_continuation(self):
         helper = self.home / "bin" / "rollover-open.py"
         helper.parent.mkdir(parents=True)

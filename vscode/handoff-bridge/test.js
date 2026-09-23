@@ -63,6 +63,11 @@ Module._load = originalLoad;
     assert.equal(fs.existsSync(path.join(root, 'acks-v2', `${id}.json`)), false);
     assert.equal(fs.existsSync(path.join(root, 'launches-v2', `${id}.json`)), true);
     mockVscode.workspace.workspaceFolders = [{ uri: { scheme: 'file', fsPath: workspace } }];
+    mockVscode.window.state.focused = false;
+    await bridge.scanPending();
+    assert.equal(fs.existsSync(path.join(root, 'launches-v2', `${id}.json`)), true);
+    assert.equal(calls.length, 1);
+    mockVscode.window.state.focused = true;
     await bridge.scanPending();
     assert.deepEqual(calls.slice(1).map(call => call[0]),
                      ['vscode.openWith', 'clipboard']);

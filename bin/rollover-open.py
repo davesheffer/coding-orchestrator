@@ -67,7 +67,8 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
               else f"Continue from the saved handoff below (source: {handoff}). Verify the listed state before acting.")
     root = home()
     workspace = workspace_root(workspace)
-    write_json(root / "launches-v2" / f"{request_id}.json", {
+    request = root / "launches-v2" / f"{request_id}.json"
+    write_json(request, {
         "client": client, "handoff": str(handoff), "prompt": prompt,
         "workspace": str(workspace), "created_at": time.time(),
     })
@@ -86,6 +87,10 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
                 return "Codex tab launch acknowledged; handoff and continuation prompt copied. Paste and send it."
             return "Claude tab launch acknowledged with the continuation prompt pre-filled. Press Enter there."
         return f"Editor could not open the {client} tab: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
+    try:
+        request.unlink()
+    except FileNotFoundError:
+        return f"The {client} tab launch is still pending. Check VS Code before opening another tab; handoff: {handoff}"
     return f"No matching VS Code workspace tab was confirmed. Open a new {client} tab and send: {prompt}"
 
 

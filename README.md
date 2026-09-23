@@ -227,7 +227,8 @@ to start the new Codex conversation.
 The helper matches the opened workspace to the Git root by default. For a
 non-Git folder or a VS Code workspace opened above the Git root, pass
 `--workspace /path/to/open/folder` so the bridge selects that window exactly.
-Claude's relay opens a new Claude tab with its resume prompt prefilled; press
+For Claude, pass the same option to `relay.py handoff`; the relay forwards it to
+the shared helper. Claude's relay opens a new Claude tab with its resume prompt prefilled; press
 Enter to start the new Claude conversation. The helper reports whether a
 matching workspace window acknowledged opening the tab, and
 prints a manual continuation prompt when it cannot confirm the launch. The
