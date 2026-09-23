@@ -17,13 +17,13 @@ def home() -> Path:
                 Path.home() / ".coding-orchestrator").expanduser().resolve()
 
 
-def workspace_root() -> Path:
+def workspace_root(explicit: Path | None = None) -> Path:
     cwd = Path.cwd().resolve()
-    vscode_cwd = os.environ.get("VSCODE_CWD")
-    if vscode_cwd:
-        candidate = Path(vscode_cwd).expanduser().resolve()
-        if cwd == candidate or candidate in cwd.parents:
-            return candidate
+    if explicit is not None:
+        candidate = explicit.expanduser().resolve(strict=True)
+        if not candidate.is_dir():
+            raise ValueError(f"workspace is not a directory: {candidate}")
+        return candidate
     try:
         result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
                                 capture_output=True, text=True, encoding="utf-8", timeout=3)
@@ -53,7 +53,8 @@ def write_json(path: Path, data: dict) -> None:
     os.replace(temporary, path)
 
 
-def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 12.0) -> str:
+def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 12.0,
+           workspace: Path | None = None) -> str:
     handoff = handoff.expanduser().resolve(strict=True)
     if not handoff.is_file():
         raise ValueError(f"handoff is not a regular file: {handoff}")
@@ -65,7 +66,7 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
     prompt = (f"{resume_token} continue from the saved handoff." if client == "claude"
               else f"Continue from the saved handoff below (source: {handoff}). Verify the listed state before acting.")
     root = home()
-    workspace = workspace_root()
+    workspace = workspace_root(workspace)
     write_json(root / "launches" / f"{request_id}.json", {
         "client": client, "handoff": str(handoff), "prompt": prompt,
         "workspace": str(workspace), "created_at": time.time(),
@@ -104,22 +105,25 @@ def main(argv=None) -> int:
     opener = sub.add_parser("open")
     opener.add_argument("--client", choices=("codex", "claude"), required=True)
     opener.add_argument("--handoff", type=Path, required=True)
+    opener.add_argument("--workspace", type=Path)
     opener.add_argument("--resume-token", default="")
     writer = sub.add_parser("handoff")
     writer.add_argument("--client", choices=("codex",), required=True)
     writer.add_argument("--title", default="continue")
+    writer.add_argument("--workspace", type=Path)
     writer.add_argument("--no-open", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "open":
-            message = launch(args.client, args.handoff, args.resume_token)
+            message = launch(args.client, args.handoff, args.resume_token,
+                             workspace=args.workspace)
             print(message)
             return 0 if "tab launch acknowledged" in message else 2
         else:
             path = save_codex(args.title, sys.stdin.read())
             print(f"handoff saved: {path}")
             if not args.no_open:
-                message = launch("codex", path)
+                message = launch("codex", path, workspace=args.workspace)
                 print(message)
                 return 0 if "tab launch acknowledged" in message else 2
     except (OSError, ValueError) as exc:

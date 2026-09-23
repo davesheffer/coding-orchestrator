@@ -16,6 +16,10 @@ SPEC.loader.exec_module(rollover)
 
 
 class RolloverOpenTests(unittest.TestCase):
+    def test_vscode_launch_directory_does_not_override_project_root(self):
+        with patch.dict(os.environ, {"VSCODE_CWD": str(Path.cwd().parent)}):
+            self.assertEqual(rollover.workspace_root(), Path.cwd().resolve())
+
     def test_launch_uses_opaque_id_and_waits_for_bridge_ack(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}):
