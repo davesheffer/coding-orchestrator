@@ -1,0 +1,12 @@
+{
+  "name": "handoff-bridge",
+  "displayName": "Coding Orchestrator Handoff Bridge",
+  "description": "Open saved Claude or Codex handoffs in fresh VS Code agent tabs.",
+  "version": "0.1.0",
+  "publisher": "coding-orchestrator",
+  "repository": {"type": "git", "url": "https://github.com/davesheffer/coding-orchestrator"},
+  "engines": {"vscode": "^1.95.0"},
+  "main": "./extension.js",
+  "activationEvents": ["onUri"],
+  "license": "MIT"
+}

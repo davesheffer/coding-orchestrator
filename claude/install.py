@@ -242,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         managed_sources[dest / "agents" / f"{name}.md"] = data
     managed_sources[dest / "relay" / "relay.py"] = (root / "relay" / "relay.py").read_bytes()
     managed_sources[dest / "bin" / "pr-status"] = (root / "bin" / "pr-status").read_bytes()
+    managed_sources[dest / "bin" / "rollover-open.py"] = (root / "bin" / "rollover-open.py").read_bytes()
 
     directories = (dest, dest / "agents", dest / "relay", dest / "relay" / "handoffs",
                    dest / "relay" / "state", dest / "bin")

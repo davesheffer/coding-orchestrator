@@ -29,6 +29,8 @@ class CodexInstallTests(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.home / "bin/agent-report.py").is_file())
+        self.assertEqual((self.home / "bin/rollover-open.py").read_bytes(),
+                         (ROOT / "bin/rollover-open.py").read_bytes())
         import tomllib
         config = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
         self.assertEqual(config["model"], "gpt-6-sol")

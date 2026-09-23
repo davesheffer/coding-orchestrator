@@ -26,9 +26,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile Python
-        run: python -m compileall -q claude codex relay tests bin/pr-status bin/agent-run.py
+        run: python -m compileall -q claude codex relay tests bin/pr-status bin/agent-run.py bin/rollover-open.py
       - name: Check shell syntax
         if: runner.os != 'Windows'
         run: bash -n install.sh codex/install.sh
       - name: Test installers, executable entry points, release upgrades, and relay
         run: python -m unittest discover -s tests -v
+      - name: Test VS Code handoff bridge
+        run: node vscode/handoff-bridge/test.js

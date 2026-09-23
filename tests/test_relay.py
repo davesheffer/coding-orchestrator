@@ -67,6 +67,33 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(len(files), 1)
         self.assertIn("GOAL: continue", files[0].read_text(encoding="utf-8"))
 
+    def test_windows_editor_handoff_requests_new_claude_tab(self):
+        with patch.object(relay_module.sys, "platform", "win32"), \
+                patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}), \
+                patch.object(relay_module.os, "startfile", create=True) as startfile, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertTrue(relay_module.open_editor_prompt('relay:1234abcd continue "test"'))
+        uri = startfile.call_args.args[0]
+        self.assertTrue(uri.startswith("vscode://anthropic.claude-code/open?prompt=relay%3A1234abcd"))
+        self.assertIn("launch requested", output.getvalue())
+
+    def test_windows_editor_handoff_reports_launch_failure(self):
+        with patch.object(relay_module.sys, "platform", "win32"), \
+                patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}), \
+                patch.object(relay_module.os, "startfile", side_effect=OSError("no handler"), create=True), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(relay_module.open_editor_prompt("relay:1234abcd"))
+        self.assertIn("no handler", output.getvalue())
+
+    def test_installed_handoff_uses_shared_bridge(self):
+        helper = self.home / "bin" / "rollover-open.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text('print("bridge acknowledged test launch")\n', encoding="utf-8")
+        body = "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks"
+        result = self.run_relay("handoff", "--title", "test", input_text=body, cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("bridge acknowledged test launch", result.stdout)
+
     def test_unicode_handoff_round_trips_with_non_utf8_defaults(self):
         self.env.update({"PYTHONUTF8": "0", "PYTHONIOENCODING": "ascii",
                          "LC_ALL": "C", "PYTHONCOERCECLOCALE": "0"})

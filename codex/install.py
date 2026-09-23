@@ -240,11 +240,13 @@ def main(argv: list[str] | None = None) -> int:
     helper_source = read_regular(here.parent / "bin" / "pr-status")
     agent_run_source = read_regular(here.parent / "bin" / "agent-run.py")
     report_source = read_regular(here.parent / "bin" / "agent-report.py")
+    rollover_source = read_regular(here.parent / "bin" / "rollover-open.py")
     assert all(source is not None for source in
-               (config_source, helper_source, agent_run_source, report_source))
+               (config_source, helper_source, agent_run_source, report_source, rollover_source))
     sources[dest / "bin" / "pr-status"] = helper_source
     sources[dest / "bin" / "agent-run.py"] = agent_run_source
     sources[dest / "bin" / "agent-report.py"] = report_source
+    sources[dest / "bin" / "rollover-open.py"] = rollover_source
     parse_toml(here / "config.example.toml", config_source)
     managed_block(sources[dest / "AGENTS.md"], here / "AGENTS.md")
 

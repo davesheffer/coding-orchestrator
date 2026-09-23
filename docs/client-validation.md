@@ -133,6 +133,24 @@ preference preservation; they cannot establish that a live agent follows this fl
 
 ## Relay and completion
 
+### VS Code handoff bridge — 2026-09-23
+
+On Windows with VS Code, the shared bridge was packaged as a VSIX and installed.
+The initial `os.startfile` URL launch did not receive an acknowledgement;
+`code --open-url` did. The helper now prefers the latter on Windows. A live
+Claude relay handoff saved its file, and the bridge acknowledged opening a
+Claude tab with the `relay:<id>` prompt. A live Codex handoff saved a file,
+and the bridge acknowledged opening a Codex tab and copying the full handoff
+with its continuation prompt. The user still presses Enter in Claude or
+pastes and sends the prompt in Codex. An acknowledgement records successful
+editor commands, not proof that either model processed the prompt. Automated
+Python and VS Code mock tests cover request validation and failure reporting.
+
+The VS Code extension and client extension must be installed and activated in
+the relevant VS Code window. Reload existing windows after installing the
+bridge. Test with a fresh tab on each client after client-extension updates;
+their internal command IDs can change.
+
 In Claude, verify a GREEN/AMBER/RED measurement with representative transcripts,
 then unknown usage and compaction without a subsequent measurement. Unknown must
 not force a rollover. At RED, the Stop hook should nudge once, not loop.

@@ -199,9 +199,31 @@ for scout/runner; builder uses Sol only. Tests, partial work and unknown
 errors are never blindly retried. The older
 [critic-only manual workflow](docs/critic-network-fallback.md) remains available.
 
-Codex uses native compaction. A transcript-based gauge is documented in
-[the proposal](codex/CONTEXT-GAUGE.md); it is **not implemented or installed**.
-The Claude relay remains Claude-specific.
+Codex uses native compaction within the current session. A transcript-based
+gauge is documented in [the proposal](codex/CONTEXT-GAUGE.md); it is **not
+implemented or installed**. For an explicit fresh-session handoff, both clients
+use the same `bin/rollover-open.py` launch protocol and the local
+[VS Code handoff bridge](vscode/handoff-bridge/README.md). The Claude relay
+supplies its saved handoff to that bridge; Codex supplies a self-contained
+handoff when asked to roll over.
+
+Install the bridge once in VS Code, then reload existing VS Code windows:
+
+```sh
+cd vscode/handoff-bridge
+npx --yes @vscode/vsce package --no-dependencies --out handoff-bridge.vsix
+code --install-extension handoff-bridge.vsix --force
+```
+
+From Codex in a VS Code project, ask it to save a handoff and open a fresh tab.
+The installed global instructions tell it to pipe the state into the helper.
+On Windows the direct helper is `python "$env:USERPROFILE/.codex/bin/rollover-open.py" handoff --client codex --title "task"`;
+it reads the handoff from standard input. The bridge opens a new Codex tab and
+copies the complete handoff with its continuation prompt; paste it and press Enter.
+Claude's relay opens a new Claude tab with its resume prompt prefilled; press
+Enter. The helper reports whether VS Code acknowledged opening the tab, and
+prints a manual continuation prompt when it cannot confirm the launch. The
+bridge requires the corresponding Claude Code or Codex VS Code extension.
 
 ## PR and CI status
 
@@ -244,6 +266,7 @@ runner. No credentials are included.
 | `codex/PROMPT.md`, `codex/CONTEXT-GAUGE.md` | Validation brief and optional gauge proposal |
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
 | `bin/pr-status` | Shared PR/CI helper |
+| `bin/rollover-open.py`, `vscode/handoff-bridge/` | Shared handoff protocol and VS Code tab bridge |
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
 | `tests/` | Bundle contracts, both installers, and relay behavior |
