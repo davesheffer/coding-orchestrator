@@ -89,7 +89,7 @@ The preceding critic-only procedure remains available for manual restricted laun
 
 ## Continuity
 
-Use native Codex compaction; no Claude relay or Codex gauge is installed. Continue the task through compaction and treat corrections/follow-ups as steering. A handoff preserves:
+Use native Codex compaction to continue within the same session; no context gauge is installed. For a fresh-session rollover, write a self-contained handoff and run `python <CODEX_HOME>/bin/rollover-open.py handoff --client codex --title "<short title>"` with the handoff body on stdin. The helper saves it and requests a new VS Code Codex tab through the installed bridge. Report whether the bridge acknowledged the launch; if it did not, give the user the saved path and continuation prompt. A handoff preserves:
 
 ```text
 GOAL: intended outcome

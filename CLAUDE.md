@@ -49,7 +49,7 @@ NEXT PROMPT: latest user prompt verbatim, for task shifts or RED rollover
 HANDOFF
 ```
 
-The installer resolves the helper paths above to this installation. The relay saves a handoff and may ask the editor to open a session or copy/print a relay prompt. Report its actual result; never claim a session opened merely because the handoff was saved. If necessary, tell the user to start a new session and send the printed `relay:<id>` prompt. After a successful handoff, stop working here.
+The installer resolves the helper paths above to this installation. The relay saves a handoff and asks the shared VS Code bridge to open a new Claude tab. Report whether the bridge acknowledged the launch; saving alone does not prove a tab opened. If the bridge is unavailable, tell the user to start a new session and send the printed `relay:<id>` prompt. After a successful handoff, stop working here.
 
 A `relay:<id>` prompt continues the injected handoff. Recheck material UNVERIFIED claims and act on NEXT PROMPT when present.
 <!-- CLAUDE-ORCHESTRATOR:END -->
