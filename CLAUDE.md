@@ -7,13 +7,13 @@ The main session owns the request, design, root cause, judgment, verification, a
 
 | Work | Role | Model |
 |---|---|---|
-| Locate, read, summarize | scout | Haiku |
+| Locate, read, summarize | scout | Sonnet |
 | Run exact test/build commands and distill output | runner | Sonnet |
 | Implement an already specified change | builder | Sonnet |
 | Adversarial review of risky changes or claims | critic | Fable |
-| Design, ambiguity, security/concurrency decisions | main session | Fable |
+| Design, ambiguity, security/concurrency decisions | main session | Opus 5.5 |
 
-Use the installed named roles. For built-in agents, explicitly select a supported model (`haiku` for bounded reading, `sonnet` for running and specified implementation); avoid expensive inheritance for easy work.
+Use the installed named roles. For built-in agents, explicitly select `sonnet` for bounded reading, exact checks, and specified implementation; reserve `fable` for the critic. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work.
 
 - Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
 - Launch independent, delegation-sized units together; respect concurrency limits and avoid overlapping edits. Large Workflow orchestration with dozens of agents requires an explicit user request.

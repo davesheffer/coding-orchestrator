@@ -22,7 +22,7 @@ def frontmatter(path):
 class BundleContractTests(unittest.TestCase):
     def test_role_names_models_boundaries_and_reports_match(self):
         expected = {
-            "scout": ("haiku", "gpt-6-luna", "read-only"),
+            "scout": ("sonnet", "gpt-6-luna", "read-only"),
             "runner": ("sonnet", "gpt-6-luna", "workspace-write"),
             "builder": ("sonnet", "gpt-6-sol", "workspace-write"),
             "critic": ("fable", "gpt-6-astra", "read-only"),
