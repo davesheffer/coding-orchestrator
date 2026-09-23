@@ -16,14 +16,9 @@ SPEC.loader.exec_module(rollover)
 
 
 class RolloverOpenTests(unittest.TestCase):
-    def test_windows_opener_uses_code_cli(self):
-        with patch.object(rollover.sys, "platform", "win32"), \
-                patch.object(rollover.shutil, "which", return_value="code.cmd"), \
-                patch.object(rollover.subprocess, "run") as run:
-            rollover.open_uri("vscode://coding-orchestrator.handoff-bridge/open?id=test")
-        run.assert_called_once_with(
-            ["code.cmd", "--open-url", "vscode://coding-orchestrator.handoff-bridge/open?id=test"],
-            check=True, capture_output=True)
+    def test_vscode_launch_directory_does_not_override_project_root(self):
+        with patch.dict(os.environ, {"VSCODE_CWD": str(Path.cwd().parent)}):
+            self.assertEqual(rollover.workspace_root(), Path.cwd().resolve())
 
     def test_launch_uses_opaque_id_and_waits_for_bridge_ack(self):
         with tempfile.TemporaryDirectory() as temp, \
@@ -31,30 +26,48 @@ class RolloverOpenTests(unittest.TestCase):
             handoff = Path(temp) / "handoff.md"
             handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
 
-            def acknowledge(uri):
-                request_id = uri.split("id=", 1)[1]
+            def acknowledge(_):
+                request_file = next((Path(temp) / "launches-v2").glob("*.json"))
+                request_id = request_file.stem
                 self.assertRegex(request_id, r"^[0-9a-f]{32}$")
-                self.assertNotIn(str(handoff), uri)
-                request = json.loads((Path(temp) / "launches" / f"{request_id}.json").read_text())
+                request = json.loads(request_file.read_text())
                 self.assertEqual(request["handoff"], str(handoff.resolve()))
                 self.assertEqual(request["client"], "codex")
-                rollover.write_json(Path(temp) / "acks" / f"{request_id}.json",
-                                    {"status": "opened"})
+                self.assertEqual(request["workspace"], str(Path.cwd().resolve()))
+                self.assertIn("saved handoff below", request["prompt"])
+                self.assertNotIn("attached", request["prompt"])
+                rollover.write_json(Path(temp) / "acks-v2" / f"{request_id}.json",
+                                    {"status": "opened", "workspace": request["workspace"]})
 
-            with patch.object(rollover, "open_uri", side_effect=acknowledge):
-                result = rollover.launch("codex", handoff, timeout=0.1)
+            with patch.object(rollover.time, "sleep", side_effect=acknowledge):
+                result = rollover.launch("codex", handoff, timeout=0.2)
             self.assertIn("acknowledged", result)
             self.assertIn("Paste and send", result)
 
     def test_no_ack_never_claims_tab_opened(self):
         with tempfile.TemporaryDirectory() as temp, \
-                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
-                patch.object(rollover, "open_uri"):
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}):
             handoff = Path(temp) / "handoff.md"
             handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
             result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
-            self.assertIn("not confirmed", result)
+            self.assertIn("No matching VS Code workspace tab was confirmed", result)
             self.assertIn("relay:1234abcd", result)
+            self.assertEqual(list((Path(temp) / "launches-v2").glob("*.json")), [])
+
+    def test_ack_from_different_workspace_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+
+            def acknowledge(_):
+                request_id = next((Path(temp) / "launches-v2").glob("*.json")).stem
+                rollover.write_json(Path(temp) / "acks-v2" / f"{request_id}.json",
+                                    {"status": "opened", "workspace": temp})
+
+            with patch.object(rollover.time, "sleep", side_effect=acknowledge):
+                result = rollover.launch("codex", handoff, timeout=0.2)
+            self.assertIn("different workspace", result)
 
     def test_codex_handoff_saves_body(self):
         with tempfile.TemporaryDirectory() as temp, \

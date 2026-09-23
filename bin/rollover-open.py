@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import shutil
 import subprocess
 import sys
 import time
@@ -16,6 +15,23 @@ import time
 def home() -> Path:
     return Path(os.environ.get("ORCHESTRATOR_HANDOFF_HOME") or
                 Path.home() / ".coding-orchestrator").expanduser().resolve()
+
+
+def workspace_root(explicit: Path | None = None) -> Path:
+    cwd = Path.cwd().resolve()
+    if explicit is not None:
+        candidate = explicit.expanduser().resolve(strict=True)
+        if not candidate.is_dir():
+            raise ValueError(f"workspace is not a directory: {candidate}")
+        return candidate
+    try:
+        result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+                                capture_output=True, text=True, encoding="utf-8", timeout=3)
+        if result.returncode == 0:
+            return Path(result.stdout.strip()).resolve()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return cwd
 
 
 def private_directory(path: Path) -> None:
@@ -37,19 +53,8 @@ def write_json(path: Path, data: dict) -> None:
     os.replace(temporary, path)
 
 
-def open_uri(uri: str) -> None:
-    if sys.platform == "win32":
-        code = shutil.which("code")
-        if code:
-            subprocess.run([code, "--open-url", uri], check=True, capture_output=True)
-        else:
-            os.startfile(uri)
-    else:
-        command = ["open", uri] if sys.platform == "darwin" else ["xdg-open", uri]
-        subprocess.run(command, check=True, capture_output=True)
-
-
-def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 12.0) -> str:
+def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 12.0,
+           workspace: Path | None = None) -> str:
     handoff = handoff.expanduser().resolve(strict=True)
     if not handoff.is_file():
         raise ValueError(f"handoff is not a regular file: {handoff}")
@@ -59,18 +64,15 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
         raise ValueError("Claude handoffs require a relay:<id> resume token")
     request_id = secrets.token_hex(16)
     prompt = (f"{resume_token} continue from the saved handoff." if client == "claude"
-              else f"Continue from the attached handoff file {handoff}. Verify the listed state before acting.")
+              else f"Continue from the saved handoff below (source: {handoff}). Verify the listed state before acting.")
     root = home()
-    write_json(root / "launches" / f"{request_id}.json", {
+    workspace = workspace_root(workspace)
+    request = root / "launches-v2" / f"{request_id}.json"
+    write_json(request, {
         "client": client, "handoff": str(handoff), "prompt": prompt,
-        "created_at": time.time(),
+        "workspace": str(workspace), "created_at": time.time(),
     })
-    uri = f"vscode://coding-orchestrator.handoff-bridge/open?id={request_id}"
-    try:
-        open_uri(uri)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        return f"Editor launch failed ({exc}). Open a new {client} tab and send: {prompt}"
-    ack = root / "acks" / f"{request_id}.json"
+    ack = root / "acks-v2" / f"{request_id}.json"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -79,11 +81,17 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
             time.sleep(0.1)
             continue
         if result.get("status") == "opened":
+            if Path(result.get("workspace", "")).resolve() != workspace:
+                return f"Editor acknowledged a different workspace. Open a new {client} tab and send: {prompt}"
             if client == "codex":
                 return "Codex tab launch acknowledged; handoff and continuation prompt copied. Paste and send it."
             return "Claude tab launch acknowledged with the continuation prompt pre-filled. Press Enter there."
         return f"Editor could not open the {client} tab: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
-    return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
+    try:
+        request.unlink()
+    except FileNotFoundError:
+        return f"The {client} tab launch is still pending. Check VS Code before opening another tab; handoff: {handoff}"
+    return f"No matching VS Code workspace tab was confirmed. Open a new {client} tab and send: {prompt}"
 
 
 def save_codex(title: str, body: str) -> Path:
@@ -102,22 +110,25 @@ def main(argv=None) -> int:
     opener = sub.add_parser("open")
     opener.add_argument("--client", choices=("codex", "claude"), required=True)
     opener.add_argument("--handoff", type=Path, required=True)
+    opener.add_argument("--workspace", type=Path)
     opener.add_argument("--resume-token", default="")
     writer = sub.add_parser("handoff")
     writer.add_argument("--client", choices=("codex",), required=True)
     writer.add_argument("--title", default="continue")
+    writer.add_argument("--workspace", type=Path)
     writer.add_argument("--no-open", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "open":
-            message = launch(args.client, args.handoff, args.resume_token)
+            message = launch(args.client, args.handoff, args.resume_token,
+                             workspace=args.workspace)
             print(message)
             return 0 if "tab launch acknowledged" in message else 2
         else:
             path = save_codex(args.title, sys.stdin.read())
             print(f"handoff saved: {path}")
             if not args.no_open:
-                message = launch("codex", path)
+                message = launch("codex", path, workspace=args.workspace)
                 print(message)
                 return 0 if "tab launch acknowledged" in message else 2
     except (OSError, ValueError) as exc:

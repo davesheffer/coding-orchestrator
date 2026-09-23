@@ -23,7 +23,6 @@ import shlex
 import subprocess
 import sys
 import time
-import urllib.parse
 from pathlib import Path
 
 ROOT = (Path(os.environ["CLAUDE_HOME"]).expanduser() / "relay"
@@ -40,44 +39,6 @@ DEFAULTS = {
 }
 RELAY_RE = re.compile(r"\brelay:([a-f0-9]{8})\b")
 MAX_TRANSCRIPT_BYTES = 8 << 20
-URI_SCHEMES = {
-    "com.microsoft.VSCode": "vscode",
-    "com.microsoft.VSCodeInsiders": "vscode-insiders",
-    "com.todesktop.230313mzl4w4u92": "cursor",
-    "com.exafunction.windsurf": "windsurf",
-}
-
-
-def editor_scheme():
-    if os.environ.get("CLAUDE_CODE_ENTRYPOINT") != "claude-vscode":
-        return None
-    scheme = URI_SCHEMES.get(os.environ.get("__CFBundleIdentifier", ""))
-    if sys.platform == "win32" and not scheme:
-        requested = os.environ.get("CLAUDE_RELAY_IDE_SCHEME", "vscode")
-        scheme = requested if requested in URI_SCHEMES.values() else "vscode"
-    return scheme
-
-
-def open_editor_prompt(next_prompt):
-    scheme = editor_scheme()
-    if not scheme or sys.platform not in ("darwin", "win32"):
-        return False
-    uri = f"{scheme}://anthropic.claude-code/open?prompt={urllib.parse.quote(next_prompt)}"
-    try:
-        if sys.platform == "win32":
-            os.startfile(uri)
-        else:
-            result = subprocess.run(["open", uri], check=False)
-            if result.returncode != 0:
-                raise OSError(f"open exited {result.returncode}")
-    except OSError as exc:
-        print(f"could not request editor session ({exc}); falling back to relay prompt.")
-        return False
-    print("editor session launch requested with the relay prompt pre-filled; press Enter there to continue.")
-    print(f"If no tab appears, open a Claude tab and send: {next_prompt}")
-    return True
-
-
 def config():
     cfg = dict(DEFAULTS)
     try:
@@ -278,13 +239,17 @@ def git(cwd, *args):
 
 
 def cmd_handoff(argv):
-    title, do_open = "continue", True
+    title, do_open, workspace = "continue", True, None
     it = iter(argv)
     for a in it:
         if a == "--title":
             title = next(it, title)
         elif a == "--no-open":
             do_open = False
+        elif a == "--workspace":
+            workspace = next(it, None)
+            if not workspace:
+                sys.exit("relay: --workspace requires a path")
     body = sys.stdin.read().strip()
     if len(body) < 40:
         sys.exit("relay: handoff body is empty/too short — pipe the handoff on stdin.")
@@ -317,16 +282,20 @@ def cmd_handoff(argv):
     print(f"handoff saved: {path}")
     helper = CLAUDE_HOME / "bin" / "rollover-open.py"
     if do_open and cfg["auto_open"] and helper.is_file():
-        result = subprocess.run([sys.executable, str(helper), "open", "--client", "claude",
-                                 "--handoff", str(path), "--resume-token", f"relay:{hid}"],
+        command = [sys.executable, str(helper), "open", "--client", "claude",
+                   "--handoff", str(path), "--resume-token", f"relay:{hid}"]
+        if workspace:
+            command.extend(["--workspace", workspace])
+        result = subprocess.run(command,
                                 capture_output=True, text=True, encoding="utf-8")
         if result.returncode == 0:
             print(result.stdout.strip())
             return
+        if "tab launch is still pending" in result.stdout:
+            print(result.stdout.strip())
+            return
         print(f"handoff bridge failed (exit {result.returncode}): "
               f"{result.stdout.strip()} {result.stderr.strip()}".strip())
-    if do_open and cfg["auto_open"] and open_editor_prompt(next_prompt):
-        return
     if sys.platform == "darwin":
         subprocess.run(["pbcopy"], input=next_prompt, text=True, encoding="utf-8")
         print("relay prompt copied to the clipboard.")
