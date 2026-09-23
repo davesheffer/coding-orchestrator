@@ -67,6 +67,7 @@ class CodexInstallTests(unittest.TestCase):
         self.assertNotIn("default_permissions", config)
         self.assertEqual(list(self.home.glob("*.config.toml")), [])
         installed_instructions = (self.home / "AGENTS.md").read_bytes()
+        self.assertIn(b'python "$env:USERPROFILE/.codex/bin/pr-status"', installed_instructions)
         self.assertNotIn(b"<!-- CODEX-CRITIC-NETWORK-FALLBACK:START -->", installed_instructions)
         helper = self.home / "bin" / "pr-status"
         self.assertEqual(helper.read_bytes(), (ROOT / "bin" / "pr-status").read_bytes())

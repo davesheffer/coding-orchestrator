@@ -209,6 +209,16 @@ PATH="${CODEX_HOME:-$HOME/.codex}/bin:$PATH" pr-status
 "${CLAUDE_HOME:-$HOME/.claude}/bin/pr-status" --failed
 ```
 
+On Windows, invoke the extensionless Python helper through Python so its file
+association cannot open it in an editor:
+
+```powershell
+python "$env:USERPROFILE/.codex/bin/pr-status" 4 --failed
+python "$env:USERPROFILE/.claude/bin/pr-status" --failed
+```
+
+Use the corresponding `CODEX_HOME` or `CLAUDE_HOME` path for custom installs.
+
 It requires an authenticated `gh`. When executable, `~/.hunch/agent-gh` is used
 instead; that wrapper is optional and is not bundled. Run this networked helper
 as the orchestrator, unless network access has been explicitly granted to a

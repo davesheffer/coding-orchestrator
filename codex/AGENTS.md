@@ -20,7 +20,7 @@ Own the request, design, root cause, judgment, verification, and final answer. D
 - Delegate bounded searches, extraction, summaries and noisy offline checks to scout/runner without waiting for a context-size threshold or another user reminder. Use builder for a specified implementation with clear ownership and acceptance checks. Keep briefs fresh and bounded; do not pass the entire main conversation to routine workers.
 - Launch independent, delegation-sized units together within the host's concurrency limit. Keep dependencies sequential and file ownership disjoint. Workflows with dozens of agents require an explicit user request.
 - Batch independent tool calls; await and inspect every result. Keep edits, approvals, dependencies, and waits sequential. Bound output and preserve check exit codes when trimming logs.
-- Query PR/CI state in one command: `PATH="${CODEX_HOME:-$HOME/.codex}/bin:$PATH" pr-status`. Networked polling stays in the main session unless the user explicitly authorized runner network access.
+- Query PR/CI state in one command. On Windows, run `python "$env:USERPROFILE/.codex/bin/pr-status"` (substitute `CODEX_HOME` when set); on POSIX, run `PATH="${CODEX_HOME:-$HOME/.codex}/bin:$PATH" pr-status`. Networked polling stays in the main session unless the user explicitly authorized runner network access.
 
 ## Briefing and verification
 
