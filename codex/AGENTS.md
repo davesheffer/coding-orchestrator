@@ -9,18 +9,17 @@ Own the request, design, root cause, judgment, verification, and final answer. D
 
 | Work | Role | Model / reasoning |
 |---|---|---|
-| Locate, read, summarize | scout | gpt-5.6-luna / low |
-| Run an exact test/build command and report results | runner | gpt-5.6-luna / low |
-| Implement an already specified change | builder | gpt-5.6-terra / medium |
+| Locate, read, summarize | scout | gpt-6-luna / low |
+| Run an exact test/build command and report results | runner | gpt-6-luna / low |
+| Implement an already specified change | builder | gpt-6-sol / medium |
 | Adversarial review of risky changes or claims | critic | gpt-6-astra / high |
-| Design, ambiguity, root cause, security/concurrency decisions | main session | gpt-6-astra / high |
+| Design, ambiguity, root cause, security/concurrency decisions | main session | gpt-6-sol / medium; escalate demanding cases to Astra |
 
 - Select installed native roles in `~/.codex/agents/*.toml`. If using a built-in role, explicitly supply the configured model, reasoning, role instructions, and brief through supported host parameters. Never invent parameters or silently use an expensive inherited model for easy work.
 - Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
 - Delegate bounded searches, extraction, summaries and noisy offline checks to scout/runner without waiting for a context-size threshold or another user reminder. Use builder for a specified implementation with clear ownership and acceptance checks. Keep briefs fresh and bounded; do not pass the entire main conversation to routine workers.
 - Launch independent, delegation-sized units together within the host's concurrency limit. Keep dependencies sequential and file ownership disjoint. Workflows with dozens of agents require an explicit user request.
 - Batch independent tool calls; await and inspect every result. Keep edits, approvals, dependencies, and waits sequential. Bound output and preserve check exit codes when trimming logs.
-- With reliable usage of at least 100k context tokens, delegate reading to scout and noisy execution to runner. Never invent usage estimates. Keep already-decided edits and outward actions in the main session.
 - Query PR/CI state in one command: `PATH="${CODEX_HOME:-$HOME/.codex}/bin:$PATH" pr-status`. Networked polling stays in the main session unless the user explicitly authorized runner network access.
 
 ## Briefing and verification
@@ -46,7 +45,7 @@ Keep push, publish, deploy, delete, and send actions in the main session within 
 
 Scout/critic require read-only. Runner/builder require workspace-write restricted to the repository. Runner may create artifacts from its exact check; it must not edit source, install dependencies, or repair failures. Subagents have network disabled unless explicitly authorized.
 
-Verify effective permissions before delegation: parent overrides can supersede role settings. Prompts do not enforce isolation. On Windows, if native boundaries cannot be verified, use the installed launcher immediately instead of silently doing delegation-sized work on Astra:
+Verify effective permissions before delegation: parent overrides can supersede role settings. Prompts do not enforce isolation. On Windows, if native boundaries cannot be verified, use the installed launcher immediately instead of doing delegation-sized work on the main model:
 
 ```text
 python <CODEX_HOME>/bin/agent-run.py <scout|runner|builder|critic> --cd <repository> --brief <brief.txt>
@@ -70,7 +69,7 @@ Verify the resulting sandbox and network restrictions. If a restricted runtime i
 ### Launcher model and network fallbacks
 
 - Fresh installs default unnamed subagents to Luna/low; named roles retain their own settings. Existing configurations are preserved unless the user opts into `--configure-routing`, which fills missing subagent model/effort defaults while preserving explicit choices.
-- The Windows launcher tries scout/runner on Luna -> Terra -> Sol, builder on Terra -> Sol, and critic on Astra only. Only a recognized model-unavailable error before any work can advance the chain. Authentication/rate limits, failed tests, started work, malformed logs and unknown errors return to the main session without an automatic retry. Inspect partial edits and evidence before continuing. No silent Astra fallback for routine work.
+- The Windows launcher tries scout/runner on Luna -> Sol, builder on Sol, and critic on Astra only. Only a recognized model-unavailable error before any work can advance the chain. Authentication/rate limits, failed tests, started work, malformed logs and unknown errors return to the main session without an automatic retry. Inspect partial edits and evidence before continuing. No silent Astra fallback for routine work.
 - Network fallback is off by default for every role. If isolation fails but file limits hold, explain that the shell could access the network even with web tools disabled. Ask which roles, if any, may use that exception and whether to remember the choice. Existing session authorization is sufficient; never ask again for approval already given. Installation, `--force`, repository examples and silence do not grant consent.
 - Store remembered launcher approval only in the user-owned ~/.codex/agent-routing.json `network_fallback_roles` list. An empty list denies fallback. List only roles the user explicitly approved; removing a role revokes its exception. The installer creates an empty policy and preserves existing policies even during forced upgrades. Never copy another user's policy into this bundle. Reconcile any conflicting saved instructions with the user's latest answer before updating the policy.
 - The launcher requires that Codex home be outside the delegated workspace. It always attempts isolation first and never relaxes filesystem restrictions. Scout/critic stay read-only; runner/builder can write only in the named workspace. Effective web/MCP/apps/plugins/browser/computer/image/nested-agent tools remain disabled. Agents must make no external requests; report missing network isolation under UNVERIFIED. Config errors or failed file/tool checks never authorize a weaker launch.

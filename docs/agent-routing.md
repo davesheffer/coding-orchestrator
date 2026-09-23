@@ -1,9 +1,10 @@
 # Codex cheap-agent routing and fallbacks
 
 The orchestrator keeps design, ambiguous debugging and final verification on
-Astra/high. Scouts and runners start on Luna/low; specified implementation starts
-on Terra/medium. Critics remain Astra/high. Bounded routine work should be
-delegated without waiting for a large context window or another user reminder.
+Sol/medium, escalating demanding cases to Astra. Scouts and runners start on
+Luna/low; specified implementation starts on Sol/medium. Critics remain
+Astra/high. Bounded routine work should be delegated without waiting for a large
+context window or another user reminder.
 
 ## Install or upgrade
 
@@ -22,7 +23,7 @@ choice. Configurations that cannot be safely edited are refused without writes;
 add the missing keys under `[agents]` manually in that case:
 
 ```toml
-default_subagent_model = "gpt-5.6-luna"
+default_subagent_model = "gpt-6-luna"
 default_subagent_reasoning_effort = "low"
 ```
 
@@ -95,8 +96,8 @@ never grants exceptions to the other roles.
 
 | Role | Ordered model attempts |
 |---|---|
-| Scout / runner | Luna/low -> Terra/low -> Sol/low |
-| Builder | Terra/medium -> Sol/medium |
+| Scout / runner | Luna/low -> Sol/low |
+| Builder | Sol/medium |
 | Critic | Astra/high only |
 
 Only recognized model-unavailable errors before any work can advance the chain.
@@ -109,10 +110,18 @@ delegation instead of assuming an account has access to these model names.
 
 `~/.codex/agent-runs/<timestamp-role-id>/` retains `report.json`, event logs, stderr
 and the final agent response. Reports include permission probes, disabled tools,
-requested and observed model/effort, thread IDs and CLI exits. Model identity comes
+requested and observed model/effort, thread IDs, CLI exits, preflight/attempt timing,
+and turn token usage when available. Model identity comes
 from the tested CLI's local thread database; missing or changed schemas produce
 an unverified result, not a guessed model identity. These artifacts are private
 local evidence and should not be committed or uploaded by default.
+
+Use `python bin/agent-report.py --workspace C:/path/to/repo` to aggregate local
+reports without printing task text. For a controlled scout comparison,
+`--trial-model gpt-6-luna` or `--trial-model gpt-6-sol` selects exactly one
+configured candidate and disables automatic model fallback for that run. It
+does not change the permission checks. See `benchmarks/README.md` for the
+read-only paired protocol and its limitations.
 
 CLI exit zero means the agent finished, not that its task passed. Inspect RESULT,
 actual acceptance-command exits and builder diffs. Evidence of a successful

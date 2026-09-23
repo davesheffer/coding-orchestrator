@@ -21,10 +21,10 @@ sending messages stay with the orchestrator and the user's authorization.
 
 | Role | Responsibility | Claude Code | Codex model / reasoning |
 |---|---|---|---|
-| Orchestrator | Design, ambiguity, root causes, final verification | Fable | GPT-6 Astra / high |
-| `scout` | Read-only lookup and reconnaissance | Sonnet | GPT-5.6 Luna / low |
-| `runner` | Exact commands; exit codes and verbatim failures | Sonnet | GPT-5.6 Luna / low |
-| `builder` | A specified change, then its acceptance check | Opus | GPT-5.6 Terra / medium |
+| Orchestrator | Design, ambiguity, root causes, final verification | Fable | GPT-6 Sol / medium |
+| `scout` | Read-only lookup and reconnaissance | Haiku | GPT-6 Luna / low |
+| `runner` | Exact commands; exit codes and verbatim failures | Sonnet | GPT-6 Luna / low |
+| `builder` | A specified change, then its acceptance check | Sonnet | GPT-6 Sol / medium |
 | `critic` | Fresh-context adversarial review | Fable | GPT-6 Astra / high |
 
 These are the author's model selections, not a promise of access on every plan.
@@ -103,8 +103,8 @@ Python tests do not establish native client compatibility or effective permissio
 
 The Codex installer:
 
-- Installs four native TOML roles, `bin/pr-status` and the restricted Windows
-  `bin/agent-run.py` launcher under
+- Installs four native TOML roles, `bin/pr-status`, the restricted Windows
+  `bin/agent-run.py` launcher, and `bin/agent-report.py` under
   `${CODEX_HOME:-$HOME/.codex}`. Claude Code does not need to be installed.
 - Merges the marked orchestrator section into global `AGENTS.md`, preserving
   content outside that section. Existing instructions receive a backup when
@@ -144,7 +144,7 @@ your custom `CODEX_HOME` path.
 Start a **new Codex session** from the project you want to work on:
 
 ```sh
-codex -m gpt-6-astra -c 'model_reasoning_effort="high"'
+codex -m gpt-6-sol -c 'model_reasoning_effort="medium"'
 ```
 
 Try: “Use scout to locate the task-report renderer. Explain its entry points;
@@ -172,6 +172,9 @@ files are not a wildcard for future servers. The launcher remains dependent on
 the host's Codex sandbox; a prompt alone does not replace enforcement. Other
 platforms retain the verified native/manual launch workflow. See
 [routing and fallbacks](docs/agent-routing.md) for commands and limitations.
+The [optimization audit](docs/optimization-research.md) records the current routing
+change, measured limits, source research, and the experiments needed to compare
+cost per correctly completed task.
 
 On native Windows, verify the sandbox and the active Windows Firewall profile.
 The `unelevated` sandbox provides weaker network isolation; the `elevated`
@@ -183,8 +186,8 @@ does not change firewall settings. See the [Windows sandbox documentation](https
 An [optional last-resort network fallback](docs/agent-routing.md#optional-network-exception)
 can be approved per role. The launcher tries isolation first on every run and
 retains file-access limits and disabled external tools. Installation grants no
-exception. Model-unavailable errors before any work can try Luna -> Terra -> Sol
-for scout/runner and Terra -> Sol for builder. Tests, partial work and unknown
+exception. Model-unavailable errors before any work can try Luna -> Sol
+for scout/runner; builder uses Sol only. Tests, partial work and unknown
 errors are never blindly retried. The older
 [critic-only manual workflow](docs/critic-network-fallback.md) remains available.
 
@@ -224,6 +227,7 @@ runner. No credentials are included.
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
 | `bin/pr-status` | Shared PR/CI helper |
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
+| `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
 | `tests/` | Bundle contracts, both installers, and relay behavior |
 | `.github/workflows/ci.yml` | Python 3.11–3.13 Linux CI plus Windows/macOS 3.12, compilation, shell syntax, and tests |
 

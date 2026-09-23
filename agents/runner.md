@@ -1,6 +1,6 @@
 ---
 name: runner
-description: Cheapest tier (Sonnet). Runs commands and reports results verbatim — test suites, typecheck, build, lint, a script, a git/gh status query — and distills long output into pass/fail plus the exact failing lines. Use whenever a command's output is long or noisy and the orchestrator only needs the verdict. NOT for fixing what fails, and not for anything destructive or outward-facing (push, publish, deploy, delete).
+description: Run an exact command and report its exit code and relevant failures. Use for noisy offline tests and builds; do not diagnose or repair failures.
 model: sonnet
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*

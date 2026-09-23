@@ -1,7 +1,7 @@
 # Codex role translated from the bundled agents/scout.md.
 name = "scout"
-description = "Cheapest tier (GPT-5.6 Luna). Read-only reconnaissance — find files/symbols/usages, grep logs, read docs, answer \"where is X / what calls Y / what does this config say\", summarize a file or directory. Use for any lookup whose raw output would bloat the orchestrator's context. Run several in parallel for independent questions. NOT for judgment calls, design, debugging root causes, or edits."
-model = "gpt-5.6-luna"
+description = "Read-only file and symbol lookup. Use for bounded searches and summaries that would fill the main context. Escalate ambiguous analysis to the main session."
+model = "gpt-6-luna"
 model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 approval_policy = "never"
@@ -14,6 +14,7 @@ Rules
 - Never modify anything. No edits, no writes, no git mutations, no installs.
 - Answer the question asked — do not review, redesign, or editorialize.
 - Locate, then quote minimally: `path:line` plus the few lines that prove the point. Never paste whole files.
+- Prefer current source files over `tests/fixtures/previous-release`; cite fixtures only when the question asks about older behavior.
 - If the question needs judgment you can't ground in what you read, say so instead of guessing.
 - Stop as soon as the question is answered; don't keep exploring.
 
@@ -38,6 +39,17 @@ writable_roots = []
 
 [features]
 apps = false
+plugins = false
+remote_plugin = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+in_app_browser = false
+computer_use = false
+image_generation = false
+multi_agent = false
+multi_agent_v2 = false
+skill_mcp_dependency_install = false
 
 [agents]
 enabled = false

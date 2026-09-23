@@ -1,0 +1,32 @@
+[
+  {
+    "id": "event-fallback",
+    "prompt": "Locate the function that parses Codex JSON event lines. State how malformed lines affect automatic model fallback. Cite paths and lines. Do not edit files.",
+    "required": ["parse_events", "events_complete", "retryable_model_error"]
+  },
+  {
+    "id": "network-consent",
+    "prompt": "Find where the Windows launcher reads saved network-fallback consent. Name the file and explain what missing consent does. Cite paths and lines. Do not edit files.",
+    "required": ["approved_roles", "agent-routing.json", "blocked-network"]
+  },
+  {
+    "id": "installer-preservation",
+    "prompt": "Find how the Codex installer handles an existing config.toml when configure-routing is not selected. Cite the function or branch and tests. Do not edit files.",
+    "required": ["config.toml", "configure-routing", "preserv"]
+  },
+  {
+    "id": "relay-unknown",
+    "prompt": "Find how the Claude relay treats unknown token usage. Does unknown force a RED rollover? Cite paths and lines. Do not edit files.",
+    "required": ["unknown", "RED", "relay/relay.py"]
+  },
+  {
+    "id": "probe-boundary",
+    "prompt": "Find which write destinations the Windows agent launcher checks in its filesystem permission probe. Cite paths and lines. Do not edit files.",
+    "required": ["cwd.parent", "tempfile", "ROOT"]
+  },
+  {
+    "id": "model-observation",
+    "prompt": "Find how the Windows launcher verifies the model actually used after a Codex run. State what happens if it cannot verify model identity. Cite paths and lines. Do not edit files.",
+    "required": ["actual_model", "state_5.sqlite", "model-unverified"]
+  }
+]

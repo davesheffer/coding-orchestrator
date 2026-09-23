@@ -12,14 +12,15 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import uuid
 
 ROOT = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')).resolve()
 MODELS = {
-    'scout': [('gpt-5.6-luna', 'low'), ('gpt-5.6-terra', 'low'), ('gpt-5.6-sol', 'low')],
-    'runner': [('gpt-5.6-luna', 'low'), ('gpt-5.6-terra', 'low'), ('gpt-5.6-sol', 'low')],
-    'builder': [('gpt-5.6-terra', 'medium'), ('gpt-5.6-sol', 'medium')],
+    'scout': [('gpt-6-luna', 'low'), ('gpt-6-sol', 'low')],
+    'runner': [('gpt-6-luna', 'low'), ('gpt-6-sol', 'low')],
+    'builder': [('gpt-6-sol', 'medium')],
     'critic': [('gpt-6-astra', 'high')],
 }
 DISABLED = ('apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_external',
@@ -76,7 +77,7 @@ def config_paths(cwd):
 
 
 def settings_for(cwd, writable, network, mode, policy, instructions):
-    servers = set()
+    servers = {}
     for path in config_paths(cwd):
         if path.exists():
             config = tomllib.loads(path.read_text(encoding='utf-8-sig'))
@@ -96,7 +97,11 @@ def settings_for(cwd, writable, network, mode, policy, instructions):
     settings.update({'features.' + name: False for name in DISABLED})
     # CLI tables merge recursively. Preserve each existing transport, disable it,
     # and supply a valid dummy transport only for absent built-in server entries.
-    settings['mcp_servers'] = {name: {'enabled': False} for name in servers}
+    settings['mcp_servers'] = {
+        name: {'enabled': False, **{key: value for key, value in server.items()
+                                    if key in ('command', 'args', 'url')}}
+        for name, server in servers.items()
+    }
     for name in ('node_repl', 'computer-use'):
         if name not in servers:
             settings['mcp_servers'][name] = {'enabled': False, 'command': 'cmd.exe'}
@@ -225,12 +230,14 @@ def actual_model(thread_id):
 
 
 def main(argv=None):
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('role', choices=MODELS)
     parser.add_argument('--cd', required=True, type=Path)
     parser.add_argument('--brief', type=Path, help='UTF-8 brief file; otherwise read stdin')
     parser.add_argument('--probe-only', action='store_true')
     parser.add_argument('--no-network-fallback', action='store_true')
+    parser.add_argument('--trial-model', help='Use one configured role model without automatic model fallback')
     args = parser.parse_args(argv)
     cwd = args.cd.resolve(strict=True)
     if not cwd.is_dir() or cwd == cwd.parent or cwd in (ROOT, Path.home().resolve()):
@@ -243,11 +250,17 @@ def main(argv=None):
     role = tomllib.loads((ROOT / 'agents' / (args.role + '.toml')).read_text(encoding='utf-8-sig'))
     if (role.get('model'), role.get('model_reasoning_effort')) != MODELS[args.role][0]:
         raise RuntimeError('Installed role model differs from launcher policy; reconcile settings before launch')
+    models = MODELS[args.role]
+    if args.trial_model is not None:
+        models = [choice for choice in models if choice[0] == args.trial_model]
+        if not models:
+            raise RuntimeError('Trial model is not configured for this role')
     approved = args.role in approved_roles() and not args.no_network_fallback
     run_id = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + args.role + '-' + uuid.uuid4().hex[:8]
     logs = ROOT / 'agent-runs' / run_id
     logs.mkdir(parents=True)
-    report = {'role': args.role, 'workspace': str(cwd), 'probes': [], 'attempts': [], 'status': 'preflight'}
+    report = {'role': args.role, 'workspace': str(cwd), 'probes': [], 'attempts': [],
+              'status': 'preflight', 'trial_model': args.trial_model}
 
     def save():
         target = logs / 'report.json'
@@ -313,6 +326,7 @@ the network isolation exception in UNVERIFIED. File limits remain mandatory.
     report['network_exception'] = network_exception
     report['authorization_source'] = str(ROOT / 'agent-routing.json') if network_exception else None
     report['tools'] = verify_tools(exe, cwd, settings)
+    report['preflight_ms'] = round((time.monotonic() - started) * 1000)
     report['status'] = 'preflight-passed'
     save()
     if args.probe_only:
@@ -320,21 +334,26 @@ the network isolation exception in UNVERIFIED. File limits remain mandatory.
     launch_brief = ('Assigned role: ' + args.role + '. You are not alone in the workspace; preserve others\' edits.\n'
                     'Do not delegate or run Hunch bookkeeping. Follow the bounded brief below.\n'
                     'Fresh permission probe evidence:\n' + json.dumps(report['probes']) + '\n\n' + brief)
-    for i, (model, effort) in enumerate(MODELS[args.role]):
+    for i, (model, effort) in enumerate(models):
         settings['model'] = model
         settings['model_reasoning_effort'] = effort
         message_path = logs / f'{i}-final.txt'
         command = [exe, 'exec', '--strict-config', '--cd', str(cwd), '--json',
                    *overrides(settings), '--output-last-message', str(message_path), '-']
         print(f'Launching {args.role}: {model} / {effort}', flush=True)
+        attempt_started = time.monotonic()
         with (logs / f'{i}-events.jsonl').open('w', encoding='utf-8') as output, (logs / f'{i}-stderr.log').open('w', encoding='utf-8') as error:
             result = subprocess.run(command, input=launch_brief, text=True, encoding='utf-8',
                                     stdout=output, stderr=error)
         events, events_complete = parse_events((logs / f'{i}-events.jsonl').read_text(encoding='utf-8'))
         thread = next((e.get('thread_id') for e in events if e.get('type') == 'thread.started'), None)
         observed = actual_model(thread)
+        usage = next((e['usage'] for e in reversed(events)
+                      if e.get('type') == 'turn.completed' and isinstance(e.get('usage'), dict)), None)
         attempt = {'requested_model': model, 'requested_effort': effort, 'observed': observed,
-                   'thread_id': thread, 'exit': result.returncode, 'events_complete': events_complete}
+                   'thread_id': thread, 'exit': result.returncode, 'events_complete': events_complete,
+                   'duration_ms': round((time.monotonic() - attempt_started) * 1000),
+                   'usage': usage}
         report['attempts'].append(attempt)
         if result.returncode == 0:
             report['status'] = 'completed' if events_complete and observed == {'model': model, 'effort': effort} else 'model-unverified'
@@ -347,7 +366,7 @@ the network isolation exception in UNVERIFIED. File limits remain mandatory.
         attempt['model_fallback_allowed'] = can_retry
         report['status'] = 'model-unavailable' if can_retry else 'failed-no-retry'
         save()
-        if not can_retry or i == len(MODELS[args.role]) - 1:
+        if not can_retry or i == len(models) - 1:
             print(f'Agent stopped (exit {result.returncode}); inspect {logs}. Main session must assess partial work before continuing.')
             return result.returncode or 1
         print('Model unavailable before work started; trying the next configured model.', flush=True)

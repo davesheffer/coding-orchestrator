@@ -7,18 +7,18 @@ The main session owns the request, design, root cause, judgment, verification, a
 
 | Work | Role | Model |
 |---|---|---|
-| Locate, read, summarize | scout | Sonnet |
+| Locate, read, summarize | scout | Haiku |
 | Run exact test/build commands and distill output | runner | Sonnet |
-| Implement an already specified change | builder | Opus |
+| Implement an already specified change | builder | Sonnet |
 | Adversarial review of risky changes or claims | critic | Fable |
 | Design, ambiguity, security/concurrency decisions | main session | Fable |
 
-Use the installed named roles. For built-in agents, explicitly select a supported model (`sonnet` for reading/running, `opus` for implementation); avoid expensive inheritance for easy work.
+Use the installed named roles. For built-in agents, explicitly select a supported model (`haiku` for bounded reading, `sonnet` for running and specified implementation); avoid expensive inheritance for easy work.
 
 - Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
 - Launch independent, delegation-sized units together; respect concurrency limits and avoid overlapping edits. Large Workflow orchestration with dozens of agents requires an explicit user request.
 - Batch independent calls, inspect every result, bound output, and preserve real exit codes. Keep edits, dependencies, approvals, and waits sequential.
-- When the relay reports at least 100k tokens, delegate reading to scout and noisy execution to runner. Keep decided edits and outward actions in the main session. Do not invent usage estimates.
+- Delegate bounded reading and noisy execution when their benefit exceeds briefing and verification overhead. Keep tiny known-file tasks and decided edits in the main session. Do not invent usage estimates.
 - Query PR/CI state once using `__PR_STATUS__`. Networked polling stays in the main session unless runner network access was explicitly authorized.
 
 ## Briefing and trust
