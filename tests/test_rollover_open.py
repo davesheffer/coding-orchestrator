@@ -36,7 +36,7 @@ class RolloverOpenTests(unittest.TestCase):
                 self.assertRegex(request_id, r"^[0-9a-f]{32}$")
                 self.assertNotIn(str(handoff), uri)
                 request = json.loads((Path(temp) / "launches" / f"{request_id}.json").read_text())
-                self.assertEqual(request["handoff"], str(handoff))
+                self.assertEqual(request["handoff"], str(handoff.resolve()))
                 self.assertEqual(request["client"], "codex")
                 rollover.write_json(Path(temp) / "acks" / f"{request_id}.json",
                                     {"status": "opened"})
@@ -61,7 +61,7 @@ class RolloverOpenTests(unittest.TestCase):
                 patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}):
             path = rollover.save_codex("repair", "GOAL: continue the repair\nSTATE: tests passed\nNEXT STEP: verify")
             self.assertIn("GOAL: continue", path.read_text(encoding="utf-8"))
-            self.assertEqual(path.parent, Path(temp) / "handoffs")
+            self.assertEqual(path.parent, (Path(temp) / "handoffs").resolve())
             if os.name != "nt":
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
