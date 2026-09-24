@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
@@ -28,6 +29,9 @@ DISABLED = ('apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_exte
             'browser_use_full_cdp_access', 'in_app_browser', 'computer_use',
             'image_generation', 'multi_agent', 'multi_agent_v2',
             'skill_mcp_dependency_install', 'hooks')
+# Every other saved status (blocked-*, completed, model-unverified, failed-no-retry)
+# is terminal and must survive a later exception along with its exit semantics.
+NON_TERMINAL_STATUSES = ('preflight', 'preflight-passed', 'model-unavailable')
 
 
 def toml(value):
@@ -126,7 +130,10 @@ def settings_for(cwd, writable, network, mode, policy, instructions, allow_host=
     for path in config_paths(cwd):
         if path.exists():
             config = tomllib.loads(path.read_text(encoding='utf-8-sig'))
-            servers.update(config.get('mcp_servers', {}))
+            entries = config.get('mcp_servers', {})
+            if not isinstance(entries, dict) or any(not isinstance(v, dict) for v in entries.values()):
+                raise RuntimeError(f'Invalid mcp_servers in {path}; expected a table of server tables')
+            servers.update(entries)
     # Unset domains allow nothing; the allowlist never narrows an open fallback.
     access = ({'enabled': True, 'domains': {allow_host: 'allow'}} if allow_host and not network
               else {'enabled': network})
@@ -163,7 +170,8 @@ def verify_tools(exe, cwd, settings):
     if result.returncode:
         raise RuntimeError('Cannot inspect effective MCP settings: ' + result.stderr[-2000:])
     servers = json.loads(result.stdout)
-    if not isinstance(servers, list) or any(s.get('enabled', True) for s in servers):
+    # A server counts as enabled unless explicitly disabled; missing or null 'enabled' must not slip past.
+    if not isinstance(servers, list) or any(not isinstance(s, dict) or s.get('enabled') is not False for s in servers):
         raise RuntimeError('Effective MCP server remains enabled; refusing delegation')
     result = subprocess.run([exe, *overrides(settings), 'features', 'list'],
                             cwd=cwd, capture_output=True, text=True, encoding='utf-8',
@@ -174,7 +182,7 @@ def verify_tools(exe, cwd, settings):
                 if len(parts := line.split()) >= 3}
     if any(features.get(name) != 'false' for name in DISABLED):
         raise RuntimeError('A required tool restriction is not effective; refusing delegation')
-    return {'mcp_servers': {s['name']: s['enabled'] for s in servers},
+    return {'mcp_servers': {str(s.get('name')): s['enabled'] for s in servers},
             'disabled_features': list(DISABLED)}
 
 
@@ -211,8 +219,8 @@ def probe(exe, cwd, settings, policy, writable, allow_host=None):
     marker = '.agent-probe-' + uuid.uuid4().hex
     read = cwd / (marker + '.read')
     targets = list(dict.fromkeys([cwd / marker, cwd.parent / marker,
-                                  Path(tempfile.gettempdir()) / marker, ROOT / marker]))
-    if any(p.parent == cwd for p in targets[1:]):
+                                  Path(tempfile.gettempdir()).resolve() / marker, ROOT / marker]))
+    if any(p.is_relative_to(cwd.resolve()) for p in targets[1:]):
         raise RuntimeError('Workspace overlaps protected probe roots')
     read.write_text('agent-probe', encoding='utf-8')
     try:
@@ -283,6 +291,8 @@ def parse_events(text):
     events = []
     complete = True
     for line in text.splitlines():
+        if not line.strip():
+            continue
         try:
             event = json.loads(line)
             if not isinstance(event, dict) or not isinstance(event.get('type'), str):
@@ -294,12 +304,27 @@ def parse_events(text):
     return events, complete
 
 
+def state_db():
+    """Newest Codex state schema: highest state_<N>.sqlite, then newest mtime."""
+    def rank(path):
+        version = path.stem.removeprefix('state_')
+        return (int(version) if version.isdigit() else -1, path.stat().st_mtime)
+    try:
+        return max(ROOT.glob('state_*.sqlite'), key=rank, default=None)
+    except OSError:
+        return None
+
+
 def actual_model(thread_id):
     if not thread_id:
         return None
-    uri = (ROOT / 'state_5.sqlite').as_uri() + '?mode=ro'
+    path = state_db()
+    if path is None:
+        return None
+    uri = path.as_uri() + '?mode=ro'
     try:
-        with sqlite3.connect(uri, uri=True) as db:
+        # sqlite3's own context manager only commits; closing releases the file.
+        with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
             row = db.execute('select model,reasoning_effort from threads where id=?',
                              (thread_id,)).fetchone()
             return {'model': row[0], 'effort': row[1]} if row else None
@@ -334,12 +359,20 @@ def main(argv=None):
         raise RuntimeError('Choose a specific repository/workspace directory')
     if ROOT == cwd or ROOT.is_relative_to(cwd):
         raise RuntimeError('CODEX_HOME must be outside the delegated workspace; project files cannot grant fallback consent')
-    brief = '' if args.probe_only else (args.brief.read_text(encoding='utf-8') if args.brief else sys.stdin.read())
+    if args.probe_only:
+        brief = ''
+    elif args.brief:
+        brief = args.brief.read_text(encoding='utf-8')
+    else:
+        # Hosts pipe UTF-8 regardless of the console code page; strip a leading BOM.
+        brief = sys.stdin.buffer.read().decode('utf-8-sig', 'replace')
     if not args.probe_only and not brief.strip():
         raise RuntimeError('A bounded task brief is required')
     role = tomllib.loads((ROOT / 'agents' / (args.role + '.toml')).read_text(encoding='utf-8-sig'))
     if (role.get('model'), role.get('model_reasoning_effort')) != MODELS[args.role][0]:
         raise RuntimeError('Installed role model differs from launcher policy; reconcile settings before launch')
+    if not isinstance(role.get('developer_instructions'), str) or not role['developer_instructions'].strip():
+        raise RuntimeError('Installed role lacks developer_instructions; reinstall the role before launch')
     models = MODELS[args.role]
     if args.trial_model is not None:
         models = [choice for choice in models if choice[0] == args.trial_model]
@@ -360,6 +393,18 @@ def main(argv=None):
 
     save()
     print('Agent run:', logs, flush=True)
+    try:
+        return launch(args, cwd, brief, role, models, approved, logs, report, save, started)
+    except Exception:
+        # A failure after the first save must not leave a stale preflight status,
+        # but an already-saved terminal status and its exit semantics must survive.
+        if report['status'] in NON_TERMINAL_STATUSES:
+            report['status'] = 'error'
+        save()
+        raise
+
+
+def launch(args, cwd, brief, role, models, approved, logs, report, save, started):
     exe = executable()
     writable = args.role in ('builder', 'runner')
     # Each invocation starts from strict isolation; never cache a failed network probe.
@@ -421,10 +466,17 @@ unverified.
 '''
         settings = settings_for(cwd, writable, True, fallback_mode, policy, instructions)
         evidence = probe(exe, cwd, settings, policy, writable)
-        report['probes'].append({'mode': fallback_mode, 'fallback': True, **evidence})
+        report['probes'].append({'mode': fallback_mode, 'fallback': True,
+                                 'jev_allowlist': None, **evidence})
+        if evidence['exit'] != 0:
+            report['status'] = 'blocked-sandbox-startup'
+            save()
+            print(json.dumps(evidence), flush=True)
+            return 3
         if not evidence['filesystem_ok']:
             report['status'] = 'blocked-filesystem'
             save()
+            print(json.dumps(evidence), flush=True)
             return 3
         print('Fallback: network isolation unavailable; filesystem restrictions verified. No external requests allowed.', flush=True)
     else:
@@ -433,7 +485,11 @@ unverified.
             print(f'Network: only {allowed} (Jev) allowed; direct sockets and other hosts verified blocked.', flush=True)
     report['network_exception'] = network_exception
     report['authorization_source'] = str(ROOT / 'agent-routing.json') if network_exception else None
-    report['tools'] = verify_tools(exe, cwd, settings)
+    try:
+        report['tools'] = verify_tools(exe, cwd, settings)
+    except Exception:
+        report['status'] = 'blocked-tools'
+        raise
     report['preflight_ms'] = round((time.monotonic() - started) * 1000)
     report['status'] = 'preflight-passed'
     save()
@@ -450,10 +506,11 @@ unverified.
                    *overrides(settings), '--output-last-message', str(message_path), '-']
         print(f'Launching {args.role}: {model} / {effort}', flush=True)
         attempt_started = time.monotonic()
+        # No timeout on purpose: a delegated Codex run's length is unbounded.
         with (logs / f'{i}-events.jsonl').open('w', encoding='utf-8') as output, (logs / f'{i}-stderr.log').open('w', encoding='utf-8') as error:
             result = subprocess.run(command, input=launch_brief, text=True, encoding='utf-8',
                                     stdout=output, stderr=error)
-        events, events_complete = parse_events((logs / f'{i}-events.jsonl').read_text(encoding='utf-8'))
+        events, events_complete = parse_events((logs / f'{i}-events.jsonl').read_text(encoding='utf-8', errors='replace'))
         thread = next((e.get('thread_id') for e in events if e.get('type') == 'thread.started'), None)
         observed = actual_model(thread)
         usage = next((e['usage'] for e in reversed(events)
@@ -468,7 +525,7 @@ unverified.
             save()
             print(json.dumps(attempt), flush=True)
             if message_path.exists():
-                print(message_path.read_text(encoding='utf-8'), flush=True)
+                print(message_path.read_text(encoding='utf-8', errors='replace'), flush=True)
             return 0 if report['status'] == 'completed' else 4
         can_retry = events_complete and retryable_model_error(events, result.returncode)
         attempt['model_fallback_allowed'] = can_retry
@@ -478,6 +535,7 @@ unverified.
             print(f'Agent stopped (exit {result.returncode}); inspect {logs}. Main session must assess partial work before continuing.')
             return result.returncode or 1
         print('Model unavailable before work started; trying the next configured model.', flush=True)
+    # Unreachable in practice (the loop above always returns); fail closed if it ever falls through.
     return 1
 
 

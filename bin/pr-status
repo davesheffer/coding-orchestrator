@@ -17,6 +17,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -25,10 +26,25 @@ BAD = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP
 OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 
+def wrapper_command():
+    base = os.path.expanduser("~/.hunch/agent-gh")
+    if sys.platform == "win32":
+        # shutil.which performs the real PATHEXT lookup; only .exe/.com are safe
+        # to launch directly (.bat/.cmd would pass arguments through cmd.exe).
+        resolved = shutil.which(base)
+        if resolved and os.path.splitext(resolved)[1].lower() in (".exe", ".com"):
+            return resolved
+        return "gh"
+    return base if os.access(base, os.X_OK) else "gh"
+
+
 def gh(*args):
-    wrapper = os.path.expanduser("~/.hunch/agent-gh")
-    exe = wrapper if os.access(wrapper, os.X_OK) else "gh"
-    r = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8", timeout=60)
+    exe = wrapper_command()
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.exit(f"pr-status: {' '.join(args[:3])} could not run {exe}: {exc}")
     if r.returncode != 0:
         sys.exit(f"pr-status: {' '.join(args[:3])} failed: {r.stderr.strip()[:300]}")
     return r.stdout
