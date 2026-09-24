@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -19,10 +20,12 @@ GOOD = {'exit': 0, 'filesystem_ok': True, 'network': 'CONNECTED'}
 ISOLATED = dict(GOOD, network='DENIED')
 STARTUP_FAILURE = {'exit': 1, 'filesystem_ok': False, 'network': 'UNKNOWN', 'error': 'sandbox setup unavailable'}
 LEAK = dict(GOOD, filesystem_ok=False)
+JEV_ONLY = dict(ISOLATED, off_list='URLError:Tunnel connection failed: 403', allow_host='CONNECTED')
+JEV_LEAKY = dict(ISOLATED, off_list='CONNECTED', allow_host='CONNECTED')
 
 
 class FlowTests(unittest.TestCase):
-    def run_flow(self, responses, probes, approved=True, extra_args=()):
+    def run_flow(self, responses, probes, approved=True, extra_args=(), jev=False, launched=None):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TEST_TMPDIR')) as temp:
             root = Path(temp)
             workspace = root / 'workspace'
@@ -30,6 +33,9 @@ class FlowTests(unittest.TestCase):
             (root / 'agents').mkdir()
             (root / 'agents/scout.toml').write_text('model="gpt-6-luna"\nmodel_reasoning_effort="low"\ndeveloper_instructions="Read-only scout"\n')
             (root / 'agent-routing.json').write_text(json.dumps({'network_fallback_roles': ['scout'] if approved else []}))
+            if jev:
+                (root / 'jev').mkdir()
+                (root / 'jev/config.json').write_text(json.dumps({'jev': {'enabled': True}}))
             brief = root / 'brief.txt'
             brief.write_text('Bounded local test task')
             calls = []
@@ -37,6 +43,8 @@ class FlowTests(unittest.TestCase):
             def fake_exec(command, **kwargs):
                 chosen = next(toml.split('=', 1)[1].strip('"') for toml in command if toml.startswith('model='))
                 calls.append(chosen)
+                if launched is not None:
+                    launched.append(command)
                 code, stream = responses[len(calls) - 1]
                 kwargs['stdout'].write(stream)
                 Path(command[command.index('--output-last-message') + 1]).write_text('RESULT: test response')
@@ -55,6 +63,7 @@ class FlowTests(unittest.TestCase):
                  contextlib.redirect_stdout(io.StringIO()):
                 code = agent.main(['scout', '--cd', str(workspace), '--brief', str(brief), *extra_args])
             report = json.loads(next((root / 'agent-runs').glob('*/report.json')).read_text())
+            self.probe_hosts = [call.args[5] if len(call.args) > 5 else None for call in probe.call_args_list]
             return code, calls, report, probe.call_count
 
     def test_model_unavailable_falls_back_once_to_sol(self):
@@ -119,6 +128,65 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(count, 2)
         self.assertEqual(report['status'], 'blocked-network')
+
+    @staticmethod
+    def permissions(command):
+        part = next(p for p in command if p.startswith('permissions.local-agent-'))
+        return tomllib.loads('v = ' + part.split('=', 1)[1])['v']['network']
+
+    def test_jev_disabled_never_probes_allowlist(self):
+        stream = '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n'
+        launched = []
+        code, _, report, count = self.run_flow([(0, stream)], [ISOLATED], launched=launched)
+        self.assertEqual(code, 0)
+        self.assertEqual(count, 1)
+        self.assertEqual(self.probe_hosts, [None])
+        self.assertIsNone(report['jev_allowlist'])
+        self.assertNotIn('domains', self.permissions(launched[0]))
+
+    def test_enforced_jev_allowlist_launches_with_one_domain(self):
+        stream = '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n'
+        launched = []
+        code, _, report, count = self.run_flow([(0, stream)], [JEV_ONLY], jev=True, launched=launched)
+        self.assertEqual(code, 0)
+        self.assertEqual(count, 1)
+        self.assertEqual(self.probe_hosts, ['api.typesafe.ai'])
+        self.assertEqual(report['jev_allowlist'], 'api.typesafe.ai')
+        self.assertFalse(report['network_exception'])
+        self.assertEqual(self.permissions(launched[0]),
+                         {'enabled': True, 'domains': {'api.typesafe.ai': 'allow'}})
+        self.assertIn('Jev network allowlist', next(p for p in launched[0] if p.startswith('developer_instructions=')))
+
+    def test_unenforced_allowlist_retries_same_backend_offline(self):
+        stream = '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n'
+        launched = []
+        code, _, report, count = self.run_flow([(0, stream)], [JEV_LEAKY, ISOLATED], jev=True, launched=launched)
+        self.assertEqual(code, 0)
+        self.assertEqual(count, 2)
+        self.assertEqual(self.probe_hosts, ['api.typesafe.ai', None])
+        self.assertEqual([p['mode'] for p in report['probes']], ['elevated', 'elevated'])
+        self.assertIsNone(report['jev_allowlist'])
+        self.assertEqual(self.permissions(launched[0]), {'enabled': False})
+        self.assertNotIn('Jev network allowlist', next(p for p in launched[0] if p.startswith('developer_instructions=')))
+
+    def test_allowlist_probe_without_off_list_evidence_is_not_trusted(self):
+        code, calls, report, count = self.run_flow([], [ISOLATED, GOOD, GOOD, GOOD], approved=False, jev=True)
+        self.assertEqual(code, 3)
+        self.assertEqual(calls, [])
+        self.assertEqual(count, 4)
+        self.assertEqual(report['status'], 'blocked-network')
+
+    def test_no_isolation_uses_open_fallback_without_allowlist(self):
+        stream = '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n'
+        launched = []
+        code, _, report, count = self.run_flow([(0, stream)], [JEV_LEAKY, GOOD, JEV_LEAKY, GOOD, GOOD],
+                                               jev=True, launched=launched)
+        self.assertEqual(code, 0)
+        self.assertEqual(count, 5)
+        self.assertEqual(self.probe_hosts[-1], None)
+        self.assertTrue(report['network_exception'])
+        self.assertIsNone(report['jev_allowlist'])
+        self.assertEqual(self.permissions(launched[0]), {'enabled': True})
 
 
 if __name__ == '__main__':

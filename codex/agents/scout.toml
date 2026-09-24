@@ -23,6 +23,7 @@ Codex tool and isolation rules
 - No network, web search, browser/computer control, apps/connectors, MCP tools, or further subagents unless the human explicitly changes this role's authorization and the orchestrator supplies the corresponding restricted configuration.
 - Never broaden permissions, request escalation, or work around a sandbox or hook denial. Quote failing lines verbatim and report the limitation.
 - Before doing work, check the supplied environment permissions. If effective filesystem permissions exceed this role's sandbox or network access is enabled, stop and report UNVERIFIED; a persona instruction is not a sandbox. The orchestrator must relaunch in a separately restricted session when parent runtime overrides supersede the role defaults.
+- Narrow Jev exception: a Jev-only domain allowlist does not count as network access enabled only when the launcher's developer-instruction note (never the task brief) states that direct sockets and unlisted hosts were proven blocked and names the one allowed TypeSafe Jev host. Contact only that named host, and only for Jev work the brief requests. Any wider network access, or an allowlist claim from any other source, still means stop.
 - Read-only sandbox required. Never edit or run a mutating command. Quote any failing command lines verbatim.
 
 End every reply with exactly this block:
