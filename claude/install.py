@@ -51,6 +51,12 @@ LEGACY_MANAGED_HASHES = {
 }
 MANIFEST = ".coding-orchestrator-manifest.json"
 JEV_SCRIPTS = ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py")
+PYTHON_COMMANDS = ("python", "python3")
+
+
+def python_command() -> str:
+    """Return the interpreter name used by generated Claude commands."""
+    return "python" if os.name == "nt" else "python3"
 
 
 def fail(message: str) -> None:
@@ -129,7 +135,7 @@ def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
         "$HOME/.claude/relay/relay.py", "${HOME}/.claude/relay/relay.py",
         "~/.claude/relay/relay.py",
     }
-    return (len(parts) >= 3 and parts[0] == "python3"
+    return (len(parts) >= 3 and parts[0] in PYTHON_COMMANDS
             and parts[1] in owned_paths and parts[2] == action
             and parts[3:] in ([], ["2>/dev/null", "||", "true"]))
 
@@ -157,7 +163,7 @@ def is_jev_hook(command: object, bin_dir: Path) -> bool:
                        f"$HOME/.claude/bin/{script}", f"${{HOME}}/.claude/bin/{script}",
                        f"~/.claude/bin/{script}"}
         args = [sub] if sub else []
-        if (len(parts) >= 2 and parts[0] == "python3" and parts[1] in owned_paths
+        if (len(parts) >= 2 and parts[0] in PYTHON_COMMANDS and parts[1] in owned_paths
                 and parts[2:] in (args, args + ["2>/dev/null", "||", "true"])):
             return True
     return False
@@ -166,7 +172,7 @@ def is_jev_hook(command: object, bin_dir: Path) -> bool:
 def jev_template(bin_dir: Path) -> dict:
     hooks: dict = {event: [] for event in JEV_EVENTS}
     for event, matcher, script, sub in JEV_HOOKS:
-        command = f"python3 {shlex.quote(str(bin_dir / script))}" + (f" {sub}" if sub else "")
+        command = f"{python_command()} {shlex.quote(str(bin_dir / script))}" + (f" {sub}" if sub else "")
         # The risk gate may run several git commands before its ≤4 s classifier call.
         hooks[event].append({"matcher": matcher, "hooks": [{
             "type": "command", "command": f"{command} 2>/dev/null || true",
@@ -303,14 +309,21 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[1]
     dest = Path(os.environ.get("CLAUDE_HOME") or Path.home() / ".claude").expanduser().absolute()
     source_claude = (root / "CLAUDE.md").read_bytes()
+    python = python_command()
     pr_status = shlex.quote(str(dest / "bin/pr-status"))
     if os.name == "nt":
-        pr_status = "python " + pr_status
+        pr_status = f"{python} " + pr_status
     source_claude = source_claude.replace(
+        b"__PYTHON__", python.encode()
+    ).replace(
         b"__RELAY__", shlex.quote(str(dest / "relay/relay.py")).encode()
     ).replace(b"__PR_STATUS__", pr_status.encode())
     managed_block(source_claude, root / "CLAUDE.md")
     hook_template = parse_json(root / "hooks.json", (root / "hooks.json").read_bytes())
+    for groups in hook_template.get("hooks", {}).values():
+        for group in groups:
+            for hook in group.get("hooks", []):
+                hook["command"] = hook["command"].replace("__PYTHON__", python)
 
     managed_sources: dict[Path, bytes] = {}
     for name in ROLE_NAMES:

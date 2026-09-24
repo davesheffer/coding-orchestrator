@@ -82,10 +82,10 @@ can still apply a stronger parent permission mode, so use `/tasks` and `/status`
 to confirm the effective model and settings when validating a new machine.
 
 On Windows, use `python claude/install.py --dry-run` followed by
-`python claude/install.py`. Claude's generated hooks still require a POSIX shell
-and a working `python3` command (for example, through Git Bash); native PowerShell
-installation alone does not verify those hooks. For a custom destination, set
-`CLAUDE_CONFIG_DIR` to the same directory as `CLAUDE_HOME` when launching Claude.
+`python claude/install.py`. Generated Claude commands use `python` on Windows and
+`python3` elsewhere; the hooks still require a POSIX shell on Windows (for
+example, through Git Bash). For a custom destination, set `CLAUDE_CONFIG_DIR` to
+the same directory as `CLAUDE_HOME` when launching Claude.
 
 #### Context relay and rollover
 
