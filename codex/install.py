@@ -223,8 +223,14 @@ def merge_jev_hooks(path: Path, prior: bytes | None, dest: Path, enabled: bool) 
     return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+JEV_DISABLED = "jev: disabled (was enabled). Re-run with --jev to keep it."
+
+
 def merge_jev_config(path: Path, prior: bytes | None, enabled: bool) -> bytes | None:
     doc = parse_json(path, prior)
+    # Jev features are opt-in: --jev turns them on; installing without it turns them off,
+    # so a TYPESAFE_API_KEY in the environment alone never sends data. main() reports
+    # the flip so a routine upgrade never disables them silently.
     if prior is None and not enabled:
         return None
     jev = doc.setdefault("jev", {})
@@ -349,6 +355,9 @@ def main(argv: list[str] | None = None) -> int:
     jev_existing = read_regular(jev_path)
     hooks_desired = merge_jev_hooks(hooks_path, hooks_existing, dest, args.jev)
     jev_desired = merge_jev_config(jev_path, jev_existing, args.jev)
+    prior_jev = parse_json(jev_path, jev_existing).get("jev")
+    jev_disabled = (not args.jev and isinstance(prior_jev, dict)
+                    and prior_jev.get("enabled") is True)
     override = dest / "AGENTS.override.md"
     if override.is_symlink():
         fail(f"refusing symlink: {override}")
@@ -391,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         for action in actions:
             print(action)
+        if jev_disabled:
+            print(JEV_DISABLED)
         return 0
 
     for directory in (dest, dest / "agents", dest / "bin", dest / "jev"):
@@ -405,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
     if helper.exists() and not os.access(helper, os.X_OK):
         os.chmod(helper, stat.S_IMODE(helper.stat().st_mode) | stat.S_IXUSR)
         print(f"chmod +x {helper}")
+    if jev_disabled:
+        print(JEV_DISABLED)
     return 0
 
 

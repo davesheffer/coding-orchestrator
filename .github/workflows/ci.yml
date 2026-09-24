@@ -13,11 +13,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
         include:
-          - os: windows-latest
-            python-version: "3.12"
           - os: macos-latest
             python-version: "3.12"
     steps:
@@ -28,7 +26,7 @@ jobs:
       - name: Compile Python
         run: python -m compileall -q claude codex relay tests bin/pr-status bin/agent-run.py bin/rollover-open.py
       - name: Check shell syntax
-        if: runner.os != 'Windows'
+        shell: bash
         run: bash -n install.sh codex/install.sh
       - name: Test installers, executable entry points, release upgrades, and relay
         run: python -m unittest discover -s tests -v

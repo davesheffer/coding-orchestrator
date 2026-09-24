@@ -81,9 +81,30 @@ explicit permission modes, narrow tool allowlists, and no MCP tools. Claude Code
 can still apply a stronger parent permission mode, so use `/tasks` and `/status`
 to confirm the effective model and settings when validating a new machine.
 
+Role permissions are weaker than their names suggest:
+
+- Per the [subagent documentation](https://code.claude.com/docs/en/sub-agents),
+  "When the main conversation is in `bypassPermissions`, `acceptEdits`, or auto
+  mode, the subagent runs in that same mode and Claude Code ignores the
+  `permissionMode` you set." In those modes only each role's `tools:` list
+  constrains it.
+- Scout and critic are read-only by instruction. They keep `Bash`, which is not
+  sandboxed; `permissionMode: plan` blocks edit tools but not every shell command.
+  Builder's ban on commit and push is likewise instruction-only.
+- Runner uses `permissionMode: dontAsk`, which auto-denies any Bash command that
+  would otherwise prompt, except read-only commands and those matching your
+  `permissions.allow` rules. The bundle ships no allow rules, so add rules for your
+  own test and build commands to `~/.claude/settings.json` or the project's
+  settings, for example:
+
+  ```json
+  {"permissions": {"allow": ["Bash(python -m unittest:*)", "Bash(npm test:*)"]}}
+  ```
+
 On Windows, use `python claude/install.py --dry-run` followed by
 `python claude/install.py`. Claude's generated hooks still require a POSIX shell
-and a working `python3` command (for example, through Git Bash); native PowerShell
+(for example, Git Bash). They call `python` on Windows and `python3` elsewhere, and
+the installer warns when that command is not on `PATH`; native PowerShell
 installation alone does not verify those hooks. For a custom destination, set
 `CLAUDE_CONFIG_DIR` to the same directory as `CLAUDE_HOME` when launching Claude.
 
@@ -163,7 +184,9 @@ task changes, gate risky commits, check subagent reports, and grade handoffs.
 The scripts are always installed. Only `--jev` registers the hooks and sets
 `jev.enabled` to `true` in the installed `relay/config.json`. Rerunning
 `./install.sh` without `--jev` removes only the hooks this bundle owns and sets
-`jev.enabled` back to `false`. Your own hooks and other `jev` keys stay. A
+`jev.enabled` back to `false`, printing `jev: disabled (was enabled). Re-run with
+--jev to keep it.` when it was on. Include `--jev` on every upgrade to keep the
+features. Your own hooks and other `jev` keys stay. A
 `TYPESAFE_API_KEY` in the environment alone never turns anything on.
 
 | Feature | Runs in | Question for Jev | What happens | Sent to TypeSafe |
@@ -319,7 +342,9 @@ inspect and relocate that link before installing a regular copy.
 
 `--jev` installs user-level Codex hooks in `~/.codex/hooks.json` and enables
 `~/.codex/jev/config.json`. The hooks preserve unrelated entries and rerunning
-the installer without `--jev` disables only this bundle's Jev hooks. Codex
+the installer without `--jev` disables only this bundle's Jev hooks and sets
+`jev.enabled` to `false`, printing `jev: disabled (was enabled). Re-run with --jev
+to keep it.` when it was on. Codex
 requires you to review and trust these user hooks through `/hooks` before they
 run; a changed hook definition needs review again. The hooks use Python 3.11+
 and TypeSafe's paid Jev API. Set `TYPESAFE_API_KEY`, set `jev.api_key_file` in
@@ -487,7 +512,7 @@ runner. No credentials are included.
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
 | `tests/` | Bundle contracts, both installers, and relay behavior |
-| `.github/workflows/ci.yml` | Python 3.11–3.13 Linux CI plus Windows/macOS 3.12, compilation, shell syntax, and tests |
+| `.github/workflows/ci.yml` | Python 3.11–3.13 Linux and Windows CI plus macOS 3.12, compilation, shell syntax, and tests |
 
 ## Update and verify
 
