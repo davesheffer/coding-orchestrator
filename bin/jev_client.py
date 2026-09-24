@@ -11,8 +11,12 @@ hard deadline of min(timeout_seconds, 4) seconds. Callers treat None as "no
 opinion" and keep their pre-Jev behaviour. Nothing here logs prompt, diff or
 report text, or the key.
 """
+import csv
+import ctypes
 import json
 import os
+import re
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -173,24 +177,35 @@ def http_classify(body, cfg, key):
         return json.loads(response.read().decode("utf-8"))
 
 
-def ask(cfg, feature, state, questions, classify_fn=None):
+def ask(cfg, feature, state, questions, classify_fn=None, errors=None):
     """Return the Jev `answers` dict, or None (disabled, no key, error, timeout).
 
     classify_fn(body, key) returns the parsed response; it defaults to the HTTP
-    call and always runs under the hard deadline.
+    call and always runs under the hard deadline. When `errors` is a list, a
+    failed call appends a short reason (the exception class name, "NoApiKey" or
+    "MalformedResponse") so callers can log it; never the body or the key.
+    Disabled features and disallowed endpoints append nothing.
     """
     if not feature_enabled(cfg, feature) or not endpoint_allowed(cfg.get("endpoint")):
         return None
     key = api_key(cfg)
     if not key:
+        if errors is not None:
+            errors.append("NoApiKey")
         return None
     fn = classify_fn or (lambda body, k: http_classify(body, cfg, k))
     body = {"state": state, "model": cfg["jev_model"], "questions": questions}
     try:
         answers = call_with_deadline(fn, (body, key), effective_timeout(cfg))["answers"]
-    except Exception:
+    except Exception as exc:
+        if errors is not None:
+            errors.append(type(exc).__name__)
         return None
-    return answers if isinstance(answers, dict) else None
+    if not isinstance(answers, dict):
+        if errors is not None:
+            errors.append("MalformedResponse")
+        return None
+    return answers
 
 
 def noul(answers, name):
@@ -210,19 +225,60 @@ def timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+def _restrict_windows_file(path):
+    """Remove inherited access from a newly created, still-empty file, leaving only the
+    current user (the same approach as relay/relay.py `_restrict_windows_state`)."""
+    system_dir = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(system_dir, len(system_dir))
+    if not 0 < length < len(system_dir):
+        raise OSError("could not locate the Windows system directory")
+    system_dir = Path(system_dir.value)
+    # A timeout so a hung whoami.exe/icacls.exe can't block the caller past its own
+    # deadline; the caller already treats any exception here (including
+    # TimeoutExpired) as a best-effort failure.
+    identity = subprocess.run([str(system_dir / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
+                              capture_output=True, text=True, check=True, timeout=MAX_DEADLINE_SECONDS)
+    rows = list(csv.reader(identity.stdout.splitlines()))
+    sid = rows[0][-1].strip() if rows and rows[0] else ""
+    if not re.fullmatch(r"S-\d+(?:-\d+)+", sid):
+        raise OSError("could not determine the current Windows user SID")
+    subprocess.run([str(system_dir / "icacls.exe"), str(path), "/inheritance:r",
+                    "/grant:r", f"*{sid}:F"],
+                   capture_output=True, text=True, check=True, timeout=MAX_DEADLINE_SECONDS)
+
+
 def write_log(cfg, entry, path=None):
     if not cfg.get("log", True):
         return
     path = Path(path or LOG_PATH)
     try:
         if path.is_file() and path.stat().st_size > MAX_LOG_BYTES:
-            os.replace(path, path.with_name(path.name + ".1"))
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
             try:
-                os.chmod(path, 0o600)
+                os.replace(path, path.with_name(path.name + ".1"))
             except OSError:
+                # e.g. Windows while another hook holds the log open: skip rotation
+                # this time and still append the entry.
                 pass
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND, 0o600)
+            created = False
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            if os.name == "nt":
+                # os.open's mode doesn't restrict Windows ACLs; do it once, while the
+                # new file is still empty. Best effort: entries hold no text or key.
+                if created:
+                    try:
+                        _restrict_windows_file(path)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass

@@ -193,8 +193,8 @@ features. Your own hooks and other `jev` keys stay. A
 |---|---|---|---|---|
 | `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A confident choice that differs from the current model is applied through `updatedInput.model` | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
 | `shift` | `UserPromptSubmit` → `relay/relay.py prompt` | Does the new prompt continue the recent prompts / handoff goal? | Below `shift_low`: "TASK SHIFT DETECTED — roll over now". Above `shift_high`: the generic task-shift reminder is dropped | Last 5 prompts (500 chars each), handoff GOAL, new prompt (2,000 chars) |
-| `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds | Operation, changed file names, diff (`send_diff`, `max_diff_chars`) |
-| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A weak hand-back report is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections |
+| `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds | Operation, changed file names, diff (`send_diff`, `max_diff_chars`), with secret-looking files and tokens redacted (below) |
+| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A weak hand-back report is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections, with tokens redacted (below) |
 | `handoff_grade` | `relay.py handoff` | How actionable is this handoff for a fresh session (0–4)? Is NEXT STEP concrete? Do VERIFIED claims cite commands? | Below `handoff_min_score`: prints the gaps and **exits 3 without saving**. `--accept-weak` saves anyway | The handoff body (12,000 chars) |
 
 Missing sections count as weak without asking Jev: headers must be uppercase
@@ -211,19 +211,47 @@ with `HEAD`, because nothing is staged when the hook runs; new untracked files
 contents are omitted because an untracked path can be a symlink outside the
 repository; review new files directly before relying on the gate's advice.
 
-`risk_gate` is advisory, not enforcement. It can be bypassed with
-`command git`, `/usr/bin/git`, `env X=1 git`, `sh -c`, a shell alias, and
-similar. It also misses `git commit <pathspec>` with nothing staged, a
-`"$(git push)"` inside double quotes, and `--git-dir`/`--work-tree` or
-`GIT_DIR`/`GIT_WORK_TREE` pointing at another repo (these are detected, but the
-gate still diffs the current directory). It understands `VAR=value git`,
-`git -c k=v`, `--no-pager`, `-C <dir>` and earlier `cd <dir>` steps in the
-same command, including
-a subshell (`cd <dir> && git add -A && git commit`, `(cd <dir> && git commit)`),
-and ignores quoted text and heredoc bodies when looking for a git commit or
-push. Git calls within one gate run share a single time budget; if it runs out,
-the gate allows the call. With more than 1,000 untracked files, only the first
-1,000 are sent, and the change always counts as needing review.
+`risk_gate` is advisory, not enforcement. It finds `git`, `git.exe` and a path
+to either (`/usr/bin/git`), after `;`, `&&`, `||`, `|`, `(`, `{`, a backtick
+or a newline, and after `VAR=value`, `then`/`do`/`else` and the
+`time`/`exec`/`command`/`env`/`nice`/`sudo` wrappers (with plain flags such as
+`nice -n 5`). It understands `git -c k=v`, `--no-pager`, `-C <dir>` and earlier
+`cd <dir>` steps in the same command, including a subshell
+(`cd <dir> && git add -A && git commit`, `(cd <dir> && git commit)`) and, on
+Windows, Git Bash paths such as `cd /c/Users/me/repo`. It ignores quoted text,
+comments and heredoc bodies (a `<<` inside quotes or a comment is not a
+heredoc), honours backslash escapes and `\`-newline continuations, and gates
+every commit and push in the command: with a push anywhere, it asks about the
+staged diff plus the unpushed commits, as a push. A push is compared with its
+upstream, else the push remote's default branch (`refs/remotes/<remote>/HEAD`,
+where the remote is `remote.pushDefault` or `origin`), else `origin/main`, else
+`origin/master`; with none of these, the push is not checked. Known bypasses:
+`sh -c`/`bash -c`/`eval`, a shell alias or function, `xargs`, git run through a
+variable (`$GIT push`) or a quoted path, wrappers with value options
+(`sudo -u me git`), keywords such as `if git commit`, and `"$(git push)"` inside
+double quotes. It also misses `git commit <pathspec>` with nothing staged, and
+`--git-dir`/`--work-tree` or `GIT_DIR`/`GIT_WORK_TREE` pointing at another repo
+(these are detected, but the gate still diffs the current directory). It also
+does not scan the body of a `bash <<EOF ... EOF` heredoc or a separate
+`bash script.sh` file: a git command inside either runs unseen. Git calls
+within one gate run share a single time budget; if it runs out, the gate
+allows the call. With more than 1,000 untracked files, only the first 1,000 are
+sent, and the change always counts as needing review.
+
+Before anything is sent, the gate replaces the hunks of staged files named
+`.env*`, `*.env`, `*.pem`, `*.key`, `*secret*`, `id_rsa*`, `*.p12`, `*.pfx`,
+`credentials*`, `*.jks` or `*.keystore` with `[redacted]` (the file name is
+still sent); this applies to a plain commit's staged diff as well as a
+`commit -a`/`--all` work-tree diff and a push's unpushed commit range. Every
+`git diff` the gate runs forces `--no-color --no-ext-diff --no-textconv
+--no-relative --src-prefix=a/ --dst-prefix=b/`, so the redaction can't be
+defeated by the user's own git config (`diff.noprefix`, `diff.mnemonicPrefix`,
+`diff.srcPrefix`/`dstPrefix`, `color.diff=always`, a `textconv` driver such as
+`gpg -d`, `diff.relative`). Both features also replace token shapes in the diff and
+report text with `[redacted]`: `sk-…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_…`,
+`github_pat_…`, `AKIA…`, `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-…` and
+`-----BEGIN … PRIVATE KEY-----` blocks. This is a safety net, not a guarantee:
+other secret formats are sent as-is.
 
 `send_prompt` only applies to `route`. `shift` and `handoff_grade` always send
 the text listed in their row above; turn those features off if you want to
@@ -261,10 +289,15 @@ installed `relay/config.json`:
 | `max_report_chars` | `8000` | report_check: report text considered |
 | `handoff_min_score` | `2` | handoff_grade: minimum score (0–4) to save without `--accept-weak` |
 
-Each line of `relay/jev-log.jsonl` (mode 0600, rotated to `jev-log.jsonl.1` past
-1 MiB) records the feature, the decision, the classifier's numbers, and the
-latency. `route` records `desc_hash`, a short hash of the task description, so
-`jev-report.py` can join routing decisions with report checks. Log lines never
+Each line of `relay/jev-log.jsonl` (mode 0600; on Windows, a new log's ACL is
+limited to the current user; rotated to `jev-log.jsonl.1` past 1 MiB) records the feature, the decision, the classifier's numbers, and the
+latency. The Windows ACL is only set once, when the log file is created: a
+`jev-log.jsonl` left behind by an earlier version of this script keeps
+whatever ACL it already had. `route` records `desc_hash`, a short hash of the task description, so
+`jev-report.py` can join routing decisions with report checks. When a
+`risk_gate` or `report_check` call fails (no key, HTTP error, timeout, bad
+answer), its line adds `"reason": "unavailable"` and `error`, the exception
+class name (e.g. `HTTPError`, `TimeoutError`, `NoApiKey`). Log lines never
 contain prompt, diff or report text, task descriptions, file names, commands,
 or the key. Summarize the log with:
 
