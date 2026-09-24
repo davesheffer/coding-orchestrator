@@ -546,6 +546,28 @@ class GateTests(unittest.TestCase):
         # separator-heavy, non-matching text.
         self._assert_scans_fast(";/" * 20000, "separator-heavy")
 
+    def test_padded_commands_scan_fast(self):
+        # Each used to take 5-20s, past the hook timeout (which fails open).
+        for command, label in (("\n" * 20000, "newline run"),
+                               ("cat <<A\n" * 20000, "unterminated heredocs"),
+                               ("a=;" * 20000, "empty env assignments")):
+            self._assert_scans_fast(command, label)
+        start = time.monotonic()
+        targets = jev._scan_targets("git commit -m x;" * 5000 + "git push", "/repo")
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertIn("push", [t[0] for t in targets])
+
+    def test_quoted_dash_c_survives_long_prefix(self):
+        # A long -c/env value trims the start of the git segment out of the scanner's
+        # window; the quoted -C value must still be kept so the push stays visible.
+        for command in ('git -c x=' + "a" * 600 + ' -C "sub dir" push origin main',
+                        'FOO=' + "a" * 600 + ' git -C "sub" push'):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
+
+    def test_arithmetic_shift_is_not_a_heredoc(self):
+        command = "echo $((1<<3))\ngit push --force\n3\n"
+        self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
+
     # ---- command forms, multiple ops, push base, redaction ----
 
     def test_command_forms_detected(self):
@@ -732,6 +754,16 @@ class GateTests(unittest.TestCase):
         self.assertIn(".env", state["files"])
         self.assertNotIn("hunter2", state["diff"])
         self.assertIn("[redacted]", state["diff"])
+
+    def test_textconv_output_is_not_sent(self):
+        # A textconv driver's output would go out as hunk text under a name that
+        # isn't redacted (e.g. `gpg -d` for *.gpg).
+        (Path(self.repo) / ".gitattributes").write_text("*.txt diff=leak\n")
+        run_git(["config", "diff.leak.textconv", "echo LEAKED-BY-TEXTCONV; cat"], self.repo)
+        self.stage_change("a.txt", "plain\n")
+        out = self.gate(self.payload("git commit -m x"), classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        self.assertNotIn("LEAKED-BY-TEXTCONV", self.calls[0][0]["state"]["diff"])
 
     def test_scrub_token_shapes(self):
         key = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----"

@@ -243,10 +243,11 @@ Before anything is sent, the gate replaces the hunks of staged files named
 `credentials*`, `*.jks` or `*.keystore` with `[redacted]` (the file name is
 still sent); this applies to a plain commit's staged diff as well as a
 `commit -a`/`--all` work-tree diff and a push's unpushed commit range. Every
-`git diff` the gate runs forces `--no-color --no-ext-diff --src-prefix=a/
---dst-prefix=b/`, so the redaction can't be defeated by the user's own git
-config (`diff.noprefix`, `diff.mnemonicPrefix`, `diff.srcPrefix`/`dstPrefix`,
-`color.diff=always`). Both features also replace token shapes in the diff and
+`git diff` the gate runs forces `--no-color --no-ext-diff --no-textconv
+--no-relative --src-prefix=a/ --dst-prefix=b/`, so the redaction can't be
+defeated by the user's own git config (`diff.noprefix`, `diff.mnemonicPrefix`,
+`diff.srcPrefix`/`dstPrefix`, `color.diff=always`, a `textconv` driver such as
+`gpg -d`, `diff.relative`). Both features also replace token shapes in the diff and
 report text with `[redacted]`: `sk-…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_…`,
 `github_pat_…`, `AKIA…`, `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-…` and
 `-----BEGIN … PRIVATE KEY-----` blocks. This is a safety net, not a guarantee:
