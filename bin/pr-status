@@ -17,7 +17,6 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-import shutil
 import subprocess
 import sys
 
@@ -29,11 +28,12 @@ OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 def wrapper_command():
     base = os.path.expanduser("~/.hunch/agent-gh")
     if sys.platform == "win32":
-        # shutil.which performs the real PATHEXT lookup; only .exe/.com are safe
-        # to launch directly (.bat/.cmd would pass arguments through cmd.exe).
-        resolved = shutil.which(base)
-        if resolved and os.path.splitext(resolved)[1].lower() in (".exe", ".com"):
-            return resolved
+        # Only .com/.exe are safe to launch directly (.bat/.cmd would pass arguments
+        # through cmd.exe), so check for those explicitly, in PATHEXT's default order;
+        # shutil.which applies PATHEXT to a path with a directory only from Python 3.12.
+        for ext in (".com", ".exe"):
+            if os.path.isfile(base + ext):
+                return base + ext
         return "gh"
     return base if os.access(base, os.X_OK) else "gh"
 
