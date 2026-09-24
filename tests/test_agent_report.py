@@ -47,6 +47,25 @@ class AgentReportTests(unittest.TestCase):
             self.assertEqual(result['attempts_with_usage'], 0)
             self.assertIsNone(result['attempt_ms']['median'])
 
+    def test_workspace_filter_skips_reports_without_a_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'run').mkdir()
+            (root / 'run/report.json').write_text(json.dumps({'role': 'scout', 'status': 'preflight'}),
+                                                  encoding='utf-8')
+            self.assertEqual(reporter.summarize(root, Path('.'))['runs'], 0)
+            self.assertEqual(reporter.summarize(root)['runs'], 1)
+
+    def test_invalid_utf8_event_log_still_reports_usage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp) / 'run'
+            run.mkdir()
+            (run / 'report.json').write_text(json.dumps({'role': 'scout', 'status': 'completed',
+                                                         'attempts': [{}]}), encoding='utf-8')
+            (run / '0-events.jsonl').write_bytes(b'\xff\xfe\n' + json.dumps(
+                {'type': 'turn.completed', 'usage': {'input_tokens': 7}}).encode() + b'\n')
+            self.assertEqual(reporter.summarize(Path(temp))['token_totals']['input_tokens'], 7)
+
 
 if __name__ == '__main__':
     unittest.main()

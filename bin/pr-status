@@ -25,10 +25,24 @@ BAD = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP
 OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 
+def launchable(path):
+    if not os.access(path, os.X_OK):
+        return False
+    if sys.platform != "win32":
+        return True
+    # Windows reports every existing file as executable; only PATHEXT suffixes launch.
+    suffixes = {s.lower() for s in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if s}
+    return os.path.splitext(path)[1].lower() in suffixes
+
+
 def gh(*args):
     wrapper = os.path.expanduser("~/.hunch/agent-gh")
-    exe = wrapper if os.access(wrapper, os.X_OK) else "gh"
-    r = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8", timeout=60)
+    exe = wrapper if launchable(wrapper) else "gh"
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.exit(f"pr-status: {' '.join(args[:3])} could not run {exe}: {exc}")
     if r.returncode != 0:
         sys.exit(f"pr-status: {' '.join(args[:3])} failed: {r.stderr.strip()[:300]}")
     return r.stdout

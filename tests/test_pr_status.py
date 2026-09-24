@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import subprocess
 import threading
 import unittest
 from pathlib import Path
@@ -104,6 +105,49 @@ class PrStatusTests(unittest.TestCase):
                     pr_status.main(argv)
                 self.assertEqual(error.exception.code, 2)
                 gh.assert_not_called()
+
+
+class GhLaunchTests(unittest.TestCase):
+    def launch(self, platform, wrapper, pathext=".COM;.EXE;.BAT;.CMD", result=None, error=None):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            if error is not None:
+                raise error
+            return result or subprocess.CompletedProcess(command, 0, "[]", "")
+
+        with patch.object(pr_status.sys, "platform", platform), \
+             patch.object(pr_status.os.path, "expanduser", return_value=wrapper), \
+             patch.object(pr_status.os, "access", return_value=True), \
+             patch.dict(pr_status.os.environ, {"PATHEXT": pathext}), \
+             patch.object(pr_status.subprocess, "run", side_effect=run):
+            output = pr_status.gh("pr", "list", "--json", "number")
+        return output, calls
+
+    def test_windows_uses_wrapper_only_with_a_pathext_suffix(self):
+        _, calls = self.launch("win32", "C:/home/.hunch/agent-gh")
+        self.assertEqual(calls[0][0][0], "gh")
+        _, calls = self.launch("win32", "C:/home/.hunch/agent-gh.CMD", pathext=".COM;.EXE;;.cmd;")
+        self.assertEqual(calls[0][0][0], "C:/home/.hunch/agent-gh.CMD")
+
+    def test_posix_uses_executable_wrapper(self):
+        output, calls = self.launch("linux", "/home/u/.hunch/agent-gh")
+        self.assertEqual(output, "[]")
+        self.assertEqual(calls[0][0], ["/home/u/.hunch/agent-gh", "pr", "list", "--json", "number"])
+        self.assertEqual(calls[0][1]["errors"], "replace")
+
+    def test_launch_errors_exit_with_a_message(self):
+        for error in (OSError(193, "not a valid Win32 application"), subprocess.TimeoutExpired("gh", 60)):
+            with self.subTest(error=error), self.assertRaises(SystemExit) as caught:
+                self.launch("win32", "C:/home/.hunch/agent-gh", error=error)
+            self.assertTrue(str(caught.exception.code).startswith("pr-status: pr list --json could not run gh"))
+
+    def test_failed_command_exits_with_its_stderr(self):
+        failed = subprocess.CompletedProcess([], 1, "", "HTTP 401\n")
+        with self.assertRaises(SystemExit) as caught:
+            self.launch("linux", "/home/u/.hunch/agent-gh", result=failed)
+        self.assertEqual(caught.exception.code, "pr-status: pr list --json failed: HTTP 401")
 
 
 if __name__ == "__main__":

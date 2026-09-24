@@ -26,7 +26,7 @@ def event_usage(path):
     if not path.is_file():
         return None
     usage = None
-    with path.open(encoding='utf-8') as stream:
+    with path.open(encoding='utf-8', errors='replace') as stream:
         for line in stream:
             try:
                 event = json.loads(line)
@@ -50,7 +50,9 @@ def collect(root, workspace=None):
         if not isinstance(report, dict):
             unreadable += 1
             continue
-        if workspace and Path(str(report.get('workspace', ''))).resolve() != workspace.resolve():
+        # A report without a workspace must not resolve to the current directory.
+        if workspace and ('workspace' not in report
+                          or Path(str(report['workspace'])).resolve() != workspace.resolve()):
             continue
         reports.append((path.parent, report))
     return reports, unreadable
