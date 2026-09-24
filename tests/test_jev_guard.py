@@ -550,12 +550,26 @@ class GateTests(unittest.TestCase):
         # Each used to take 5-20s, past the hook timeout (which fails open).
         for command, label in (("\n" * 20000, "newline run"),
                                ("cat <<A\n" * 20000, "unterminated heredocs"),
-                               ("a=;" * 20000, "empty env assignments")):
+                               ("a=;" * 20000, "empty env assignments"),
+                               ("a=b\n" * 25000 + "git push", "env assignment lines"),
+                               ("sudo -n\n" * 12500, "wrapper lines"),
+                               ("then\n" * 20000, "keyword lines"),
+                               ("".join(f"cat <<W{i}\n" for i in range(10000)),
+                                "distinct unterminated heredocs")):
             self._assert_scans_fast(command, label)
+            start = time.monotonic()
+            jev._scan_targets(command, "/repo")
+            self.assertLess(time.monotonic() - start, 2.0, label)
         start = time.monotonic()
-        targets = jev._scan_targets("git commit -m x;" * 5000 + "git push", "/repo")
+        targets = jev._scan_targets("git commit -m x;" * 5000 + "git -C other push", "/repo")
         self.assertLess(time.monotonic() - start, 2.0)
-        self.assertIn("push", [t[0] for t in targets])
+        # Every match is resolved: the last push keeps its own directory.
+        self.assertIn(("push", os.path.join("/repo", "other"), False), targets)
+
+    def test_substitution_env_value_detected(self):
+        for command, op in (("FOO=$(date) git push", "push"),
+                            ("X=$((1+2)) git commit -m x", "commit")):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], [op], command)
 
     def test_quoted_dash_c_survives_long_prefix(self):
         # A long -c/env value trims the start of the git segment out of the scanner's

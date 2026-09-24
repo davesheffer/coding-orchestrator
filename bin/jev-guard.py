@@ -39,6 +39,7 @@ the gate hook's 10 s timeout even in the worst case (4 s of git plus a 4 s
 classify_fn call).
 Nothing here logs diff text, file names, commands, or report text.
 """
+import bisect
 import fnmatch
 import hashlib
 import json
@@ -88,16 +89,20 @@ GIT_GLOBAL_OPTS = (r"(?:\s+(?:-C\s+" + _OPT_ARG + r"|-c\s+" + _OPT_ARG + r"|"
                     r"--(?!(?:git-dir|work-tree|namespace|super-prefix|config-env)(?![\w-]))"
                     r"[\w-]+(?:=\S+)?))*")
 # What may start a command: the start, a ; & | ( operator, a newline, a `{` group or
-# a backtick substitution. Only blanks follow it (_LEAD): a newline is a separator in
+# a backtick substitution, or a `)` (so `X=$(date) git push`, whose value the env
+# prefix below can't span, is still seen). Only blanks follow it (_LEAD): a newline is a separator in
 # its own right, and `\s*` there let each newline of a long run re-consume the rest of
 # the run (quadratic).
-_SEP = r"(?:^|[;&|(\n{`])"
+_SEP = r"(?:^|[;&|()\n{`])"
 _LEAD = r"[ \t]*"
 # Env-assignment (e.g. `GIT_EDITOR=true git commit`, `A=1 B=2 git push`), shell keyword
 # (then/do/else) and wrapper (time/exec/command/env/nice/sudo, with their -flags and a
 # numeric flag value such as `nice -n 5`) prefixes before the `git` invocation itself.
-_ENV_PREFIX = (r"(?:(?:then|do|else|time|exec|command|env|nice|sudo)\s+(?:-[\w-]+(?:\s+\d+)?\s+)*"
-               r"|[A-Za-z_]\w*=[^\s;&|()`]*\s+)*")
+# Only blanks separate them: a newline ends the statement (and is a _SEP itself), and
+# `\s+` here let each line of `A=b\n` * N re-consume the rest of the run (quadratic).
+_ENV_PREFIX = (r"(?:(?:then|do|else|time|exec|command|env|nice|sudo)[ \t]+"
+               r"(?:-[\w-]+(?:[ \t]+\d+)?[ \t]+)*"
+               r"|[A-Za-z_]\w*=[^\s;&|()`]*[ \t]+)*")
 # `git`, `git.exe`, or a path to either (`/usr/bin/git`, `C:\Git\cmd\git.exe`). The
 # leading path segment excludes shell separators/quotes/backtick (rather than `\S*`)
 # so it can never backtrack across a command boundary looking for "git" — the other
@@ -143,9 +148,10 @@ _CD_PREFIX_RE = re.compile(_SEP + _LEAD + r"cd\s+$")
 # `-c ` or `cd ` is then kept, since dropping it would turn `-C "dir" push` into
 # `-C  push` and hide the push (a spurious check is the safe side).
 _LOOSE_KEEP_RE = re.compile(r"(?:-[Cc]|(?<![\w-])cd)\s+$")
-# More git commit/push matches than this in one command are not resolved one by one
-# (each resolution rescans the prefix); later ones still count toward the operation.
-MAX_GIT_MATCHES = 64
+# What separates the segments _cd_dirs looks for `cd <dir>` in.
+_CD_SPLIT_RE = re.compile(r"&&|\|\||;|\n|\(|\{|`")
+# A line that could end a heredoc (`WORD`, or indented for the `<<-` form).
+_TERMINATOR_LINE_RE = re.compile(r"(?m)^([ \t]*)([\w.-]+)[ \t]*\r?$")
 # Staged files whose hunks are never sent to Jev (matched case-insensitively against the
 # file's base name); only the file name and a `[redacted]` marker go out.
 REDACT_FILE_PATTERNS = (".env*", "*.env", "*.pem", "*.key", "*secret*", "id_rsa*", "*.p12", "*.pfx",
@@ -337,10 +343,24 @@ def _strip_heredocs_and_quotes(command):
     tail = ""  # last (roughly) PREFIX_WINDOW_CHARS of "".join(out); see its definition
     pending = []  # (word, dash_form) heredoc terminators whose bodies start at the next newline
     trimmed = False
-    # (word, dash_form) with no terminator anywhere after where it was last searched
-    # from: later searches start further on, so they can't find one either. Without
-    # this, `cat <<A\n` repeated re-searches to the end of the input every time.
-    unterminated = set()
+    # word -> ([starts], [ends]) of every terminator-shaped line, and the same for
+    # unindented lines only; built on the first heredoc so each body end is a bisect
+    # rather than a regex search to the end of the input (quadratic on many
+    # unterminated heredocs).
+    terminators = None
+
+    def terminator_end(word, dash_form, start):
+        nonlocal terminators
+        if terminators is None:
+            terminators = ({}, {})
+            for t in _TERMINATOR_LINE_RE.finditer(command):
+                for table in (terminators[0],) + (() if t.group(1) else (terminators[1],)):
+                    starts, ends = table.setdefault(t.group(2), ([], []))
+                    starts.append(t.start())
+                    ends.append(t.end())
+        starts, ends = terminators[0 if dash_form else 1].get(word, ((), ()))
+        k = bisect.bisect_left(starts, start)
+        return ends[k] if k < len(starts) else None
 
     def emit(s):
         nonlocal tail, trimmed
@@ -399,23 +419,16 @@ def _strip_heredocs_and_quotes(command):
             # git push`) was scanned above; the bodies start here, one per operator.
             emit(ch)
             i += 1
-            for key in pending:
-                if key in unterminated:
-                    continue
-                word, dash_form = key
+            for word, dash_form in pending:
                 # Real bash only strips *leading tabs* for `<<-`, but any leading
                 # whitespace here is a reasonable proxy; without `<<-`, bash requires
                 # the terminator at column 0. A trailing `\r` (CRLF body) is tolerated
-                # either way.
-                indent = r"[ \t]*" if dash_form else ""
-                end = re.compile(r"(?m)^" + indent + re.escape(word) + r"[ \t]*\r?$").search(
-                    command, i)
-                # No terminator: not a real heredoc (e.g. `$((1<<3))`), so keep the
-                # text; a spurious check is safer than hiding a later git command.
-                if end:
-                    i = end.end()
-                else:
-                    unterminated.add(key)
+                # either way. No terminator: not a real heredoc (e.g. `$((1<<3))`), so
+                # keep the text; a spurious check is safer than hiding a later git
+                # command.
+                end = terminator_end(word, dash_form, i)
+                if end is not None:
+                    i = end
             pending = []
             continue
         emit(ch)
@@ -543,41 +556,55 @@ def _dash_c_dir(opts_segment):
     return None
 
 
-def _cd_prefix_dir(command, git_start):
-    """Return the directory the `cd <dir>` segments before the git command lead to
-    (successive cds accumulate; relative results stay relative to the payload cwd),
-    or None when there is no cd. A -C in the git segment is resolved relative to it."""
-    # GIT_COMMAND_RE's leading separator class consumes only one char of a two-char
-    # operator (e.g. the second `&` of `&&`), so the prefix can end with a stray
-    # separator; strip it before splitting into &&/;/|| segments.
-    prefix = command[:git_start].rstrip().rstrip("&|;").rstrip()
-    result = None
-    # A `(` subshell opener, `{` group or backtick is also a segment separator, so
-    # `(cd sub && git commit)` still finds the `cd sub` segment.
-    for segment in re.split(r"&&|\|\||;|\n|\(|\{|`", prefix):
-        m = CD_RE.match(segment)
-        if not m:
-            continue
-        try:
-            tokens = shlex.split(m.group(1))
-        except ValueError:
-            tokens = m.group(1).split()
-        # Drop options (-P, --) and redirections (2>/dev/null) around the directory.
-        tokens = [t for t in tokens if not t.startswith("-") and not re.match(r"^\d*[<>]", t)]
-        if len(tokens) != 1:
-            continue
-        target = _native_path(tokens[0])
-        result = os.path.join(result, target) if result else target
-    return result
+def _cd_dirs(command):
+    """([segment ends], [cd directory in effect after each]) for the command's
+    &&/||/;/newline/`(`/`{`/backtick segments (successive cds accumulate; relative
+    results stay relative to the payload cwd; None before any cd). Built once per
+    command so resolving each git match is a bisect, not a rescan of its prefix."""
+    ends, dirs = [], []
+    result, pos = None, 0
+    for sep in _CD_SPLIT_RE.finditer(command):
+        result = _cd_segment_dir(command[pos:sep.start()], result)
+        ends.append(sep.start())
+        dirs.append(result)
+        pos = sep.end()
+    return ends, dirs
 
 
-def _git_target(command, match, cwd, add_end=-1):
+def _cd_prefix_dir(command, git_start, cd_index=None):
+    """Return the directory the `cd <dir>` segments before the git command lead to,
+    or None when there is no cd. A -C in the git segment is resolved relative to it.
+    Only whole segments count: a `cd` piped into or backgrounded before the git
+    (`cd x | git push`) runs in a subshell and doesn't move it."""
+    ends, dirs = cd_index or _cd_dirs(command)
+    k = bisect.bisect_right(ends, git_start) - 1
+    return dirs[k] if k >= 0 else None
+
+
+def _cd_segment_dir(segment, result):
+    """`result` joined with the directory of a `cd <dir>` segment, else unchanged."""
+    m = CD_RE.match(segment)
+    if not m:
+        return result
+    try:
+        tokens = shlex.split(m.group(1))
+    except ValueError:
+        tokens = m.group(1).split()
+    # Drop options (-P, --) and redirections (2>/dev/null) around the directory.
+    tokens = [t for t in tokens if not t.startswith("-") and not re.match(r"^\d*[<>]", t)]
+    if len(tokens) != 1:
+        return result
+    target = _native_path(tokens[0])
+    return os.path.join(result, target) if result else target
+
+
+def _git_target(command, match, cwd, add_end=-1, cd_index=None):
     """(op, cwd, all_flag) for one GIT_COMMAND_RE match in the stripped command.
     `add_end` is where the command's first `git add` match ends (None: there is none;
-    -1: search the prefix here)."""
+    -1: search the prefix here); `cd_index` is _cd_dirs(command), if already built."""
     opts_segment, op = match.group(1), match.group(2)
     # The shell resolves -C relative to any directory an earlier cd moved to.
-    cd_dir = _cd_prefix_dir(command, match.start())
+    cd_dir = _cd_prefix_dir(command, match.start(), cd_index)
     if cd_dir:
         cwd = os.path.join(cwd, cd_dir)
     dash_c_dir = _dash_c_dir(opts_segment)
@@ -596,19 +623,15 @@ def _git_target(command, match, cwd, add_end=-1):
 
 def _scan_targets(raw_command, base_cwd):
     """The distinct (op, cwd, all_flag) targets of every git commit/push in the command.
-    Past MAX_GIT_MATCHES matches, later ones are not resolved (each resolution rescans
-    the prefix, which is quadratic on a padded command); a push among them still makes
-    the operation a push, checked against the first target's directory."""
+    The cd index and first `git add` are computed once, so a command with thousands of
+    git invocations still resolves each one in (near) constant time."""
     command = _strip_heredocs_and_quotes(raw_command)
     add = GIT_ADD_RE.search(command)
     add_end = add.end() if add else None
+    cd_index = _cd_dirs(command)
     targets = []
-    for count, match in enumerate(GIT_COMMAND_RE.finditer(command)):
-        if count >= MAX_GIT_MATCHES:
-            if match.group(2) == "push" and not any(t[0] == "push" for t in targets):
-                targets.append(("push", targets[0][1], False))
-            continue
-        target = _git_target(command, match, base_cwd, add_end)
+    for match in GIT_COMMAND_RE.finditer(command):
+        target = _git_target(command, match, base_cwd, add_end, cd_index)
         if target not in targets:
             targets.append(target)
     return targets
