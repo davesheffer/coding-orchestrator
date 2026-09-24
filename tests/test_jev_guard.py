@@ -454,6 +454,25 @@ class GateTests(unittest.TestCase):
     def test_heredoc_body_commit_not_detected(self):
         self.assert_not_detected("cat <<EOF > notes.txt\ngit commit -m y\nEOF\n")
 
+    def test_heredoc_terminator_with_dot_and_dash_not_detected(self):
+        # `.`/`-` in the terminator word (e.g. `EOF-1`, `END.MARKER`) must still be
+        # recognized so the heredoc body (containing a fake `git commit`) is stripped.
+        self.assert_not_detected("cat <<EOF-1\ngit commit -m y\nEOF-1\n")
+        self.assert_not_detected("cat <<END.MARKER\ngit commit -m y\nEND.MARKER\n")
+
+    def test_heredoc_terminator_with_crlf_stripped(self):
+        self.assert_not_detected("cat <<EOF\r\ngit commit -m y\r\nEOF\r\n")
+
+    def test_heredoc_dash_form_allows_indented_terminator(self):
+        self.assert_not_detected("cat <<-EOF\ngit commit -m y\n\tEOF\n")
+
+    def test_heredoc_plain_form_requires_column_zero_terminator(self):
+        # Without `<<-`, bash requires the terminator at column 0; an indented "EOF"
+        # does not end the heredoc, so everything up to the real (column-0)
+        # terminator -- including the fake `git commit` in between -- is still body
+        # text, not a real command.
+        self.assert_not_detected("cat <<EOF\ngit commit -m y\n\tEOF\ngit commit -m x\nEOF\n")
+
     def test_echo_dash_c_quoted_not_detected(self):
         self.assert_not_detected('echo -c "x; git commit -m y"')
 
@@ -506,6 +525,26 @@ class GateTests(unittest.TestCase):
         self.assertIsNone(jev.GIT_COMMAND_RE.search(jev._strip_heredocs_and_quotes(cmd + ' "a"' * 20)))
         self.assertLess(time.monotonic() - start, 1.0)
         self.assertIsNotNone(jev.GIT_COMMAND_RE.search("git --work-tree x --git-dir=y --no-pager commit"))
+
+    def _assert_scans_fast(self, command, label):
+        start = time.monotonic()
+        stripped = jev._strip_heredocs_and_quotes(command)
+        list(jev.GIT_COMMAND_RE.finditer(stripped))
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 2.0, f"{label}: {elapsed:.2f}s")
+
+    def test_many_quoted_args_scan_fast(self):
+        # Each quote used to re-join the whole scanned-so-far prefix and rescan it
+        # from scratch, making this O(n^2); 20000 quotes previously took ~49s.
+        self._assert_scans_fast("'a' ;" * 20000, "single-quoted")
+
+    def test_many_double_quoted_args_scan_fast(self):
+        self._assert_scans_fast('"a" ' * 20000, "double-quoted")
+
+    def test_many_separators_scan_fast(self):
+        # Exercises _GIT's leading path-segment group against a long run of
+        # separator-heavy, non-matching text.
+        self._assert_scans_fast(";/" * 20000, "separator-heavy")
 
     # ---- command forms, multiple ops, push base, redaction ----
 
@@ -655,6 +694,10 @@ class GateTests(unittest.TestCase):
         token = "ghp_" + "A" * 30
         self.stage_change(".env", "DB_PASSWORD=hunter2\n")
         self.stage_change("server.PEM", "certificate body\n")
+        self.stage_change("prod.env", "PROD_SECRET=hunter3\n")
+        self.stage_change("credentials.json", "{\"key\": \"hunter4\"}\n")
+        self.stage_change("app.jks", "keystore body\n")
+        self.stage_change("app.keystore", "keystore body2\n")
         self.stage_change("a.txt", f"key = sk-{'b' * 20}\ntoken = {token}\nplain change\n")
         out = self.gate(self.payload("git commit -m x"), classify_fn=self.classify())
         self.assertIsNotNone(out)
@@ -665,10 +708,30 @@ class GateTests(unittest.TestCase):
         self.assertIn("diff --git a/server.PEM b/server.PEM", diff)
         self.assertNotIn("hunter2", diff)
         self.assertNotIn("certificate body", diff)
+        self.assertNotIn("hunter3", diff)
+        self.assertNotIn("hunter4", diff)
+        self.assertNotIn("keystore body", diff)
+        self.assertNotIn("keystore body2", diff)
         self.assertNotIn("sk-bbbb", diff)
         self.assertNotIn(token, diff)
         self.assertIn("+plain change", diff)
-        self.assertEqual(diff.count("[redacted]"), 4)
+        self.assertEqual(diff.count("[redacted]"), 8)
+
+    def test_redaction_survives_hostile_diff_config(self):
+        # diff.noprefix/mnemonicPrefix drop the a/ b/ header prefixes DIFF_HEADER_RE
+        # expects, and color.diff=always would inject ANSI codes into the header line;
+        # without forcing --no-color/--src-prefix/--dst-prefix on every diff, _redact_diff
+        # never enters header mode and the secret file's hunk is sent unredacted.
+        run_git(["config", "diff.noprefix", "true"], self.repo)
+        run_git(["config", "diff.mnemonicPrefix", "true"], self.repo)
+        run_git(["config", "color.diff", "always"], self.repo)
+        self.stage_change(".env", "DB_PASSWORD=hunter2\n")
+        out = self.gate(self.payload("git commit -m x"), classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        state = self.calls[0][0]["state"]
+        self.assertIn(".env", state["files"])
+        self.assertNotIn("hunter2", state["diff"])
+        self.assertIn("[redacted]", state["diff"])
 
     def test_scrub_token_shapes(self):
         key = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----"

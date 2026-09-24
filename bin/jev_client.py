@@ -233,15 +233,18 @@ def _restrict_windows_file(path):
     if not 0 < length < len(system_dir):
         raise OSError("could not locate the Windows system directory")
     system_dir = Path(system_dir.value)
+    # A timeout so a hung whoami.exe/icacls.exe can't block the caller past its own
+    # deadline; the caller already treats any exception here (including
+    # TimeoutExpired) as a best-effort failure.
     identity = subprocess.run([str(system_dir / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
-                              capture_output=True, text=True, check=True)
+                              capture_output=True, text=True, check=True, timeout=MAX_DEADLINE_SECONDS)
     rows = list(csv.reader(identity.stdout.splitlines()))
     sid = rows[0][-1].strip() if rows and rows[0] else ""
     if not re.fullmatch(r"S-\d+(?:-\d+)+", sid):
         raise OSError("could not determine the current Windows user SID")
     subprocess.run([str(system_dir / "icacls.exe"), str(path), "/inheritance:r",
                     "/grant:r", f"*{sid}:F"],
-                   capture_output=True, text=True, check=True)
+                   capture_output=True, text=True, check=True, timeout=MAX_DEADLINE_SECONDS)
 
 
 def write_log(cfg, entry, path=None):

@@ -95,8 +95,11 @@ _SEP = r"(?:^|[;&|(\n{`])"
 # numeric flag value such as `nice -n 5`) prefixes before the `git` invocation itself.
 _ENV_PREFIX = (r"(?:(?:then|do|else|time|exec|command|env|nice|sudo)\s+(?:-[\w-]+(?:\s+\d+)?\s+)*"
                r"|[A-Za-z_]\w*=\S*\s+)*")
-# `git`, `git.exe`, or a path to either (`/usr/bin/git`, `C:\Git\cmd\git.exe`).
-_GIT = r"(?:\S*[/\\])?git(?:\.exe)?"
+# `git`, `git.exe`, or a path to either (`/usr/bin/git`, `C:\Git\cmd\git.exe`). The
+# leading path segment excludes shell separators/quotes/backtick (rather than `\S*`)
+# so it can never backtrack across a command boundary looking for "git" — the other
+# half of the scanner's quadratic behaviour fixed in _strip_heredocs_and_quotes below.
+_GIT = r"""(?:[^\s;&|(){}`'"]*[/\\])?git(?:\.exe)?"""
 GIT_COMMAND_RE = re.compile(
     _SEP + r"\s*" + _ENV_PREFIX + _GIT + r"(" + GIT_GLOBAL_OPTS + r")\s+(commit|push)\b")
 GIT_ADD_RE = re.compile(_SEP + r"\s*" + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS + r"\s+add\b")
@@ -109,10 +112,19 @@ ALL_FLAG_RE = re.compile(r"(?:^|\s)(--all|-[A-Za-z]*a[A-Za-z]*)(?=\s|$)")
 CD_RE = re.compile(r"^\s*cd\s+(.+?)\s*$")
 # A heredoc operator (`<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`, `<<\WORD`); the
 # scanner in _strip_heredocs_and_quotes only tries it outside quotes and comments, and
-# never on a here-string (`<<<`).
-HEREDOC_RE = re.compile(r"<<-?[ \t]*(?:'(\w+)'|\"(\w+)\"|\\?(\w+))")
+# never on a here-string (`<<<`). Group 1 captures a leading `-` (the `<<-` form, which
+# lets bash indent the terminator with tabs); the word itself may contain `.` and `-`
+# (e.g. `<<EOF-1`, `<<END.MARKER`), not just `\w`.
+HEREDOC_RE = re.compile(r"<<(-)?[ \t]*(?:'([\w.-]+)'|\"([\w.-]+)\"|\\?([\w.-]+))")
 # More untracked files than this are not folded in; the change then always needs review.
 MAX_UNTRACKED = 1000
+# Chars of scanned-so-far command kept for the -C/-c and cd quote-context checks in
+# _strip_heredocs_and_quotes below; far larger than any real `-C "<dir>"`/`cd "<dir>"`
+# prefix, so checking only this bounded tail behaves like scanning the full prefix
+# without rejoining/rescanning it from scratch on every quoted argument (quadratic on
+# a command with many quotes). Kept well under 4 KB: the per-quote regex search cost
+# below scales with this window, and a command can have thousands of quoted arguments.
+PREFIX_WINDOW_CHARS = 256
 # Quoted strings are stripped so words inside them (e.g. `echo "git commit"`) can't be
 # mistaken for a real command, EXCEPT a quoted -C/-c argument (e.g. -C "dir with
 # space") or a `cd "dir"` target, which fix 2 needs intact to resolve the gate's cwd.
@@ -125,13 +137,22 @@ _GIT_DASH_C_PREFIX_RE = re.compile(
 _CD_PREFIX_RE = re.compile(_SEP + r"\s*cd\s+$")
 # Staged files whose hunks are never sent to Jev (matched case-insensitively against the
 # file's base name); only the file name and a `[redacted]` marker go out.
-REDACT_FILE_PATTERNS = (".env*", "*.pem", "*.key", "*secret*", "id_rsa*", "*.p12", "*.pfx")
+REDACT_FILE_PATTERNS = (".env*", "*.env", "*.pem", "*.key", "*secret*", "id_rsa*", "*.p12", "*.pfx",
+                         "credentials*", "*.jks", "*.keystore")
 # Token shapes scrubbed from diff and report text before it is sent.
 SECRET_RE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"
     r"|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}"
     r"|xox[abpr]-[\w-]{10,}", re.DOTALL)
 DIFF_HEADER_RE = re.compile(r"^diff --git (?:\"?a/(.*?)\"?) (?:\"?b/(.*?)\"?)$")
+# Forced onto every `git diff` the guard runs so the parsed header shape (matched by
+# DIFF_HEADER_RE above) can't be defeated by the user's own git config: diff.noprefix
+# or diff.mnemonicPrefix (no `a/`/`b/` prefix), diff.srcPrefix/dstPrefix (a different
+# prefix) or color.diff=always (ANSI codes in the header) would otherwise make
+# _redact_diff never enter "header" mode for a matched file, sending its hunks
+# unredacted. Command-line flags override config, unlike `-c` overrides which
+# color.diff=always still beats.
+DIFF_FORMAT_ARGS = ["--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"]
 GIT_SUBPROCESS_BUDGET_SECONDS = 4.0
 
 RISK_CRITERIA = {
@@ -299,7 +320,20 @@ def _strip_heredocs_and_quotes(command):
     string is kept when it is the value of a literal git `-C`/`-c` or a `cd` target,
     which `_cd_prefix_dir` and `_dash_c_dir` need intact to resolve the gate's cwd."""
     out = []
-    pending = []  # heredoc terminator words whose bodies start at the next newline
+    tail = ""  # last (roughly) PREFIX_WINDOW_CHARS of "".join(out); see its definition
+    pending = []  # (word, dash_form) heredoc terminators whose bodies start at the next newline
+
+    def emit(s):
+        nonlocal tail
+        out.append(s)
+        # Trimmed only once tail has grown to double the window, so the O(window) trim
+        # cost amortizes to O(1) per character instead of running (and rescanning) on
+        # every quoted argument.
+        tail += s
+        if len(tail) > 2 * PREFIX_WINDOW_CHARS:
+            # The leading "x" keeps _SEP's `^` from matching at a mid-word cut.
+            tail = "x" + tail[-PREFIX_WINDOW_CHARS:]
+
     i, n = 0, len(command)
     while i < n:
         ch = command[i]
@@ -307,7 +341,7 @@ def _strip_heredocs_and_quotes(command):
             if command.startswith("\n", i + 1):
                 i += 2  # line continuation: `git \<newline>commit` is one command
                 continue
-            out.append(command[i:i + 2])
+            emit(command[i:i + 2])
             i += 2
             continue
         if ch in "'\"":
@@ -315,11 +349,10 @@ def _strip_heredocs_and_quotes(command):
             if end is None:
                 # Unbalanced quote: keep the rest; a spurious check is safer than
                 # hiding a later git command.
-                out.append(command[i:])
+                emit(command[i:])
                 break
-            prefix = "".join(out)
-            if _GIT_DASH_C_PREFIX_RE.search(prefix) or _CD_PREFIX_RE.search(prefix):
-                out.append(command[i:end])
+            if _GIT_DASH_C_PREFIX_RE.search(tail) or _CD_PREFIX_RE.search(tail):
+                emit(command[i:end])
             i = end
             continue
         if ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
@@ -327,30 +360,37 @@ def _strip_heredocs_and_quotes(command):
             i = n if end == -1 else end
             continue
         if command.startswith("<<<", i):
-            out.append("<<<")  # a here-string, not a heredoc
+            emit("<<<")  # a here-string, not a heredoc
             i += 3
             continue
         if command.startswith("<<", i):
             m = HEREDOC_RE.match(command, i)
             if m:
-                pending.append(m.group(1) or m.group(2) or m.group(3))
-                out.append(m.group(0))
+                word = m.group(2) or m.group(3) or m.group(4)
+                pending.append((word, bool(m.group(1))))
+                emit(m.group(0))
                 i = m.end()
                 continue
         if ch == "\n" and pending:
             # The rest of the `<<WORD` line itself (e.g. `&& git commit` or `| tee out;
             # git push`) was scanned above; the bodies start here, one per operator.
-            out.append(ch)
+            emit(ch)
             i += 1
-            for word in pending:
-                end = re.compile(r"(?m)^[ \t]*" + re.escape(word) + r"[ \t]*$").search(command, i)
+            for word, dash_form in pending:
+                # Real bash only strips *leading tabs* for `<<-`, but any leading
+                # whitespace here is a reasonable proxy; without `<<-`, bash requires
+                # the terminator at column 0. A trailing `\r` (CRLF body) is tolerated
+                # either way.
+                indent = r"[ \t]*" if dash_form else ""
+                end = re.compile(r"(?m)^" + indent + re.escape(word) + r"[ \t]*\r?$").search(
+                    command, i)
                 # No terminator: not a real heredoc (e.g. `$((1<<3))`), so keep the
                 # text; a spurious check is safer than hiding a later git command.
                 if end:
                     i = end.end()
             pending = []
             continue
-        out.append(ch)
+        emit(ch)
         i += 1
     return "".join(out)
 
@@ -436,21 +476,22 @@ def _push_base(cwd, deadline=None):
 
 def _diff_range(op, all_flag, cwd, deadline=None, base=None):
     if op == "commit":
-        return _run_git(["diff", "HEAD"] if all_flag else ["diff", "--cached"], cwd, deadline)
+        args = ["diff", *DIFF_FORMAT_ARGS] + (["HEAD"] if all_flag else ["--cached"])
+        return _run_git(args, cwd, deadline)
     if base is None:
         return None
-    return _run_git(["diff", f"{base}...HEAD"], cwd, deadline)
+    return _run_git(["diff", *DIFF_FORMAT_ARGS, f"{base}...HEAD"], cwd, deadline)
 
 
 def _diff_names(op, all_flag, cwd, deadline=None, base=None):
     if op == "commit":
-        args = (["diff", "HEAD", "--name-only", "-z"] if all_flag
-                else ["diff", "--cached", "--name-only", "-z"])
+        args = (["diff", *DIFF_FORMAT_ARGS, "HEAD", "--name-only", "-z"] if all_flag
+                else ["diff", *DIFF_FORMAT_ARGS, "--cached", "--name-only", "-z"])
         out = _run_git(args, cwd, deadline)
         return out
     if base is None:
         return None
-    return _run_git(["diff", f"{base}...HEAD", "--name-only", "-z"], cwd, deadline)
+    return _run_git(["diff", *DIFF_FORMAT_ARGS, f"{base}...HEAD", "--name-only", "-z"], cwd, deadline)
 
 
 def _untracked_files(cwd, deadline=None):

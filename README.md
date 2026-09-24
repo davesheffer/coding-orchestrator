@@ -231,18 +231,26 @@ variable (`$GIT push`) or a quoted path, wrappers with value options
 (`sudo -u me git`), keywords such as `if git commit`, and `"$(git push)"` inside
 double quotes. It also misses `git commit <pathspec>` with nothing staged, and
 `--git-dir`/`--work-tree` or `GIT_DIR`/`GIT_WORK_TREE` pointing at another repo
-(these are detected, but the gate still diffs the current directory). Git calls
+(these are detected, but the gate still diffs the current directory). It also
+does not scan the body of a `bash <<EOF ... EOF` heredoc or a separate
+`bash script.sh` file: a git command inside either runs unseen. Git calls
 within one gate run share a single time budget; if it runs out, the gate
 allows the call. With more than 1,000 untracked files, only the first 1,000 are
 sent, and the change always counts as needing review.
 
 Before anything is sent, the gate replaces the hunks of staged files named
-`.env*`, `*.pem`, `*.key`, `*secret*`, `id_rsa*`, `*.p12` or `*.pfx` with
-`[redacted]` (the file name is still sent), and both features replace token
-shapes in the diff and report text with `[redacted]`: `sk-…`, `ghp_`/`gho_`/
-`ghu_`/`ghs_`/`ghr_…`, `github_pat_…`, `AKIA…`, `xoxa-`/`xoxb-`/`xoxp-`/
-`xoxr-…` and `-----BEGIN … PRIVATE KEY-----` blocks. This is a safety net,
-not a guarantee: other secret formats are sent as-is.
+`.env*`, `*.env`, `*.pem`, `*.key`, `*secret*`, `id_rsa*`, `*.p12`, `*.pfx`,
+`credentials*`, `*.jks` or `*.keystore` with `[redacted]` (the file name is
+still sent); this applies to a plain commit's staged diff as well as a
+`commit -a`/`--all` work-tree diff and a push's unpushed commit range. Every
+`git diff` the gate runs forces `--no-color --no-ext-diff --src-prefix=a/
+--dst-prefix=b/`, so the redaction can't be defeated by the user's own git
+config (`diff.noprefix`, `diff.mnemonicPrefix`, `diff.srcPrefix`/`dstPrefix`,
+`color.diff=always`). Both features also replace token shapes in the diff and
+report text with `[redacted]`: `sk-…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_…`,
+`github_pat_…`, `AKIA…`, `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-…` and
+`-----BEGIN … PRIVATE KEY-----` blocks. This is a safety net, not a guarantee:
+other secret formats are sent as-is.
 
 `send_prompt` only applies to `route`. `shift` and `handoff_grade` always send
 the text listed in their row above; turn those features off if you want to
@@ -282,7 +290,9 @@ installed `relay/config.json`:
 
 Each line of `relay/jev-log.jsonl` (mode 0600; on Windows, a new log's ACL is
 limited to the current user; rotated to `jev-log.jsonl.1` past 1 MiB) records the feature, the decision, the classifier's numbers, and the
-latency. `route` records `desc_hash`, a short hash of the task description, so
+latency. The Windows ACL is only set once, when the log file is created: a
+`jev-log.jsonl` left behind by an earlier version of this script keeps
+whatever ACL it already had. `route` records `desc_hash`, a short hash of the task description, so
 `jev-report.py` can join routing decisions with report checks. When a
 `risk_gate` or `report_check` call fails (no key, HTTP error, timeout, bad
 answer), its line adds `"reason": "unavailable"` and `error`, the exception
