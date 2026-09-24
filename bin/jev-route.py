@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
     AGENT_MODELS, CONFIG_PATH, DEFAULTS, LOG_PATH, MAX_DEADLINE_SECONDS, MAX_LOG_BYTES, ROOT,
     api_key, ask, call_with_deadline, effective_timeout, elapsed_ms, endpoint_allowed, http_classify,
-    load_config, timestamp, write_log)
+    load_config, safe_repr, timestamp, write_log)
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 INSTRUCTIONS = ("Which model tier should run this subagent task? "
@@ -42,7 +42,8 @@ def frontmatter_model(path):
     for line in text[4:].split("\n---", 1)[0].splitlines():
         if line.split(":", 1)[0].strip() == "model" and ":" in line:
             value = line.split(":", 1)[1].strip().strip("'\"")
-            return value if value in AGENT_MODELS else None
+            # A full model id of a known tier (claude-opus-4-1) counts as that tier too.
+            return value if value in AGENT_MODELS or model_tier(value, AGENT_MODELS) in AGENT_MODELS else None
     return None
 
 
@@ -85,7 +86,7 @@ def valid_confidence(confidence):
 
 def verdict(choice, confidence, current, cfg):
     """Why an answer is skipped, or "applied" (shared with bin/eval-jev-routing.py)."""
-    if choice not in cfg["labels"]:
+    if not isinstance(choice, str) or choice not in cfg["labels"]:
         return "invalid label"
     if not valid_confidence(confidence):
         return "invalid confidence"
@@ -156,19 +157,25 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         choice = answer.get("choice")
         probabilities = answer.get("probabilities")
     except Exception:
+        # Malformed shape (e.g. answers["model"] is a string), same as ask()'s own check.
+        if log_fn:
+            log_fn({**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
-    try:
-        confidence = float(answer.get("confidence"))
-    except (TypeError, ValueError):
+    raw_confidence = answer.get("confidence")
+    if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
+        confidence = float(raw_confidence)
+    else:
         confidence = None
     why = verdict(choice, confidence, current, cfg)
     applied = why == "applied"
     conf_text = f"{confidence:.2f}" if valid_confidence(confidence) else "invalid"
     if confidence is not None and not math.isfinite(confidence):
         confidence = None  # keep the log strict JSON
-    reason = f"jev: {current or 'inherit'} → {choice} (conf {conf_text})"
+    # Never write a raw non-string/oversized choice; repr() is ASCII-safe (handles lone surrogates too).
+    display_choice = safe_repr(choice) if why == "invalid label" else choice
+    reason = f"jev: {current or 'inherit'} → {display_choice} (conf {conf_text})"
     if log_fn:
-        entry.update({"choice": choice, "confidence": confidence, "probabilities": probabilities,
+        entry.update({"choice": display_choice, "confidence": confidence, "probabilities": probabilities,
                       "applied": applied, "reason": reason if applied else f"{reason}; skipped: {why}"})
         log_fn(entry)
     if not applied:

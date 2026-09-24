@@ -102,22 +102,27 @@ def route(payload, cfg, classify_fn=None):
         answer = answers["model"]
         choice = answer["choice"]
     except (TypeError, KeyError):
+        # Malformed shape (e.g. answers["model"] is a string), same as client.ask()'s own check.
+        log(cfg, {**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
-    try:
-        confidence = float(answer.get("confidence"))
-    except (TypeError, ValueError):
+    raw_confidence = answer.get("confidence")
+    if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
+        confidence = float(raw_confidence)
+    else:
         confidence = None
-    if choice not in MODELS or choice not in cfg["labels"]:
+    if not isinstance(choice, str) or choice not in MODELS or choice not in cfg["labels"]:
         why = "invalid label"
     elif confidence is None or not 0.0 <= confidence <= 1.0:  # also rejects NaN
         why = "invalid confidence"
-    elif confidence < cfg["min_confidence"]:
+    elif confidence < float(cfg["min_confidence"]):
         why = "below min_confidence"
     else:
         why = "applied"
     if confidence is not None and not math.isfinite(confidence):
         confidence = None  # keep the log strict JSON
-    log(cfg, {**entry, "choice": choice, "confidence": confidence, "applied": why == "applied",
+    # Never write a raw non-string/oversized choice; repr() is ASCII-safe (handles lone surrogates too).
+    display_choice = client.safe_repr(choice) if why == "invalid label" else choice
+    log(cfg, {**entry, "choice": display_choice, "confidence": confidence, "applied": why == "applied",
               "reason": why})
     if why != "applied":
         return None

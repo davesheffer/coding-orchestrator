@@ -204,6 +204,17 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None):
     return answers
 
 
+def safe_repr(value, limit=80):
+    """ASCII-safe, length-bounded repr of a possibly-malformed logged value.
+
+    repr() escapes lone surrogates and control characters, so the result is
+    always encodable as UTF-8 JSON text; long values are truncated with their
+    original repr length noted instead of writing the raw (possibly huge) value.
+    """
+    text = repr(value)
+    return text if len(text) <= limit else f"{text[:limit]}... (len {len(text)})"
+
+
 def noul(answers, name):
     """The yes-probability of a noul answer, or None if absent/malformed."""
     try:
@@ -234,6 +245,11 @@ def write_log(cfg, entry, path=None):
                 os.chmod(path, 0o600)
             except OSError:
                 pass
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            line = json.dumps(entry, ensure_ascii=False)
+            try:
+                line.encode("utf-8")
+            except UnicodeEncodeError:
+                line = json.dumps(entry)  # a lone surrogate from the classifier: escape, don't drop
+            handle.write(line + "\n")
     except Exception:
         pass

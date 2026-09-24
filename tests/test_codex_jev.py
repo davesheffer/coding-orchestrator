@@ -119,6 +119,35 @@ class CodexJevTests(unittest.TestCase):
         self.assertIsNone(out)
         self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "below min_confidence"))
 
+    def test_route_rejects_non_string_choice_without_raising(self):
+        out, logs = self.route_default({"model": {"choice": ["luna"], "confidence": 0.9}})
+        self.assertIsNone(out)
+        self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "invalid label"))
+        self.assertEqual(logs[0]["choice"], repr(["luna"]))
+        json.dumps(logs[0])
+
+    def test_route_rejects_bool_or_string_confidence(self):
+        for value in (True, "0.9"):
+            with self.subTest(value=value):
+                out, logs = self.route_default({"model": {"choice": "luna", "confidence": value}})
+                self.assertIsNone(out)
+                self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "invalid confidence"))
+                self.assertIsNone(logs[0]["confidence"])
+
+    def test_route_malformed_answer_shape_is_logged(self):
+        out, logs = self.route_default({"model": "luna"})
+        self.assertIsNone(out)
+        self.assertEqual((logs[0]["applied"], logs[0]["reason"], logs[0]["error"]),
+                         (False, "unavailable", "MalformedResponse"))
+
+    def test_string_min_confidence_is_coerced_to_float(self):
+        cfg = module.settings() | {"enabled": True, "min_confidence": "0.5"}
+        payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "read a file"}}
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"}), patch.object(module, "log"), \
+             patch.object(module.client, "ask", return_value={"model": {"choice": "luna", "confidence": 0.9}}):
+            out = module.route(payload, cfg)
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-luna")
+
     def test_route_logs_unavailable(self):
         def boom(body, key):
             raise TimeoutError("slow test-key")

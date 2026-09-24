@@ -18,6 +18,7 @@ Exit codes: 0 ok, 1 invalid benchmark or labels, 2 no API key.
 import argparse
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -110,7 +111,12 @@ def evaluate(tasks, cfg, classify_fn=None, router=None, home=None):
             if answer.get("choice") in cfg["labels"]:
                 choice = answer["choice"]
                 confidence = float(answer.get("confidence"))
+                if not math.isfinite(confidence):
+                    confidence = None  # keep --json output strict JSON
                 probabilities = answer.get("probabilities")
+                if isinstance(probabilities, dict):
+                    probabilities = {k: (v if isinstance(v, (int, float)) and math.isfinite(v) else None)
+                                     for k, v in probabilities.items()}
         except Exception:
             choice, confidence, probabilities = ERROR, None, None
         predicted = choice if choice in columns else ERROR
@@ -218,7 +224,7 @@ def main(argv=None):
         print("no API key: set TYPESAFE_API_KEY or jev.api_key_file", file=sys.stderr)
         return 2
     report = evaluate(tasks, cfg)
-    print(json.dumps(report, sort_keys=True) if args.json else render(report))
+    print(json.dumps(report, sort_keys=True, allow_nan=False) if args.json else render(report))
     return 0
 
 

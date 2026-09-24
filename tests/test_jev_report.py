@@ -205,6 +205,13 @@ class EvalTests(unittest.TestCase):
         self.assertEqual([r["effective"] for r in result["results"]], ["opus", "inherit", "sonnet", "fable", "inherit"])
         self.assertIn("applied accuracy: 60.0% (3/5, 1 applied)", evaluator.render(result))
 
+    def test_nan_confidence_is_dropped_and_json_output_is_strict(self):
+        tasks = [{"id": "n1", "subagent_type": "general-purpose", "description": "d1", "prompt": "p",
+                  "expected": "opus"}]
+        result = evaluator.evaluate(tasks, self.cfg, lambda state, q: answers("opus", float("nan")))
+        self.assertIsNone(result["results"][0]["confidence"])
+        json.dumps(result, sort_keys=True, allow_nan=False)  # must not raise on a strict encoder
+
     def test_validate_rejects_bad_benchmark(self):
         bad = {"version": 1, "tasks": [{"id": "a", "subagent_type": "x", "description": "d",
                                         "prompt": "p", "expected": "haiku"},
