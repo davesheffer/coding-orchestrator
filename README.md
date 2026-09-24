@@ -260,6 +260,8 @@ which is removed after `handoff_ttl_hours`.
 ```sh
 ./codex/install.sh --dry-run
 ./codex/install.sh
+# To enable TypeSafe Jev for Codex:
+./codex/install.sh --jev
 ```
 
 Requires Python **3.11+** (`tomllib`) and a Codex version supporting native
@@ -296,10 +298,31 @@ To replace customized bundle-owned role/helper files after reviewing a diff:
 ./codex/install.sh --force
 ```
 
-The installer never reads `auth.json`, copies credentials, writes to
-`~/.claude`, or installs Codex hooks. It does not permanently change your shell's
-PATH. If you already installed a helper as a symlink, the installer refuses it;
+The installer never reads `auth.json`, copies credentials, or writes to
+`~/.claude`. It does not permanently change your shell's PATH. If you already
+installed a helper as a symlink, the installer refuses it;
 inspect and relocate that link before installing a regular copy.
+
+`--jev` installs user-level Codex hooks in `~/.codex/hooks.json` and enables
+`~/.codex/jev/config.json`. The hooks preserve unrelated entries and rerunning
+the installer without `--jev` disables only this bundle's Jev hooks. Codex
+requires you to review and trust these user hooks through `/hooks` before they
+run; a changed hook definition needs review again. The hooks use Python 3.11+
+and TypeSafe's paid Jev API. Set `TYPESAFE_API_KEY`, set `jev.api_key_file` in
+the Codex Jev config, or explicitly set `jev.api_key_source` to
+`"claude_settings"` to use the key already stored in Claude Code settings.
+The installer never copies the key. Jev calls may send a task description,
+recent prompts, a Git diff, a subagent report, or a handoff to TypeSafe;
+adjust `jev.features` and the shared privacy settings in the Jev section above.
+
+Codex Jev routes only unnamed/default subagents; named scout, runner, builder,
+and critic roles keep their configured models. It checks risky `git commit` or
+`git push` calls, asks weak subagent reports for one more pass, detects clear
+task shifts, and grades Codex handoffs written through `rollover-open.py`.
+The Git check is advisory and can be overridden by retrying the same command.
+Restricted launched agents and native role profiles disable hooks, so Jev
+requests run from the main session only. Inspect decisions in
+`~/.codex/jev/jev-log.jsonl`.
 
 On Windows, use `python codex/install.py --dry-run` followed by
 `python codex/install.py`. Invoke the installed helper as

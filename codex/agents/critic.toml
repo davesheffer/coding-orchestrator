@@ -55,6 +55,7 @@ image_generation = false
 multi_agent = false
 multi_agent_v2 = false
 skill_mcp_dependency_install = false
+hooks = false
 
 [agents]
 enabled = false

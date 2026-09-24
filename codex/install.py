@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Install the bundled Codex orchestration files.
 
-Usage: install.py [--force] [--dry-run] [--configure-routing]
+Usage: install.py [--force] [--dry-run] [--configure-routing] [--jev]
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import copy
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 import tempfile
@@ -28,7 +29,7 @@ DISABLED_FEATURES = (
     'apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_external',
     'browser_use_full_cdp_access', 'in_app_browser', 'computer_use',
     'image_generation', 'multi_agent', 'multi_agent_v2',
-    'skill_mcp_dependency_install',
+    'skill_mcp_dependency_install', 'hooks',
 )
 REQUIRED_ROLE_FIELDS = {
     "name", "description", "model", "model_reasoning_effort", "sandbox_mode",
@@ -163,11 +164,76 @@ def validate_destination_root(dest: Path) -> None:
 
 
 def validate_subdirs(dest: Path) -> None:
-    for directory in (dest / "agents", dest / "bin"):
+    for directory in (dest / "agents", dest / "bin", dest / "jev", dest / "jev" / "state"):
         if directory.is_symlink():
             fail(f"refusing symlink destination directory: {directory}")
         if directory.exists() and not directory.is_dir():
             fail(f"destination ancestor is not a directory: {directory}")
+
+
+def parse_json(path: Path, data: bytes | None) -> dict:
+    if data is None:
+        return {}
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid JSON in {path}: {exc}")
+    if not isinstance(value, dict):
+        fail(f"expected JSON object in {path}")
+    return value
+
+
+def hook_command(dest: Path) -> str:
+    python = "python" if os.name == "nt" else "python3"
+    path = str(dest / "bin" / "jev-hook.py")
+    return f'{python} "{path}"' if os.name == "nt" else f"{python} {shlex.quote(path)}"
+
+
+def merge_jev_hooks(path: Path, prior: bytes | None, dest: Path, enabled: bool) -> bytes | None:
+    doc = parse_json(path, prior)
+    hooks = doc.get("hooks", {})
+    if not isinstance(hooks, dict):
+        fail(f"hooks must be an object in {path}")
+    command = hook_command(dest)
+    events = {"PreToolUse": ("Bash|Agent|Task|spawn_agent", 10),
+              "SubagentStart": ("critic", 5), "SubagentStop": ("scout|runner|builder|critic", 5),
+              "UserPromptSubmit": (None, 5)}
+    result = {name: list(groups) if isinstance(groups, list) else fail(f"invalid hook groups in {path}")
+              for name, groups in hooks.items()}
+    for event, groups in result.items():
+        remaining = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                fail(f"invalid hook group in {path}")
+            handlers = [h for h in group["hooks"] if not (isinstance(h, dict) and h.get("command") == command)]
+            if handlers:
+                remaining.append({**group, "hooks": handlers})
+        result[event] = remaining
+    if enabled:
+        for event, (matcher, timeout) in events.items():
+            group = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+            if matcher:
+                group["matcher"] = matcher
+            result.setdefault(event, []).append(group)
+    doc["hooks"] = {event: groups for event, groups in result.items() if groups}
+    if prior is None and not enabled:
+        return None
+    if prior is not None and doc == parse_json(path, prior):
+        return prior
+    return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def merge_jev_config(path: Path, prior: bytes | None, enabled: bool) -> bytes | None:
+    doc = parse_json(path, prior)
+    if prior is None and not enabled:
+        return None
+    jev = doc.setdefault("jev", {})
+    if not isinstance(jev, dict):
+        fail(f"jev config must be an object in {path}")
+    jev["enabled"] = enabled
+    if prior is not None and doc == parse_json(path, prior):
+        return prior
+    return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def backup_path(path: Path) -> Path:
@@ -225,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="replace differing managed files after backing them up")
     parser.add_argument("--dry-run", action="store_true", help="validate and list actions without changing the destination")
     parser.add_argument("--configure-routing", action="store_true", help="add missing default subagent routing settings to config.toml")
+    parser.add_argument("--jev", action="store_true", help="enable opt-in TypeSafe Jev hooks for Codex")
     args = parser.parse_args(argv)
 
     here = Path(__file__).resolve().parent
@@ -247,6 +314,14 @@ def main(argv: list[str] | None = None) -> int:
     sources[dest / "bin" / "agent-run.py"] = agent_run_source
     sources[dest / "bin" / "agent-report.py"] = report_source
     sources[dest / "bin" / "rollover-open.py"] = rollover_source
+    if args.jev:
+        for source_name, target_name in (("codex/jev-hook.py", "jev-hook.py"),
+                                         ("bin/jev_client.py", "jev_client.py"),
+                                         ("bin/jev-guard.py", "jev-guard.py")):
+            source = here.parent / source_name
+            data = read_regular(source)
+            assert data is not None
+            sources[dest / "bin" / target_name] = data
     parse_toml(here / "config.example.toml", config_source)
     managed_block(sources[dest / "AGENTS.md"], here / "AGENTS.md")
 
@@ -268,6 +343,12 @@ def main(argv: list[str] | None = None) -> int:
     routing_existing = read_regular(routing_policy)
     if routing_existing is not None:
         validate_routing_policy(routing_policy, routing_existing)
+    hooks_path = dest / "hooks.json"
+    hooks_existing = read_regular(hooks_path)
+    jev_path = dest / "jev" / "config.json"
+    jev_existing = read_regular(jev_path)
+    hooks_desired = merge_jev_hooks(hooks_path, hooks_existing, dest, args.jev)
+    jev_desired = merge_jev_config(jev_path, jev_existing, args.jev)
     override = dest / "AGENTS.override.md"
     if override.is_symlink():
         fail(f"refusing symlink: {override}")
@@ -280,14 +361,20 @@ def main(argv: list[str] | None = None) -> int:
         desired[config] = configure_routing_defaults(config, config_existing)
     if routing_existing is None:
         desired[routing_policy] = ROUTING_POLICY
+    if hooks_desired is not None:
+        desired[hooks_path] = hooks_desired
+    if jev_desired is not None:
+        desired[jev_path] = jev_desired
 
     changes: list[tuple[Path, bytes, bytes | None]] = []
     for target, data in desired.items():
-        prior = existing.get(target, config_existing if target == config else None)
+        prior = existing.get(target, {config: config_existing, hooks_path: hooks_existing,
+                                      jev_path: jev_existing}.get(target))
         if prior != data:
             changes.append((target, data, prior))
     conflicts = [path for path, _, prior in changes
-                 if prior is not None and path.name not in ("AGENTS.md", "config.toml", "agent-routing.json")]
+                 if prior is not None and path.name not in ("AGENTS.md", "config.toml", "agent-routing.json",
+                                                            "hooks.json") and path != jev_path]
     if conflicts and not args.force:
         fail("differing managed files (use --force): " + ", ".join(map(str, conflicts)))
 
@@ -306,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             print(action)
         return 0
 
-    for directory in (dest, dest / "agents", dest / "bin"):
+    for directory in (dest, dest / "agents", dest / "bin", dest / "jev"):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     for path, data, prior in changes:
         if prior is not None:

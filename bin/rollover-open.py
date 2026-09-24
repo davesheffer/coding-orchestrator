@@ -96,6 +96,22 @@ def save_codex(title: str, body: str) -> Path:
     return path
 
 
+def check_jev_handoff(body: str, accept_weak: bool) -> None:
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    hook = codex_home / "bin" / "jev-hook.py"
+    if not hook.is_file():
+        return
+    try:
+        result = subprocess.run([sys.executable, str(hook), "grade"],
+                                input=json.dumps({"handoff": body}), text=True,
+                                capture_output=True, timeout=6)
+        grade = json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return
+    if isinstance(grade, dict) and grade.get("weak") and not accept_weak:
+        raise ValueError(f"Jev rated this handoff {grade['score']:.1f}/4. Add a concrete NEXT STEP and backed verification, or use --accept-weak.")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -107,6 +123,7 @@ def main(argv=None) -> int:
     writer.add_argument("--client", choices=("codex",), required=True)
     writer.add_argument("--title", default="continue")
     writer.add_argument("--no-open", action="store_true")
+    writer.add_argument("--accept-weak", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "open":
@@ -114,7 +131,9 @@ def main(argv=None) -> int:
             print(message)
             return 0 if "tab launch acknowledged" in message else 2
         else:
-            path = save_codex(args.title, sys.stdin.read())
+            body = sys.stdin.read()
+            check_jev_handoff(body, args.accept_weak)
+            path = save_codex(args.title, body)
             print(f"handoff saved: {path}")
             if not args.no_open:
                 message = launch("codex", path)

@@ -150,6 +150,13 @@ def api_key(cfg):
             return Path(path).expanduser().read_text(encoding="utf-8").strip() or None
         except Exception:
             return None
+    if cfg.get("api_key_source") == "claude_settings":
+        try:
+            settings = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
+            value = settings.get("env", {}).get("TYPESAFE_API_KEY")
+            return value.strip() or None if isinstance(value, str) else None
+        except Exception:
+            return None
     return None
 
 
