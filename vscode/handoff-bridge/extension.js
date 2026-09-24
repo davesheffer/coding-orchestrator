@@ -12,11 +12,14 @@ function handoffHome() {
 // <home>/handoffs. Claude requests only pre-fill the relay prompt from ~/.claude/relay.
 // Resolve symlinks/junctions on both sides so a link inside handoffs cannot point
 // outside it, while still accepting a legit path that only differs by case on Windows.
+// On Windows the native realpath also expands 8.3 short names, as Python's resolve() does.
+const realpath = process.platform === 'win32' ? fs.realpathSync.native : fs.realpathSync;
+
 function realHandoffPath(root, handoff) {
   let folder;
-  try { folder = fs.realpathSync(path.resolve(root, 'handoffs')); } catch { return null; }
+  try { folder = realpath(path.resolve(root, 'handoffs')); } catch { return null; }
   let resolved;
-  try { resolved = fs.realpathSync(path.resolve(handoff)); } catch { return null; }
+  try { resolved = realpath(path.resolve(handoff)); } catch { return null; }
   const prefix = folder + path.sep;
   const matches = process.platform === 'win32'
     ? resolved.toLowerCase().startsWith(prefix.toLowerCase())
@@ -63,13 +66,23 @@ async function handleUri(uri) {
         !fs.statSync(resolvedHandoff).isFile()) {
       throw new Error('invalid or expired handoff request');
     }
+    let handoff;
+    if (isCodex) {
+      // Read through one handle now, before any await, so the checked file is the one copied.
+      const fd = fs.openSync(resolvedHandoff, 'r');
+      try {
+        if (!fs.fstatSync(fd).isFile()) throw new Error('invalid or expired handoff request');
+        handoff = fs.readFileSync(fd, 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
     if (request.client === 'claude') {
       await vscode.commands.executeCommand('claude-vscode.primaryEditor.open', undefined, request.prompt);
     } else {
       const previous = new Set(vscode.window.tabGroups.all.flatMap(group => group.tabs));
       await vscode.commands.executeCommand('chatgpt.newCodexPanel');
       await waitForNewCodexTab(previous);
-      const handoff = fs.readFileSync(resolvedHandoff, 'utf8');
       await vscode.env.clipboard.writeText(`${request.prompt}\n\nSaved handoff:\n${handoff}`);
     }
     writeAck(root, id, { status: 'opened', client: request.client });

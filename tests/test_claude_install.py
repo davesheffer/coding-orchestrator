@@ -357,8 +357,11 @@ class ClaudeInstallTests(unittest.TestCase):
             stdout, stderr = io.StringIO(), io.StringIO()
             with (mock.patch.dict(os.environ, env),
                   mock.patch.object(install_module.shutil, "which", return_value=found),
+                  mock.patch.object(install_module.subprocess, "run",
+                                    return_value=mock.Mock(returncode=0)),
                   contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
                 self.assertEqual(install_module.main(["--dry-run"]), 0)
+            self.assertNotIn("did not run a real Python interpreter", stderr.getvalue())
             self.assertEqual(f"`{install_module.hook_python()}` is not on PATH" in stderr.getvalue(),
                              warned, stderr.getvalue())
         self.assertFalse(self.home.exists())
