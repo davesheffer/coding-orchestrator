@@ -139,18 +139,22 @@ PREFIX_WINDOW_CHARS = 256
 # Quoted strings are stripped so words inside them (e.g. `echo "git commit"`) can't be
 # mistaken for a real command, EXCEPT a quoted -C/-c argument (e.g. -C "dir with
 # space") or a `cd "dir"` target, which fix 2 needs intact to resolve the gate's cwd.
-# A quoted string is preserved only when it is the value of a literal `-C`/`-c` that
+# A quoted string is preserved only when it is the value of a literal `-C`/`-c` (or
+# of a value-taking long option such as `--git-dir "x"`, whose dropped value would
+# otherwise let the option swallow the subcommand) that
 # sits in a git global-options segment (i.e. `git`, zero or more already-matched global
 # options, then `-C `/`-c `, right before the quote) — not an arbitrary `-c "..."` in
 # unrelated text (e.g. `echo -c "x; git commit -m y"`).
 _GIT_DASH_C_PREFIX_RE = re.compile(
-    _SEP + _LEAD + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS + r"\s+-[Cc]\s+$")
+    _SEP + _LEAD + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS
+    + r"\s+(?:-[Cc]\s+|" + _LONG_VALUE_OPTS + r"(?:=|\s+))$")
 _CD_PREFIX_RE = re.compile(_SEP + _LEAD + r"cd\s+$")
 # Once the window has been trimmed, the start of a long git segment (e.g. `git -c
 # x=<500 chars> -C "dir" push`) may have fallen out of it; a quote after any `-C `,
 # `-c ` or `cd ` is then kept, since dropping it would turn `-C "dir" push` into
 # `-C  push` and hide the push (a spurious check is the safe side).
-_LOOSE_KEEP_RE = re.compile(r"(?:-[Cc]|(?<![\w-])cd)\s+$")
+_LOOSE_KEEP_RE = re.compile(
+    r"(?:(?:-[Cc]|(?<![\w-])cd)\s+|" + _LONG_VALUE_OPTS + r"(?:=|\s+))$")
 # What separates the segments _cd_dirs looks for `cd <dir>` in.
 _CD_SPLIT_RE = re.compile(r"&&|\|\||;|\n|\(|\{|`")
 # A line that could end a heredoc (`WORD`, or indented for the `<<-` form).
@@ -346,10 +350,15 @@ def _strip_heredocs_and_quotes(command):
     tail = ""  # last (roughly) PREFIX_WINDOW_CHARS of "".join(out); see its definition
     pending = []  # (word, dash_form) heredoc terminators whose bodies start at the next newline
     trimmed = False
-    # Depth of unclosed `((`/`$((` arithmetic, counted in the scanned command text
-    # itself (not the bounded tail, which a long run of blanks inside `$((` can push
-    # the opener out of).
-    arith = 0
+    # Open parenthesis frames, tracked in the scanned command text itself (not the
+    # bounded tail, which a long run of blanks inside `$((` can push the opener out
+    # of): "A" a `((`/`$((` arithmetic, "B" a `$[` arithmetic, "G" a `(` grouping
+    # inside arithmetic, "S" a subshell or `$(`/`<(` substitution. `<<` is a shift,
+    # not a heredoc, while the innermost frame is arithmetic (A/B/G); only an A frame
+    # takes a `))`, so the closers of nested `$( $( ) )` can't end it early. An
+    # unclosed arithmetic frame only makes a real heredoc body get scanned (a
+    # spurious check).
+    frames = []
     # word -> ([starts], [ends]) of every terminator-shaped line, and the same for
     # unindented lines only; built on the first heredoc so each body end is a bisect
     # rather than a regex search to the end of the input (quadratic on many
@@ -411,20 +420,26 @@ def _strip_heredocs_and_quotes(command):
             emit("<<<")  # a here-string, not a heredoc
             i += 3
             continue
-        if command.startswith("((", i):
-            arith += 1
-            emit("((")
+        if command.startswith(("((", "$["), i):
+            frames.append("A" if ch == "(" else "B")
+            emit(command[i:i + 2])
             i += 2
             continue
-        if arith and command.startswith("))", i):
-            arith -= 1
-            emit("))")
-            i += 2
-            continue
-        # `<<` inside an unclosed `((`/`$((` is a shift (`$((1<<3))`), not a heredoc;
-        # taking it for one would hide the lines up to a numeric "terminator". A stray
-        # unclosed `((` only makes a real heredoc body get scanned (a spurious check).
-        if command.startswith("<<", i) and not arith:
+        if ch == "(":
+            in_arith = frames and frames[-1] in "ABG"
+            frames.append("G" if in_arith and command[i - 1:i] != "$" else "S")
+        elif ch == ")" and frames and frames[-1] != "B":
+            if frames[-1] == "A" and command.startswith("))", i):
+                frames.pop()
+                emit("))")
+                i += 2
+                continue
+            frames.pop()
+        elif ch == "]" and frames and frames[-1] == "B":
+            frames.pop()
+        # `<<` inside arithmetic is a shift (`$((1<<3))`), not a heredoc; taking it
+        # for one would hide the lines up to a numeric "terminator".
+        if command.startswith("<<", i) and not (frames and frames[-1] in "ABG"):
             m = HEREDOC_RE.match(command, i)
             if m:
                 word = m.group(2) or m.group(3) or m.group(4)

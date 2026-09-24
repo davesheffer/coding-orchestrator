@@ -587,6 +587,14 @@ class GateTests(unittest.TestCase):
                         'FOO=' + "a" * 600 + ' git -C "sub" push'):
             self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
 
+    def test_quoted_long_option_value_keeps_subcommand(self):
+        # A dropped quoted value let `--git-dir` take the subcommand as its value.
+        for command, op in (('git --git-dir "x" push', "push"),
+                            ('git --git-dir="x" push', "push"),
+                            ("git --work-tree 'w' commit -m x", "commit"),
+                            ('git -c x=' + "a" * 600 + ' --git-dir "d" push', "push")):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], [op], command)
+
     def test_arithmetic_shift_is_not_a_heredoc(self):
         command = "echo $((1<<3))\ngit push --force\n3\n"
         self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
@@ -598,6 +606,14 @@ class GateTests(unittest.TestCase):
         # Nested parens inside the arithmetic keep it open until its own `))`.
         command = "echo $(( (1+2) <<3 ))\ngit push\n3\n"
         self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
+        # The closers of nested `$(`/`(` inside the arithmetic don't end it early, a
+        # heredoc inside a `$( )` nested in it is still one, and `$[ ]` is arithmetic.
+        for command in ("echo $(( $(echo $(echo 1))<<3 ))\ngit push --force\n3\n",
+                        "echo $(( $( (echo 1))<<3 ))\ngit push --force\n3\n",
+                        "x=$(( $(cat <<EOF | wc -c\n))\nEOF\n) << 3 )); echo x=$x\ngit push\n3\n",
+                        "echo $[1<<3]\ngit push\n3\n"):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"],
+                             command)
         # A real heredoc after a closed arithmetic still hides its body.
         command = "echo $((1<<3)); cat <<EOF\ngit push\nEOF\n"
         self.assertEqual(jev._scan_targets(command, "/repo"), [])
