@@ -91,7 +91,9 @@ installation alone does not verify those hooks. For a custom destination, set
 
 The relay (`relay/relay.py`) runs as `UserPromptSubmit` and `Stop` hooks. Once a
 session is non-trivial (`task_shift_min_tokens`, default 30k), each prompt gets a
-context gauge:
+context gauge. A fresh session with no usage yet gets nothing; if a compaction or
+the 8 MiB transcript scan limit hides the last usage, the model is told usage is
+unknown and not to infer a zone:
 
 | Zone | Default threshold | What the model is told |
 |---|---|---|
@@ -104,9 +106,17 @@ verified vs unverified, next step, and optionally the user's next prompt) that
 the model pipes to `relay.py handoff --title "<title>"`. The relay saves it as
 `relay/handoffs/<id>.md` and produces a resume prompt such as
 `relay:1a2b3c4d continue "<title>" from the handoff.` Sending that prompt in a
-fresh session injects the handoff so the new session continues the work.
+fresh session injects the handoff so the new session continues the work. Only a
+prompt that starts with `relay:<id>` resumes; mentioning an id elsewhere does
+not. The handoff is injected inside a `<handoff id="...">` fence, and its NEXT
+PROMPT is presented as the previous session's recorded request. The gauge still
+applies on that turn. Handoff files written by this version are private (mode
+0600 in a 0700 folder; on Windows, an owner-only ACL applied to each new file
+and to a newly created handoffs folder — an existing handoffs folder keeps its
+current ACL) and a new handoff never replaces an existing id.
 Handoffs and per-session state older than `handoff_ttl_hours` (72) are removed
-the next time a handoff is written; resuming a handoff refreshes its age.
+when a handoff is written and, at most once an hour, when a prompt is submitted;
+resuming a handoff refreshes its age.
 
 Rollover has two modes:
 
@@ -114,7 +124,9 @@ Rollover has two modes:
   (`bin/rollover-open.py`) to open a new Claude tab. If the bridge is missing or
   fails, it tries the editor's `vscode://anthropic.claude-code/open` URI with the
   prompt pre-filled (Claude Code's VS Code-family extension on macOS or Windows
-  only). If neither launch is confirmed, it falls back to copy behaviour.
+  only). If neither launch is confirmed, it falls back to copy behaviour. On
+  Windows the editor URI launch cannot be confirmed, so the prompt is copied
+  as well.
 - **`copy`**: no tab or editor launch is attempted. The relay only copies the
   resume prompt to the clipboard and prints it. Start a new Claude session (a
   new tab or `/clear`) and paste it. The clipboard is `pbcopy` on macOS, `clip`
@@ -253,7 +265,9 @@ TypeSafe's paid third-party API. Turn off a feature under `jev.features`, or use
 `send_prompt: false` and `send_diff: false` to send less. Only while `shift` is
 on, the relay keeps your last five prompts (500 chars each) and the handoff GOAL
 line in its per-session state file `relay/state/<session>.json` (mode 0600),
-which is removed after `handoff_ttl_hours`.
+which is removed after `handoff_ttl_hours`. Independently of Jev, a handoff
+(including any NEXT PROMPT text) is kept in the private `relay/handoffs/<id>.md`
+for the same period.
 
 ### Codex
 
