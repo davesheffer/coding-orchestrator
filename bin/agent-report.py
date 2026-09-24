@@ -50,9 +50,11 @@ def collect(root, workspace=None):
         if not isinstance(report, dict):
             unreadable += 1
             continue
-        # A report without a workspace must not resolve to the current directory.
-        if workspace and ('workspace' not in report
-                          or Path(str(report['workspace'])).resolve() != workspace.resolve()):
+        # A report without an absolute workspace must not resolve to the current
+        # directory; a bare "" or "." would otherwise match any --workspace filter.
+        value = report.get('workspace')
+        if workspace and (not isinstance(value, str) or not Path(value).is_absolute()
+                          or Path(value).resolve() != workspace.resolve()):
             continue
         reports.append((path.parent, report))
     return reports, unreadable

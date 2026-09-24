@@ -17,6 +17,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -25,19 +26,20 @@ BAD = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP
 OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 
-def launchable(path):
-    if not os.access(path, os.X_OK):
-        return False
-    if sys.platform != "win32":
-        return True
-    # Windows reports every existing file as executable; only PATHEXT suffixes launch.
-    suffixes = {s.lower() for s in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if s}
-    return os.path.splitext(path)[1].lower() in suffixes
+def wrapper_command():
+    base = os.path.expanduser("~/.hunch/agent-gh")
+    if sys.platform == "win32":
+        # shutil.which performs the real PATHEXT lookup; only .exe/.com are safe
+        # to launch directly (.bat/.cmd would pass arguments through cmd.exe).
+        resolved = shutil.which(base)
+        if resolved and os.path.splitext(resolved)[1].lower() in (".exe", ".com"):
+            return resolved
+        return "gh"
+    return base if os.access(base, os.X_OK) else "gh"
 
 
 def gh(*args):
-    wrapper = os.path.expanduser("~/.hunch/agent-gh")
-    exe = wrapper if launchable(wrapper) else "gh"
+    exe = wrapper_command()
     try:
         r = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=60)

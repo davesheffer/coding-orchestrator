@@ -29,6 +29,9 @@ DISABLED = ('apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_exte
             'browser_use_full_cdp_access', 'in_app_browser', 'computer_use',
             'image_generation', 'multi_agent', 'multi_agent_v2',
             'skill_mcp_dependency_install', 'hooks')
+# Every other saved status (blocked-*, completed, model-unverified, failed-no-retry)
+# is terminal and must survive a later exception along with its exit semantics.
+NON_TERMINAL_STATUSES = ('preflight', 'preflight-passed', 'model-unavailable')
 
 
 def toml(value):
@@ -167,7 +170,8 @@ def verify_tools(exe, cwd, settings):
     if result.returncode:
         raise RuntimeError('Cannot inspect effective MCP settings: ' + result.stderr[-2000:])
     servers = json.loads(result.stdout)
-    if not isinstance(servers, list) or any(not isinstance(s, dict) or s.get('enabled', True) for s in servers):
+    # A server counts as enabled unless explicitly disabled; missing or null 'enabled' must not slip past.
+    if not isinstance(servers, list) or any(not isinstance(s, dict) or s.get('enabled') is not False for s in servers):
         raise RuntimeError('Effective MCP server remains enabled; refusing delegation')
     result = subprocess.run([exe, *overrides(settings), 'features', 'list'],
                             cwd=cwd, capture_output=True, text=True, encoding='utf-8',
@@ -215,7 +219,7 @@ def probe(exe, cwd, settings, policy, writable, allow_host=None):
     marker = '.agent-probe-' + uuid.uuid4().hex
     read = cwd / (marker + '.read')
     targets = list(dict.fromkeys([cwd / marker, cwd.parent / marker,
-                                  Path(tempfile.gettempdir()) / marker, ROOT / marker]))
+                                  Path(tempfile.gettempdir()).resolve() / marker, ROOT / marker]))
     if any(p.is_relative_to(cwd) for p in targets[1:]):
         raise RuntimeError('Workspace overlaps protected probe roots')
     read.write_text('agent-probe', encoding='utf-8')
@@ -360,14 +364,14 @@ def main(argv=None):
     elif args.brief:
         brief = args.brief.read_text(encoding='utf-8')
     else:
-        # Hosts pipe UTF-8 regardless of the console code page.
-        brief = sys.stdin.buffer.read().decode('utf-8', 'replace')
+        # Hosts pipe UTF-8 regardless of the console code page; strip a leading BOM.
+        brief = sys.stdin.buffer.read().decode('utf-8-sig', 'replace')
     if not args.probe_only and not brief.strip():
         raise RuntimeError('A bounded task brief is required')
     role = tomllib.loads((ROOT / 'agents' / (args.role + '.toml')).read_text(encoding='utf-8-sig'))
     if (role.get('model'), role.get('model_reasoning_effort')) != MODELS[args.role][0]:
         raise RuntimeError('Installed role model differs from launcher policy; reconcile settings before launch')
-    if not isinstance(role.get('developer_instructions'), str):
+    if not isinstance(role.get('developer_instructions'), str) or not role['developer_instructions'].strip():
         raise RuntimeError('Installed role lacks developer_instructions; reinstall the role before launch')
     models = MODELS[args.role]
     if args.trial_model is not None:
@@ -392,8 +396,9 @@ def main(argv=None):
     try:
         return launch(args, cwd, brief, role, models, approved, logs, report, save, started)
     except Exception:
-        # A failure after the first save must not leave a stale preflight status.
-        if report['status'] != 'blocked-tools':
+        # A failure after the first save must not leave a stale preflight status,
+        # but an already-saved terminal status and its exit semantics must survive.
+        if report['status'] in NON_TERMINAL_STATUSES:
             report['status'] = 'error'
         save()
         raise
@@ -530,6 +535,8 @@ unverified.
             print(f'Agent stopped (exit {result.returncode}); inspect {logs}. Main session must assess partial work before continuing.')
             return result.returncode or 1
         print('Model unavailable before work started; trying the next configured model.', flush=True)
+    # Unreachable in practice (the loop above always returns); fail closed if it ever falls through.
+    return 1
 
 
 if __name__ == '__main__':

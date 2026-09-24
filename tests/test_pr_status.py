@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import subprocess
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -125,11 +126,30 @@ class GhLaunchTests(unittest.TestCase):
             output = pr_status.gh("pr", "list", "--json", "number")
         return output, calls
 
-    def test_windows_uses_wrapper_only_with_a_pathext_suffix(self):
-        _, calls = self.launch("win32", "C:/home/.hunch/agent-gh")
-        self.assertEqual(calls[0][0][0], "gh")
-        _, calls = self.launch("win32", "C:/home/.hunch/agent-gh.CMD", pathext=".COM;.EXE;;.cmd;")
-        self.assertEqual(calls[0][0][0], "C:/home/.hunch/agent-gh.CMD")
+    def test_windows_resolves_the_wrapper_only_for_exe_or_com(self):
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper_dir = Path(temp) / ".hunch"
+            wrapper_dir.mkdir()
+            base = str(wrapper_dir / "agent-gh")
+            with patch.object(pr_status.sys, "platform", "win32"), \
+                 patch.object(pr_status.os.path, "expanduser", return_value=base):
+                self.assertEqual(pr_status.wrapper_command(), "gh")  # nothing present yet
+
+                (wrapper_dir / "agent-gh.cmd").write_bytes(b"")
+                self.assertEqual(pr_status.wrapper_command(), "gh")  # .cmd runs through cmd.exe
+
+                (wrapper_dir / "agent-gh").write_bytes(b"")
+                self.assertEqual(pr_status.wrapper_command(), "gh")  # extensionless: no PATHEXT match
+
+                exe = wrapper_dir / "agent-gh.exe"
+                exe.write_bytes(b"")
+                # shutil.which reconstructs the suffix from PATHEXT casing (.EXE).
+                self.assertEqual(pr_status.wrapper_command().lower(), str(exe).lower())
+
+                exe.unlink()
+                com = wrapper_dir / "agent-gh.com"
+                com.write_bytes(b"")
+                self.assertEqual(pr_status.wrapper_command().lower(), str(com).lower())
 
     def test_posix_uses_executable_wrapper(self):
         output, calls = self.launch("linux", "/home/u/.hunch/agent-gh")

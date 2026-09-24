@@ -56,6 +56,17 @@ class AgentReportTests(unittest.TestCase):
             self.assertEqual(reporter.summarize(root, Path('.'))['runs'], 0)
             self.assertEqual(reporter.summarize(root)['runs'], 1)
 
+    def test_workspace_filter_skips_non_absolute_workspace_values(self):
+        # "" and "." resolve to the current directory; they must not masquerade as a match.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, value in (('blank', ''), ('dot', '.')):
+                (root / name).mkdir()
+                (root / name / 'report.json').write_text(
+                    json.dumps({'role': 'scout', 'status': 'preflight', 'workspace': value}), encoding='utf-8')
+            self.assertEqual(reporter.summarize(root, Path.cwd())['runs'], 0)
+            self.assertEqual(reporter.summarize(root)['runs'], 2)
+
     def test_invalid_utf8_event_log_still_reports_usage(self):
         with tempfile.TemporaryDirectory() as temp:
             run = Path(temp) / 'run'

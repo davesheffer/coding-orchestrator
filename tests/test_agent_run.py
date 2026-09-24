@@ -97,6 +97,17 @@ class RoutingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'remains enabled'):
                     agent.verify_tools('codex', Path.cwd(), {})
 
+    def test_temp_dir_is_resolved_before_overlap_check(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp).resolve()
+            # Only lands inside cwd after .resolve(); a raw string compare would miss it.
+            unresolved = str(cwd / 'nested' / '..' / 'inside')
+            with patch.object(agent.tempfile, 'gettempdir', return_value=unresolved), \
+                 patch.object(agent.subprocess, 'run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'overlaps'):
+                    agent.probe('codex', cwd, {}, 'test-policy', False)
+            run.assert_not_called()
+
     def test_temp_inside_workspace_is_refused_before_probing(self):
         with tempfile.TemporaryDirectory() as temp:
             cwd = Path(temp)
@@ -147,6 +158,13 @@ class RoutingTests(unittest.TestCase):
 
     def test_effective_tool_check_refuses_enabled_mcp(self):
         output = subprocess.CompletedProcess([], 0, json.dumps([{'name': 'extra', 'enabled': True}]), '')
+        with patch.object(agent.subprocess, 'run', return_value=output):
+            with self.assertRaisesRegex(RuntimeError, 'remains enabled'):
+                agent.verify_tools('codex', Path.cwd(), {})
+
+    def test_effective_tool_check_refuses_null_enabled(self):
+        # A missing or null 'enabled' must count as enabled, not silently pass.
+        output = subprocess.CompletedProcess([], 0, json.dumps([{'name': 'extra', 'enabled': None}]), '')
         with patch.object(agent.subprocess, 'run', return_value=output):
             with self.assertRaisesRegex(RuntimeError, 'remains enabled'):
                 agent.verify_tools('codex', Path.cwd(), {})

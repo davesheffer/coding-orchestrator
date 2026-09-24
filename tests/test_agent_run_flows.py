@@ -26,7 +26,7 @@ JEV_LEAKY = dict(ISOLATED, off_list='CONNECTED', allow_host='CONNECTED')
 
 class FlowTests(unittest.TestCase):
     def run_flow(self, responses, probes, approved=True, extra_args=(), jev=False, launched=None,
-                 stdin=None, tools=None, raises=None, final=b'RESULT: test response',
+                 stdin=None, tools=None, raises=None, final=b'RESULT: test response', break_final_read=False,
                  role='model="gpt-6-luna"\nmodel_reasoning_effort="low"\ndeveloper_instructions="Read-only scout"\n'):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TEST_TMPDIR')) as temp:
             root = Path(temp)
@@ -64,6 +64,13 @@ class FlowTests(unittest.TestCase):
             def observed(_):
                 return {'model': calls[-1], 'effort': 'low'}
 
+            original_read_text = Path.read_text
+
+            def guarded_read_text(path, *a, **k):
+                if break_final_read and path.name.endswith('-final.txt'):
+                    raise OSError('final message unreadable')
+                return original_read_text(path, *a, **k)
+
             source = ['--brief', str(brief)] if stdin is None else []
             # Mirrors default Windows stdin: the ANSI code page with surrogateescape.
             stdin = io.TextIOWrapper(io.BytesIO(stdin or b''), encoding='cp1255', errors='surrogateescape')
@@ -77,6 +84,7 @@ class FlowTests(unittest.TestCase):
                  patch.object(agent, 'actual_model', side_effect=observed), \
                  patch.object(agent.subprocess, 'run', side_effect=fake_exec), \
                  patch.object(agent.sys, 'stdin', stdin), \
+                 patch.object(Path, 'read_text', guarded_read_text), \
                  contextlib.redirect_stdout(output):
                 args = ['scout', '--cd', str(workspace), *source, *extra_args]
                 if raises is None:
@@ -289,12 +297,27 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(report['status'], 'error')
         self.assertEqual(report['attempts'], [])
 
+    def test_final_message_read_failure_after_completion_keeps_completed_status(self):
+        code, calls, report, _ = self.run_flow([(0, self.STREAM)], [ISOLATED],
+                                               break_final_read=True, raises=OSError)
+        self.assertIsNone(code)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(report['status'], 'completed')
+
     def test_utf8_stdin_brief_survives_a_legacy_console_code_page(self):
         text = 'Brief \u201c\u05e9\u05dc\u05d5\u05dd \u05d0\u05da\u05dc\u05dd\u05de\u05df\u201d \U0001f600'
         code, _, report, _ = self.run_flow([(0, self.STREAM)], [ISOLATED], stdin=text.encode('utf-8'))
         self.assertEqual(code, 0)
         self.assertEqual(report['status'], 'completed')
         self.assertTrue(self.inputs[0].endswith(text))
+
+    def test_stdin_brief_strips_a_leading_bom(self):
+        text = 'Bounded task after a BOM'
+        code, _, report, _ = self.run_flow([(0, self.STREAM)], [ISOLATED], stdin=b'\xef\xbb\xbf' + text.encode('utf-8'))
+        self.assertEqual(code, 0)
+        self.assertEqual(report['status'], 'completed')
+        self.assertTrue(self.inputs[0].endswith(text))
+        self.assertNotIn('\ufeff', self.inputs[0])
 
     def test_invalid_utf8_in_codex_output_is_recorded(self):
         stream = self.STREAM.encode() + b'\xff\xfe\n'
@@ -307,6 +330,13 @@ class FlowTests(unittest.TestCase):
     def test_role_without_instructions_is_refused_before_launch(self):
         code, calls, report, _ = self.run_flow([], [], role='model="gpt-6-luna"\nmodel_reasoning_effort="low"\n',
                                                raises=RuntimeError)
+        self.assertEqual(calls, [])
+        self.assertIsNone(report)
+
+    def test_role_with_blank_instructions_is_refused_before_launch(self):
+        code, calls, report, _ = self.run_flow(
+            [], [], role='model="gpt-6-luna"\nmodel_reasoning_effort="low"\ndeveloper_instructions="   "\n',
+            raises=RuntimeError)
         self.assertEqual(calls, [])
         self.assertIsNone(report)
 
