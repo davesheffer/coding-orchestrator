@@ -144,50 +144,90 @@ class FlowTests(unittest.TestCase):
         self.assertIsNone(report['jev_allowlist'])
         self.assertNotIn('domains', self.permissions(launched[0]))
 
+    STREAM = '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n'
+
+    def developer(self, command):
+        return next(p for p in command if p.startswith('developer_instructions='))
+
     def test_enforced_jev_allowlist_launches_with_one_domain(self):
-        stream = '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n'
         launched = []
-        code, _, report, count = self.run_flow([(0, stream)], [JEV_ONLY], jev=True, launched=launched)
+        code, _, report, count = self.run_flow([(0, self.STREAM)], [ISOLATED, JEV_ONLY], jev=True, launched=launched)
         self.assertEqual(code, 0)
-        self.assertEqual(count, 1)
-        self.assertEqual(self.probe_hosts, ['api.typesafe.ai'])
+        self.assertEqual(count, 2)
+        self.assertEqual(self.probe_hosts, [None, 'api.typesafe.ai'])
         self.assertEqual(report['jev_allowlist'], 'api.typesafe.ai')
         self.assertFalse(report['network_exception'])
         self.assertEqual(self.permissions(launched[0]),
                          {'enabled': True, 'domains': {'api.typesafe.ai': 'allow'}})
-        self.assertIn('Jev network allowlist', next(p for p in launched[0] if p.startswith('developer_instructions=')))
+        self.assertIn('Jev network allowlist', self.developer(launched[0]))
 
-    def test_unenforced_allowlist_retries_same_backend_offline(self):
-        stream = '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n'
+    def test_unenforced_allowlist_keeps_verified_offline_backend(self):
         launched = []
-        code, _, report, count = self.run_flow([(0, stream)], [JEV_LEAKY, ISOLATED], jev=True, launched=launched)
+        code, _, report, count = self.run_flow([(0, self.STREAM)], [ISOLATED, JEV_LEAKY], jev=True, launched=launched)
         self.assertEqual(code, 0)
         self.assertEqual(count, 2)
-        self.assertEqual(self.probe_hosts, ['api.typesafe.ai', None])
+        self.assertEqual(self.probe_hosts, [None, 'api.typesafe.ai'])
         self.assertEqual([p['mode'] for p in report['probes']], ['elevated', 'elevated'])
         self.assertIsNone(report['jev_allowlist'])
+        self.assertFalse(report['network_exception'])
         self.assertEqual(self.permissions(launched[0]), {'enabled': False})
-        self.assertNotIn('Jev network allowlist', next(p for p in launched[0] if p.startswith('developer_instructions=')))
+        self.assertNotIn('Jev network allowlist', self.developer(launched[0]))
 
     def test_allowlist_probe_without_off_list_evidence_is_not_trusted(self):
-        code, calls, report, count = self.run_flow([], [ISOLATED, GOOD, GOOD, GOOD], approved=False, jev=True)
-        self.assertEqual(code, 3)
-        self.assertEqual(calls, [])
-        self.assertEqual(count, 4)
-        self.assertEqual(report['status'], 'blocked-network')
-
-    def test_no_isolation_uses_open_fallback_without_allowlist(self):
-        stream = '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n'
         launched = []
-        code, _, report, count = self.run_flow([(0, stream)], [JEV_LEAKY, GOOD, JEV_LEAKY, GOOD, GOOD],
+        code, _, report, count = self.run_flow([(0, self.STREAM)], [ISOLATED, ISOLATED], approved=False,
                                                jev=True, launched=launched)
         self.assertEqual(code, 0)
-        self.assertEqual(count, 5)
-        self.assertEqual(self.probe_hosts[-1], None)
+        self.assertEqual(count, 2)
+        self.assertIsNone(report['jev_allowlist'])
+        self.assertEqual(self.permissions(launched[0]), {'enabled': False})
+
+    def test_allowlist_probe_startup_failure_keeps_offline(self):
+        launched = []
+        code, _, report, count = self.run_flow([(0, self.STREAM)], [ISOLATED, STARTUP_FAILURE],
+                                               jev=True, launched=launched)
+        self.assertEqual(code, 0)
+        self.assertEqual(count, 2)
+        self.assertEqual(self.probe_hosts, [None, 'api.typesafe.ai'])
+        self.assertEqual([p['mode'] for p in report['probes']], ['elevated', 'elevated'])
+        self.assertIsNone(report['jev_allowlist'])
+        self.assertFalse(report['network_exception'])
+        self.assertEqual(self.permissions(launched[0]), {'enabled': False})
+
+    def test_allowlist_probe_filesystem_leak_blocks_launch(self):
+        code, calls, report, count = self.run_flow([], [ISOLATED, LEAK], jev=True)
+        self.assertEqual(code, 3)
+        self.assertEqual(calls, [])
+        self.assertEqual(count, 2)
+        self.assertEqual(report['status'], 'blocked-filesystem')
+
+    def test_allowlist_follows_offline_on_second_backend(self):
+        launched = []
+        code, _, report, count = self.run_flow([(0, self.STREAM)], [STARTUP_FAILURE, ISOLATED, JEV_ONLY],
+                                               jev=True, launched=launched)
+        self.assertEqual(code, 0)
+        self.assertEqual(count, 3)
+        self.assertEqual(self.probe_hosts, [None, None, 'api.typesafe.ai'])
+        self.assertEqual([p['mode'] for p in report['probes']], ['elevated', 'unelevated', 'unelevated'])
+        self.assertEqual(report['jev_allowlist'], 'api.typesafe.ai')
+
+    def test_leaky_offline_skips_allowlist_probes(self):
+        launched = []
+        code, _, report, count = self.run_flow([(0, self.STREAM)], [GOOD, GOOD, GOOD], jev=True, launched=launched)
+        self.assertEqual(code, 0)
+        self.assertEqual(count, 3)  # two offline probes plus the open-fallback probe
+        self.assertEqual(self.probe_hosts, [None, None, None])
         self.assertTrue(report['network_exception'])
         self.assertIsNone(report['jev_allowlist'])
         self.assertEqual(self.permissions(launched[0]), {'enabled': True})
+        self.assertNotIn('Jev network allowlist', self.developer(launched[0]))
 
+    def test_leaky_offline_without_approval_blocks_after_two_probes(self):
+        code, calls, report, count = self.run_flow([], [GOOD, GOOD], approved=False, jev=True)
+        self.assertEqual(code, 3)
+        self.assertEqual(calls, [])
+        self.assertEqual(count, 2)
+        self.assertEqual(report['status'], 'blocked-network')
 
 if __name__ == '__main__':
     unittest.main()

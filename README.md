@@ -324,14 +324,17 @@ Restricted launched agents and native role profiles disable hooks, so Jev
 hooks run from the main session only. Inspect decisions in
 `~/.codex/jev/jev-log.jsonl`.
 
-While `~/.codex/jev/config.json` has `jev.enabled: true`, `agent-run.py` first
-gives scout, runner and builder (never critic) a network profile that allows only the Jev endpoint's host
+While `~/.codex/jev/config.json` has `jev.enabled: true`, `agent-run.py` can
+give scout, runner and builder (never critic) a network profile that allows only the Jev endpoint's host
 (`api.typesafe.ai` by default; the endpoint must be `https` on port 443 with a
-plain DNS name, or no allowlist is used). The permission probe (run with
-`python -I`, so workspace modules cannot forge it) must show that direct
-sockets are denied, the Jev host answers through the Codex proxy, and the proxy
-refuses an unlisted host (`example.com`). Otherwise the same backend is retried fully offline,
-then the usual approved network fallback applies. Enabling Jev is the consent:
+plain DNS name, or no allowlist is used). Each backend is probed offline
+first; only when that probe shows direct sockets denied is the allowlist
+probed, so a backend that cannot isolate costs no extra probe. The allowlist
+probe (run with `python -I`, so workspace modules cannot forge it) must show
+that direct sockets are denied, the Jev host answers through the Codex proxy,
+and the proxy explicitly refuses an unlisted host (`example.com`) with a CONNECT
+403 or a Codex policy message. Otherwise the verified offline profile is used;
+if no backend isolates, the usual approved network fallback applies. Enabling Jev is the consent:
 agents may then reach that one host where they were previously offline, but
 nothing wider. It does not turn hooks on inside agents. `report.json` records the
 result as `jev_allowlist`. On Codex 0.155.1 under the Windows sandbox, neither

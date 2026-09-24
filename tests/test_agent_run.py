@@ -197,7 +197,12 @@ class JevAllowlistTests(unittest.TestCase):
         self.assertTrue(agent.isolated(good, 'h.example'))
         self.assertFalse(agent.isolated(dict(good, network='CONNECTED'), 'h.example'))
         dns = 'URLError:<urlopen error [Errno 11001] getaddrinfo failed>'
-        for off_list in ('CONNECTED', None, 0, '', dns, 'SSLCertVerificationError:bad cert', 'TimeoutError:'):
+        for text in ('URLError:blocked by network policy', 'Network access was blocked by policy'):
+            self.assertTrue(agent.isolated(dict(good, off_list=text), 'h.example'), text)
+        upstream = 'URLError:<urlopen error Tunnel connection failed: 502 Bad Gateway>'
+        auth = 'URLError:<urlopen error Tunnel connection failed: 407 Proxy Authentication Required>'
+        for off_list in ('CONNECTED', None, 0, '', dns, 'SSLCertVerificationError:bad cert', 'TimeoutError:',
+                         upstream, auth, 'URLError:upstream blocked by policy'):
             self.assertFalse(agent.isolated(dict(good, off_list=off_list), 'h.example'), off_list)
         for allow_host in (None, dns, 'TimeoutError:'):
             self.assertFalse(agent.isolated(dict(good, allow_host=allow_host), 'h.example'), allow_host)

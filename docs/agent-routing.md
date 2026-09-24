@@ -80,10 +80,11 @@ mandatory. The launcher freshly tries isolated backends first on every invocatio
 and rechecks file limits before using the authorized fallback. It never changes
 firewall settings or disables the filesystem sandbox.
 
-With Codex Jev enabled, scout, runner and builder first try a profile that
-allows only the Jev host; it counts as isolation only when the probe shows
-direct sockets denied, the Jev host reachable and an unlisted host refused by
-the proxy. See the Codex section of the README.
+With Codex Jev enabled, scout, runner and builder try a profile that allows
+only the Jev host once a backend's offline probe shows direct sockets denied;
+it counts as isolation only when the probe shows direct sockets denied, the Jev
+host reachable and an unlisted host explicitly refused by the proxy. Otherwise
+the verified offline profile is used. See the Codex section of the README.
 
 Removing a role revokes its exception; an empty list refuses fallback for all
 roles. `--no-network-fallback` requires isolation for one invocation even if a
