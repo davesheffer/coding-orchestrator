@@ -55,7 +55,7 @@ class CodexInstallTests(unittest.TestCase):
             "apps", "plugins", "remote_plugin", "browser_use", "browser_use_external",
             "browser_use_full_cdp_access", "in_app_browser", "computer_use",
             "image_generation", "multi_agent", "multi_agent_v2",
-            "skill_mcp_dependency_install",
+            "skill_mcp_dependency_install", "hooks",
         })
         self.assertFalse(runner["agents"]["enabled"])
         critic = tomllib.loads((self.home / "agents" / "critic.toml").read_text(encoding="utf-8"))

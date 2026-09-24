@@ -68,7 +68,7 @@ class RolloverOpenTests(unittest.TestCase):
 
     def test_utf8_handoff_stdin_even_with_legacy_locale(self):
         with tempfile.TemporaryDirectory() as temp:
-            env = dict(os.environ, ORCHESTRATOR_HANDOFF_HOME=temp,
+            env = dict(os.environ, ORCHESTRATOR_HANDOFF_HOME=temp, CODEX_HOME=str(Path(temp) / "codex"),
                        PYTHONIOENCODING="cp1255")
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "handoff", "--client", "codex",
