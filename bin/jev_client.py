@@ -205,7 +205,7 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None):
 
 
 def safe_repr(value, limit=80):
-    """ASCII-safe, length-bounded repr of a possibly-malformed logged value.
+    """UTF-8-safe, length-bounded repr of a possibly-malformed logged value.
 
     repr() escapes lone surrogates and control characters, so the result is
     always encodable as UTF-8 JSON text; long values are truncated with their

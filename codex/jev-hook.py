@@ -68,6 +68,21 @@ def desc_hash(description):
     return hashlib.sha256(description.encode("utf-8", errors="replace")).hexdigest()[:12]
 
 
+def coerce_confidence(raw):
+    """The confidence as a float in [0, 1], or None if raw isn't a usable number.
+
+    Same rule as bin/jev-route.py: rejects bool and str, and treats a huge int
+    (float() raises OverflowError) as invalid instead of letting route() raise.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        value = float(raw)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
+
+
 def route(payload, cfg, classify_fn=None):
     if payload.get("tool_name") not in ("Agent", "Task", "spawn_agent"):
         return None
@@ -105,21 +120,15 @@ def route(payload, cfg, classify_fn=None):
         # Malformed shape (e.g. answers["model"] is a string), same as client.ask()'s own check.
         log(cfg, {**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
-    raw_confidence = answer.get("confidence")
-    if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
-        confidence = float(raw_confidence)
-    else:
-        confidence = None
+    confidence = coerce_confidence(answer.get("confidence"))
     if not isinstance(choice, str) or choice not in MODELS or choice not in cfg["labels"]:
         why = "invalid label"
-    elif confidence is None or not 0.0 <= confidence <= 1.0:  # also rejects NaN
+    elif confidence is None:
         why = "invalid confidence"
     elif confidence < float(cfg["min_confidence"]):
         why = "below min_confidence"
     else:
         why = "applied"
-    if confidence is not None and not math.isfinite(confidence):
-        confidence = None  # keep the log strict JSON
     # Never write a raw non-string/oversized choice; repr() is ASCII-safe (handles lone surrogates too).
     display_choice = client.safe_repr(choice) if why == "invalid label" else choice
     log(cfg, {**entry, "choice": display_choice, "confidence": confidence, "applied": why == "applied",

@@ -84,6 +84,30 @@ def valid_confidence(confidence):
     return isinstance(confidence, float) and math.isfinite(confidence) and 0.0 <= confidence <= 1.0
 
 
+def coerce_confidence(raw):
+    """The confidence as a float in [0, 1], or None if raw isn't a usable number.
+
+    Rejects bool and str. float() can raise OverflowError on a huge int (e.g. a
+    JSON number with hundreds of digits), which this treats as invalid instead
+    of letting decide()/route() raise.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        value = float(raw)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
+
+
+def sanitize_probabilities(probabilities):
+    """The probabilities dict for logging: dict only, non-finite float values become None."""
+    if not isinstance(probabilities, dict):
+        return None
+    return {k: (v if isinstance(v, (int, float)) and math.isfinite(v) else None)
+            for k, v in probabilities.items()}
+
+
 def verdict(choice, confidence, current, cfg):
     """Why an answer is skipped, or "applied" (shared with bin/eval-jev-routing.py)."""
     if not isinstance(choice, str) or choice not in cfg["labels"]:
@@ -161,21 +185,16 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         if log_fn:
             log_fn({**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
-    raw_confidence = answer.get("confidence")
-    if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
-        confidence = float(raw_confidence)
-    else:
-        confidence = None
+    confidence = coerce_confidence(answer.get("confidence"))
     why = verdict(choice, confidence, current, cfg)
     applied = why == "applied"
     conf_text = f"{confidence:.2f}" if valid_confidence(confidence) else "invalid"
-    if confidence is not None and not math.isfinite(confidence):
-        confidence = None  # keep the log strict JSON
     # Never write a raw non-string/oversized choice; repr() is ASCII-safe (handles lone surrogates too).
     display_choice = safe_repr(choice) if why == "invalid label" else choice
     reason = f"jev: {current or 'inherit'} → {display_choice} (conf {conf_text})"
     if log_fn:
-        entry.update({"choice": display_choice, "confidence": confidence, "probabilities": probabilities,
+        entry.update({"choice": display_choice, "confidence": confidence,
+                      "probabilities": sanitize_probabilities(probabilities),
                       "applied": applied, "reason": reason if applied else f"{reason}; skipped: {why}"})
         log_fn(entry)
     if not applied:

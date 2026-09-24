@@ -110,13 +110,13 @@ def evaluate(tasks, cfg, classify_fn=None, router=None, home=None):
             answer = (classify_fn(state, questions) or {})["model"]
             if answer.get("choice") in cfg["labels"]:
                 choice = answer["choice"]
-                confidence = float(answer.get("confidence"))
-                if not math.isfinite(confidence):
-                    confidence = None  # keep --json output strict JSON
+                confidence = router.coerce_confidence(answer.get("confidence"))
                 probabilities = answer.get("probabilities")
                 if isinstance(probabilities, dict):
                     probabilities = {k: (v if isinstance(v, (int, float)) and math.isfinite(v) else None)
                                      for k, v in probabilities.items()}
+                else:
+                    probabilities = None  # a non-dict (e.g. a NaN-bearing list) isn't strict-JSON safe
         except Exception:
             choice, confidence, probabilities = ERROR, None, None
         predicted = choice if choice in columns else ERROR
