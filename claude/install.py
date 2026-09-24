@@ -419,9 +419,12 @@ def main(argv: list[str] | None = None) -> int:
     elif os.name == "nt":
         # The Microsoft Store's `python` app-execution alias resolves on PATH but
         # doesn't run a real interpreter, so probe it before trusting it for hooks.
+        # No pipes: a shim's background grandchild holding inherited stdio would
+        # otherwise stall run() past the timeout while it drains output.
         try:
             works = subprocess.run([found_python, "-c", "pass"], timeout=10,
-                                   capture_output=True).returncode == 0
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             works = False
         if not works:
