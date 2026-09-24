@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
@@ -142,6 +143,84 @@ class RoutingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'outside the delegated workspace'):
                 agent.main(['scout', '--cd', str(Path.cwd()), '--probe-only'])
 
+
+class JevAllowlistTests(unittest.TestCase):
+    def host_for(self, config):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            if config is not None:
+                (root / 'jev').mkdir()
+                (root / 'jev/config.json').write_text(
+                    config if isinstance(config, str) else json.dumps(config), encoding='utf-8')
+            with patch.object(agent, 'ROOT', root):
+                return agent.jev_host()
+
+    def test_enabled_jev_allows_only_default_endpoint_host(self):
+        self.assertEqual(self.host_for({'jev': {'enabled': True}}), 'api.typesafe.ai')
+        self.assertEqual(self.host_for({'jev': {'enabled': True, 'endpoint': 'https://jev.example.org:443/v1'}}),
+                         'jev.example.org')
+
+    def test_disabled_missing_or_malformed_config_means_no_allowlist(self):
+        for config in (None, '', 'not json', '[]', {'jev': []}, {'jev': {}}, {'jev': {'enabled': False}},
+                       {'jev': {'enabled': 'true'}}, {'jev': {'enabled': 1}}):
+            self.assertIsNone(self.host_for(config), config)
+
+    def test_bad_endpoint_means_no_allowlist(self):
+        for endpoint in ('http://api.typesafe.ai/v1', 'http://localhost:8080', 'https://127.0.0.1/v1',
+                         'https://[::1]/v1', 'https://api.typesafe.ai:8443/v1', 'https://user:pw@api.typesafe.ai/',
+                         'https://*.typesafe.ai/', 'https://localhost/', 'https://example.com/', 'https:///v1',
+                         'https://api.typesafe.ai:bad/', 'https://-bad.typesafe.ai/', 'https://ex\u00e4mple.com/',
+                         'https://api.typesafe.ai./', None, 7, ['https://api.typesafe.ai']):
+            self.assertIsNone(self.host_for({'jev': {'enabled': True, 'endpoint': endpoint}}), endpoint)
+
+    def test_allowlist_profile_has_exactly_one_domain(self):
+        with patch.object(agent, 'config_paths', return_value=[]):
+            settings = agent.settings_for(Path('C:/project'), False, False, 'elevated', 'p', 'brief',
+                                          'api.typesafe.ai')
+        self.assertEqual(settings['permissions.p']['network'],
+                         {'enabled': True, 'domains': {'api.typesafe.ai': 'allow'}})
+        self.assertFalse(settings['sandbox_workspace_write.network_access'])
+        self.assertIs(settings['features.hooks'], False)
+
+    def test_without_allowlist_profile_is_unchanged(self):
+        with patch.object(agent, 'config_paths', return_value=[]):
+            offline = agent.settings_for(Path('C:/project'), False, False, 'elevated', 'p', 'brief')
+            fallback = agent.settings_for(Path('C:/project'), False, True, 'elevated', 'p', 'brief', 'api.typesafe.ai')
+        self.assertEqual(offline['permissions.p']['network'], {'enabled': False})
+        self.assertEqual(fallback['permissions.p']['network'], {'enabled': True})
+
+    def test_isolation_requires_denied_socket_and_refused_unlisted_host(self):
+        refused = 'URLError:<urlopen error Tunnel connection failed: 403 Forbidden>'
+        good = {'network': 'DENIED', 'off_list': refused, 'allow_host': 'CONNECTED'}
+        self.assertTrue(agent.isolated({'network': 'DENIED'}, None))
+        self.assertFalse(agent.isolated({'network': 'CONNECTED'}, None))
+        self.assertTrue(agent.isolated(good, 'h.example'))
+        self.assertFalse(agent.isolated(dict(good, network='CONNECTED'), 'h.example'))
+        dns = 'URLError:<urlopen error [Errno 11001] getaddrinfo failed>'
+        for off_list in ('CONNECTED', None, 0, '', dns, 'SSLCertVerificationError:bad cert', 'TimeoutError:'):
+            self.assertFalse(agent.isolated(dict(good, off_list=off_list), 'h.example'), off_list)
+        for allow_host in (None, dns, 'TimeoutError:'):
+            self.assertFalse(agent.isolated(dict(good, allow_host=allow_host), 'h.example'), allow_host)
+
+    def test_hex_or_numeric_tld_is_not_a_domain(self):
+        for endpoint in ('https://0x7f.0x0.0x0.0x1/v1', 'https://127.0.0.0x1/', 'https://jev.example.c0m/'):
+            self.assertIsNone(self.host_for({'jev': {'enabled': True, 'endpoint': endpoint}}), endpoint)
+
+    def test_critic_never_gets_allowlist(self):
+        self.assertEqual(agent.JEV_ROLES, ('scout', 'runner', 'builder'))
+
+    def test_probe_python_runs_isolated_from_workspace_modules(self):
+        seen = []
+
+        def run(command, **kwargs):
+            seen.append(command)
+            return subprocess.CompletedProcess(command, 1, '', 'stop')
+        with patch.object(Path, 'write_text'), patch.object(Path, 'is_file', return_value=False),              patch.object(agent.tempfile, 'gettempdir', return_value='C:/fake-temp'),              patch.object(agent.subprocess, 'run', side_effect=run):
+            agent.probe('codex', Path.cwd(), {}, 'test-policy', False, 'api.typesafe.ai')
+        command = seen[0]
+        python = command.index(agent.sys.executable, command.index('--'))
+        self.assertEqual(command[python + 1:python + 4], ['-I', '-B', '-c'])
+        self.assertEqual(json.loads(command[-1])['allow_host'], 'api.typesafe.ai')
 
 if __name__ == '__main__':
     unittest.main()
