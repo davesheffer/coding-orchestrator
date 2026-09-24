@@ -154,10 +154,15 @@ def api_key(cfg):
 
 
 def http_classify(body, cfg, key):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, msg, headers, newurl):
+            return None
+
     request = urllib.request.Request(
         cfg["endpoint"], data=json.dumps(body).encode("utf-8"), method="POST",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=max(effective_timeout(cfg), 0.1)) as response:
+    opener = urllib.request.build_opener(NoRedirect)
+    with opener.open(request, timeout=max(effective_timeout(cfg), 0.1)) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

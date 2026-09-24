@@ -15,6 +15,8 @@ Subcommands:
 
 Hooks must never break a prompt: every hook path swallows errors and exits 0.
 """
+import csv
+import ctypes
 import json
 import locale
 import os
@@ -161,18 +163,57 @@ def load_state(session_id):
         return {}
 
 
+def _restrict_windows_state(path):
+    """Remove inherited access from a newly created, still-empty staging path."""
+    system_dir = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(system_dir, len(system_dir))
+    if not 0 < length < len(system_dir):
+        raise OSError("could not locate the Windows system directory")
+    system_dir = Path(system_dir.value)
+    identity = subprocess.run([str(system_dir / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
+                              capture_output=True, text=True, check=True)
+    rows = list(csv.reader(identity.stdout.splitlines()))
+    sid = rows[0][-1].strip() if rows and rows[0] else ""
+    if not re.fullmatch(r"S-\d+(?:-\d+)+", sid):
+        raise OSError("could not determine the current Windows user SID")
+    subprocess.run([str(system_dir / "icacls.exe"), str(path), "/inheritance:r",
+                    "/grant:r", f"*{sid}:F"],
+                   capture_output=True, text=True, check=True)
+
+
 def save_state(session_id, state):
     STATE.mkdir(parents=True, exist_ok=True)
     path = STATE / f"{session_id}.json"
-    tmp = path.with_suffix(".tmp")
+    stage = STATE / f".private-{secrets.token_hex(8)}"
+    if os.name == "nt":
+        stage.mkdir()
+        try:
+            _restrict_windows_state(stage)
+        except Exception:
+            stage.rmdir()
+            raise
+        tmp = stage / "state.tmp"
+    else:
+        tmp = path.with_name(path.name + f".{secrets.token_hex(8)}.tmp")
     # State may hold recent prompts / the handoff goal (only when "shift" is enabled,
-    # see record_prompt/cmd_prompt): write it mode 0600, not the process umask default.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    if hasattr(os, "fchmod"):
-        os.fchmod(fd, 0o600)  # a stale .tmp left by an older version keeps its old mode
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(state))
-    tmp.replace(path)
+    # see record_prompt/cmd_prompt). Restrict access before writing any of that text.
+    fd = None
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if os.name == "nt":
+            _restrict_windows_state(tmp)
+        elif hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            handle.write(json.dumps(state))
+        tmp.replace(path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+        if os.name == "nt":
+            stage.rmdir()
 
 
 def sweep(cfg):

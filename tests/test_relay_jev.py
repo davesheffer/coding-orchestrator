@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -210,7 +211,11 @@ class RelayJevTests(unittest.TestCase):
         self.run_prompt("small prompt", session_id="s7", transcript_tokens=1000)
         path = self.state / "s7.json"
         self.assertEqual(self.read_state("s7")["recent_prompts"], ["small prompt"])
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        else:
+            acl = subprocess.run(["icacls", str(path)], capture_output=True, text=True, check=True)
+            self.assertNotIn("(I)", acl.stdout)
 
     def test_stale_tmp_does_not_leak_mode(self):
         self.state.mkdir(parents=True, exist_ok=True)
@@ -218,7 +223,21 @@ class RelayJevTests(unittest.TestCase):
         stale.write_text("{}", encoding="utf-8")
         os.chmod(stale, 0o644)
         relay_module.save_state("s6", {"recent_prompts": ["x"]})
-        self.assertEqual((self.state / "s6.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.read_state("s6"), {"recent_prompts": ["x"]})
+        if os.name != "nt":
+            self.assertEqual((self.state / "s6.json").stat().st_mode & 0o777, 0o600)
+        else:
+            acl = subprocess.run(["icacls", str(self.state / "s6.json")],
+                                 capture_output=True, text=True, check=True)
+            self.assertNotIn("(I)", acl.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL behavior")
+    def test_state_is_not_written_when_acl_restriction_fails(self):
+        with mock.patch.object(relay_module, "_restrict_windows_state", side_effect=OSError("ACL failed")):
+            with self.assertRaises(OSError):
+                relay_module.save_state("s10", {"recent_prompts": ["private prompt"]})
+        self.assertFalse((self.state / "s10.json").exists())
+        self.assertFalse(any(self.state.glob("s10.json.*.tmp")))
 
     # ---- handoff grading ----
 

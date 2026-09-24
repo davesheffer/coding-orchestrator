@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -74,6 +75,21 @@ class ClientTests(unittest.TestCase):
     def test_noul_rejects_malformed(self):
         for answers in (None, {}, {"q": {}}, {"q": {"noul": "x"}}, {"q": {"noul": 1.5}}):
             self.assertIsNone(jev_client.noul(answers, "q"))
+
+    def test_http_classify_disables_redirects(self):
+        cfg = self.config({})
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"answers": {}}'
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(jev_client.urllib.request, "build_opener", return_value=opener) as build:
+            self.assertEqual(jev_client.http_classify({}, cfg, "test-key"), {"answers": {}})
+        handler_type = build.call_args.args[0]
+        self.assertTrue(issubclass(handler_type, urllib.request.HTTPRedirectHandler))
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+        self.assertIsNone(handler_type().redirect_request(request, None, 302, "Found", {},
+                                                          "https://untrusted.invalid/collect"))
 
 
 if __name__ == "__main__":

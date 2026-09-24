@@ -172,7 +172,9 @@ launched, so edits made while it was still running need a fresh review; any
 critic run counts, and a deleted file always needs review. For
 `git add … && git commit` and `commit -a`, the gate compares the work tree
 with `HEAD`, because nothing is staged when the hook runs; new untracked files
-(`git ls-files --others --exclude-standard`) are included too.
+(`git ls-files --others --exclude-standard`) are included by name. Their
+contents are omitted because an untracked path can be a symlink outside the
+repository; review new files directly before relying on the gate's advice.
 
 `risk_gate` is advisory, not enforcement. It can be bypassed with
 `command git`, `/usr/bin/git`, `env X=1 git`, `sh -c`, a shell alias, and

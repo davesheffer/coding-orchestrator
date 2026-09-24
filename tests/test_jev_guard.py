@@ -202,7 +202,7 @@ class GateTests(unittest.TestCase):
         body = self.calls[0][0]
         self.assertIn("new.py", body["state"]["files"])
         self.assertIn("new.py", body["state"]["diff"])
-        self.assertIn("rm -rf", body["state"]["diff"])
+        self.assertNotIn("rm -rf", body["state"]["diff"])
 
     def test_untracked_new_file_included_in_commit_all_flag(self):
         (self.repo / "a.txt").write_text("three\n", encoding="utf-8")
@@ -220,7 +220,67 @@ class GateTests(unittest.TestCase):
         self.assertIsNotNone(out)
         body = self.calls[0][0]
         self.assertIn("sub/new.py", body["state"]["files"])
-        self.assertIn("token", body["state"]["diff"])
+        self.assertNotIn("token", body["state"]["diff"])
+        self.assertIn("untracked content omitted", body["state"]["diff"])
+
+    def test_untracked_symlink_does_not_send_target_contents(self):
+        outside = Path(self.repo.parent) / "outside-secret.txt"
+        outside.write_text("PRIVATE_OUTSIDE_CONTENT", encoding="utf-8")
+        try:
+            (self.repo / "new-link").symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation is unavailable")
+        os.utime(outside, (time.time() - 100, time.time() - 100))
+        jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                         lambda s: s.update(critic_ts=time.time() - 50))
+        self.gate(self.payload("git add -A && git commit -m x"), classify_fn=self.classify())
+        self.assertEqual(len(self.calls), 1)
+        diff = self.calls[0][0]["state"]["diff"]
+        self.assertIn("new-link", diff)
+        self.assertNotIn("PRIVATE_OUTSIDE_CONTENT", diff)
+
+    def test_untracked_edit_requires_fresh_risk_check(self):
+        new_file = self.repo / "new.py"
+        new_file.write_text("first", encoding="utf-8")
+        payload = self.payload("git add -A && git commit -m x")
+        self.assertIsNotNone(self.gate(payload, classify_fn=self.classify()))
+        new_file.write_text("second, longer content", encoding="utf-8")
+        self.assertIsNotNone(self.gate(payload, classify_fn=self.classify()))
+        self.assertEqual(len(self.calls), 2)
+        self.assertNotIn("second, longer content", self.calls[1][0]["state"]["diff"])
+
+    def test_unicode_untracked_edit_requires_fresh_risk_check(self):
+        new_file = self.repo / "é.py"
+        new_file.write_text("first", encoding="utf-8")
+        payload = self.payload("git add -A && git commit -m x")
+        self.assertIsNotNone(self.gate(payload, classify_fn=self.classify()))
+        new_file.write_text("second, longer content", encoding="utf-8")
+        self.assertIsNotNone(self.gate(payload, classify_fn=self.classify()))
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("é.py", self.calls[1][0]["state"]["files"])
+
+    def test_staged_unicode_filename_is_not_git_quoted(self):
+        self.stage_change(name="é.py", content="safe change\n")
+        self.assertIsNotNone(self.gate(self.payload("git commit -m x"),
+                                       classify_fn=self.classify()))
+        self.assertIn("é.py", self.calls[0][0]["state"]["files"])
+
+    def test_git_output_preserves_carriage_returns(self):
+        output = b"carriage\rname.py\0"
+        completed = subprocess.CompletedProcess(["git"], 0, stdout=output, stderr=b"")
+        with mock.patch.object(jev.subprocess, "run", return_value=completed):
+            self.assertEqual(jev._run_git(["ls-files"], self.repo), "carriage\rname.py\0")
+
+    @unittest.skipIf(os.name == "nt", "Windows filenames cannot contain carriage returns")
+    def test_carriage_return_untracked_edit_requires_fresh_risk_check(self):
+        new_file = self.repo / "carriage\rname.py"
+        new_file.write_text("first", encoding="utf-8")
+        payload = self.payload("git add -A && git commit -m x")
+        self.assertIsNotNone(self.gate(payload, classify_fn=self.classify()))
+        new_file.write_text("second, longer content", encoding="utf-8")
+        self.assertIsNotNone(self.gate(payload, classify_fn=self.classify()))
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("carriage\rname.py", self.calls[1][0]["state"]["files"])
 
     def test_untracked_name_kept_when_diff_is_full(self):
         cfg = {**self.cfg, "max_diff_chars": 10}
@@ -248,7 +308,7 @@ class GateTests(unittest.TestCase):
         for command in ("cd sub && git add -A && git commit -m x",
                         "cd sub; git add b.txt; git commit -m x",
                         'cd "sub" && git commit -m x',
-                        f"cd {sub} && ls && git commit -m x"):
+                        f'cd "{sub.as_posix()}" && ls && git commit -m x'):
             self.calls.clear()
             # A fresh session each time: an identical diff in one session is a retry.
             self.gate(self.payload(command, session_id=f"cd{len(command)}"), classify_fn=self.classify())

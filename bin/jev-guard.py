@@ -253,13 +253,14 @@ def _run_git(args, cwd, deadline=None):
             return None
         timeout = max(0.1, min(timeout, remaining))
     try:
-        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
-                                 timeout=timeout)
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=timeout)
     except Exception:
         return None
     if result.returncode != 0:
         return None
-    return result.stdout
+    # Decode bytes ourselves: text=True translates CR/CRLF, which corrupts valid
+    # NUL-delimited Git filenames and can make retry metadata lookup miss a file.
+    return result.stdout.decode("utf-8", "surrogateescape")
 
 
 def _diff_range(op, all_flag, cwd, deadline=None):
@@ -273,18 +274,20 @@ def _diff_range(op, all_flag, cwd, deadline=None):
 
 def _diff_names(op, all_flag, cwd, deadline=None):
     if op == "commit":
-        args = ["diff", "HEAD", "--name-only"] if all_flag else ["diff", "--cached", "--name-only"]
+        args = (["diff", "HEAD", "--name-only", "-z"] if all_flag
+                else ["diff", "--cached", "--name-only", "-z"])
         out = _run_git(args, cwd, deadline)
         return out
-    out = _run_git(["diff", "@{u}...HEAD", "--name-only"], cwd, deadline)
+    out = _run_git(["diff", "@{u}...HEAD", "--name-only", "-z"], cwd, deadline)
     if out is not None:
         return out
-    return _run_git(["diff", "origin/main...HEAD", "--name-only"], cwd, deadline)
+    return _run_git(["diff", "origin/main...HEAD", "--name-only", "-z"], cwd, deadline)
 
 
 def _untracked_files(cwd, deadline=None):
-    out = _run_git(["ls-files", "--others", "--exclude-standard", "--full-name"], cwd, deadline)
-    return [n for n in (out or "").splitlines() if n]
+    out = _run_git(["ls-files", "--others", "--exclude-standard", "--full-name", "-z"],
+                   cwd, deadline)
+    return [n for n in (out or "").split("\0") if n]
 
 
 def _dash_c_dir(opts_segment):
@@ -369,13 +372,14 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     diff = _diff_range(op, all_flag, cwd, deadline) or ""
     names_out = _diff_names(op, all_flag, cwd, deadline)
     names_failed = names_out is None
-    names = [n for n in (names_out or "").splitlines() if n]
+    names = [n for n in (names_out or "").split("\0") if n]
     toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline)
     toplevel = toplevel.strip() if toplevel else None
 
     # `git add … && git commit` / commit -a/--all diff the work tree against HEAD,
     # which misses brand-new untracked files; fold those in as synthetic diff blocks.
     untracked_overflow = False
+    untracked_identity = []
     if all_flag:
         max_diff_chars = int(cfg.get("max_diff_chars") or 0)
         seen = set(names)
@@ -388,16 +392,19 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
             # Always track the name so its mtime counts for critic coverage, even
             # once the diff text is full.
             names.append(name)
+            file_path = Path(toplevel) / name if toplevel else Path(cwd) / name
+            try:
+                info = file_path.lstat()  # never follow an untracked symlink
+                untracked_identity.append((name, info.st_mode, info.st_size,
+                                           info.st_mtime_ns, info.st_ctime_ns))
+            except OSError:
+                untracked_identity.append((name, None))
             room = min(max_diff_chars or 1 << 16, 1 << 16) - len(diff)
             if room <= 0:
                 continue
-            file_path = Path(toplevel) / name if toplevel else Path(cwd) / name
-            try:
-                with open(file_path, "rb") as handle:
-                    content = handle.read(room).decode("utf-8", "replace")
-            except OSError:
-                content = ""
-            diff += f"new file: {name}\n{content}"[:room]
+            # Untracked paths can be symlinks to files outside the repository.
+            # Keep the name for review, but never open their contents here.
+            diff += f"new file: {name}\n[untracked content omitted]\n"[:room]
 
     if not diff:
         return None
@@ -413,7 +420,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         for name in names:
             path = Path(toplevel) / name if toplevel else Path(name)
             try:
-                mtimes.append(path.stat().st_mtime)
+                mtimes.append(path.lstat().st_mtime)
             except OSError:
                 # Deleted (or otherwise unreadable) files have no mtime to compare
                 # against critic_ts, so treat them as needing a fresh review.
@@ -422,7 +429,10 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         covered = (not names_failed and all_stat_ok and not untracked_overflow
                    and (critic_ts >= max(mtimes) if mtimes else True))
 
-    diff_hash = hashlib.sha256(diff.encode("utf-8", "replace")).hexdigest()
+    # Keep local metadata in the retry identity so editing an omitted untracked
+    # file requires a new check, without transmitting its contents to Jev.
+    retry_identity = (diff, untracked_identity)
+    diff_hash = hashlib.sha256(repr(retry_identity).encode("utf-8", "replace")).hexdigest()
     start = time.monotonic()
 
     def log(decision, choice=None, confidence=None, needs_review_p=None):
