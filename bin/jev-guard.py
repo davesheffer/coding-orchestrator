@@ -39,9 +39,11 @@ the gate hook's 10 s timeout even in the worst case (4 s of git plus a 4 s
 classify_fn call).
 Nothing here logs diff text, file names, commands, or report text.
 """
+import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -51,8 +53,18 @@ from pathlib import Path
 
 try:
     import fcntl
-except ImportError:  # e.g. Windows: update_state falls back to unlocked writes.
+except ImportError:  # e.g. Windows: update_state locks with msvcrt instead.
     fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+# How long update_state waits for the Windows lock before giving up (the hook fails
+# open), and how often a Windows tmp.replace is retried while another process has the
+# state file open.
+MSVCRT_LOCK_SECONDS = 2.0
+REPLACE_ATTEMPTS = 5
+REPLACE_RETRY_SECONDS = 0.05
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
@@ -75,31 +87,51 @@ GIT_GLOBAL_OPTS = (r"(?:\s+(?:-C\s+" + _OPT_ARG + r"|-c\s+" + _OPT_ARG + r"|"
                     + _LONG_VALUE_OPTS + r"(?:=\S+|\s+(?!-)" + _OPT_ARG + r")|"
                     r"--(?!(?:git-dir|work-tree|namespace|super-prefix|config-env)(?![\w-]))"
                     r"[\w-]+(?:=\S+)?))*")
-# An env-assignment prefix (e.g. `GIT_EDITOR=true git commit`, `A=1 B=2 git push`)
-# before the `git` invocation itself.
-_ENV_PREFIX = r"(?:[A-Za-z_]\w*=\S*\s+)*"
+# What may start a command: the start, a ; & | ( operator, a newline, a `{` group or
+# a backtick substitution.
+_SEP = r"(?:^|[;&|(\n{`])"
+# Env-assignment (e.g. `GIT_EDITOR=true git commit`, `A=1 B=2 git push`), shell keyword
+# (then/do/else) and wrapper (time/exec/command/env/nice/sudo, with their -flags and a
+# numeric flag value such as `nice -n 5`) prefixes before the `git` invocation itself.
+_ENV_PREFIX = (r"(?:(?:then|do|else|time|exec|command|env|nice|sudo)\s+(?:-[\w-]+(?:\s+\d+)?\s+)*"
+               r"|[A-Za-z_]\w*=\S*\s+)*")
+# `git`, `git.exe`, or a path to either (`/usr/bin/git`, `C:\Git\cmd\git.exe`).
+_GIT = r"(?:\S*[/\\])?git(?:\.exe)?"
 GIT_COMMAND_RE = re.compile(
-    r"(?:^|[;&|(\n])\s*" + _ENV_PREFIX + r"git(" + GIT_GLOBAL_OPTS + r")\s+(commit|push)\b")
-GIT_ADD_RE = re.compile(r"(?:^|[;&|(\n])\s*" + _ENV_PREFIX + r"git" + GIT_GLOBAL_OPTS + r"\s+add\b")
+    _SEP + r"\s*" + _ENV_PREFIX + _GIT + r"(" + GIT_GLOBAL_OPTS + r")\s+(commit|push)\b")
+GIT_ADD_RE = re.compile(_SEP + r"\s*" + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS + r"\s+add\b")
+# Git Bash / MSYS drive paths (`/c/Users/...`), translated to `C:/...` on Windows.
+MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(/|$)")
 # -a/--all, or a short-flag cluster containing a (e.g. -am), within the commit segment.
 ALL_FLAG_RE = re.compile(r"(?:^|\s)(--all|-[A-Za-z]*a[A-Za-z]*)(?=\s|$)")
 # `cd <dir>` as its own segment (split on &&, ;, ||, or a `(` subshell opener) before
 # the git segment.
 CD_RE = re.compile(r"^\s*cd\s+(.+?)\s*$")
-# `<<` but not a here-string (`<<<`) or the tail of one.
-HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)-?\s*['\"]?(\w+)['\"]?")
+# A heredoc operator (`<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`, `<<\WORD`); the
+# scanner in _strip_heredocs_and_quotes only tries it outside quotes and comments, and
+# never on a here-string (`<<<`).
+HEREDOC_RE = re.compile(r"<<-?[ \t]*(?:'(\w+)'|\"(\w+)\"|\\?(\w+))")
 # More untracked files than this are not folded in; the change then always needs review.
 MAX_UNTRACKED = 1000
 # Quoted strings are stripped so words inside them (e.g. `echo "git commit"`) can't be
 # mistaken for a real command, EXCEPT a quoted -C/-c argument (e.g. -C "dir with
 # space") or a `cd "dir"` target, which fix 2 needs intact to resolve the gate's cwd.
-QUOTED_RE = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
 # A quoted string is preserved only when it is the value of a literal `-C`/`-c` that
 # sits in a git global-options segment (i.e. `git`, zero or more already-matched global
 # options, then `-C `/`-c `, right before the quote) — not an arbitrary `-c "..."` in
 # unrelated text (e.g. `echo -c "x; git commit -m y"`).
-_GIT_DASH_C_PREFIX_RE = re.compile(r"(?:^|[;&|(\n])\s*git" + GIT_GLOBAL_OPTS + r"\s+-[Cc]\s+$")
-_CD_PREFIX_RE = re.compile(r"(?:^|[;&|(\n])\s*cd\s+$")
+_GIT_DASH_C_PREFIX_RE = re.compile(
+    _SEP + r"\s*" + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS + r"\s+-[Cc]\s+$")
+_CD_PREFIX_RE = re.compile(_SEP + r"\s*cd\s+$")
+# Staged files whose hunks are never sent to Jev (matched case-insensitively against the
+# file's base name); only the file name and a `[redacted]` marker go out.
+REDACT_FILE_PATTERNS = (".env*", "*.pem", "*.key", "*secret*", "id_rsa*", "*.p12", "*.pfx")
+# Token shapes scrubbed from diff and report text before it is sent.
+SECRET_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"
+    r"|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}"
+    r"|xox[abpr]-[\w-]{10,}", re.DOTALL)
+DIFF_HEADER_RE = re.compile(r"^diff --git (?:\"?a/(.*?)\"?) (?:\"?b/(.*?)\"?)$")
 GIT_SUBPROCESS_BUDGET_SECONDS = 4.0
 
 RISK_CRITERIA = {
@@ -153,7 +185,40 @@ def save_session_state(session_id, state, state_dir=STATE_DIR):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     tmp.write_text(json.dumps(state), encoding="utf-8")
-    tmp.replace(path)
+    _replace(tmp, path)
+
+
+def _replace(tmp, path):
+    """tmp.replace(path), retried briefly on PermissionError (Windows refuses the
+    replace while another process has `path` open); the tmp file is removed if it
+    still fails."""
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            time.sleep(REPLACE_RETRY_SECONDS)
+
+
+def _msvcrt_lock(lock_file):
+    """Lock the first byte of `lock_file` (Windows), retrying for MSVCRT_LOCK_SECONDS;
+    raises OSError if another process still holds it."""
+    lock_file.seek(0)
+    deadline = time.monotonic() + MSVCRT_LOCK_SECONDS
+    while True:
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 def update_state(path, mutate_fn):
@@ -161,18 +226,24 @@ def update_state(path, mutate_fn):
 
     `mutate_fn(state)` mutates a freshly reloaded on-disk state dict in place (or
     returns a replacement dict) so a concurrent writer's unrelated keys survive even
-    if this invocation's load was stale. If `fcntl` is unavailable (e.g. Windows), the
-    update runs without a lock: still correct for a single process, best-effort under
-    real concurrency.
+    if this invocation's load was stale. The lock is `fcntl.flock`, or `msvcrt.locking`
+    on Windows. If neither is available, the update runs without a lock: still
+    correct for a single process, best-effort under real concurrency.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
     lock_file = None
+    locked = False
     try:
         if fcntl is not None:
             lock_file = open(lock_path, "a+")
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            locked = True
+        elif msvcrt is not None:
+            lock_file = open(lock_path, "a+")
+            _msvcrt_lock(lock_file)
+            locked = True
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(state, dict):
@@ -184,62 +255,143 @@ def update_state(path, mutate_fn):
             state = result
         tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
         tmp.write_text(json.dumps(state), encoding="utf-8")
-        tmp.replace(path)
+        _replace(tmp, path)
     finally:
         if lock_file is not None:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
+            if locked:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    else:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
             lock_file.close()
 
 
-def _strip_quotes(text):
-    """Remove quoted strings from `text`, except one immediately preceded by a literal
-    `-C`/`-c` inside a git global-options segment, or by a `cd`, which `_cd_prefix_dir`
-    and `_dash_c_dir` need intact to resolve the gate's cwd."""
-    out = []
-    pos = 0
-    for m in QUOTED_RE.finditer(text):
-        prefix = text[:m.start()]
-        if _GIT_DASH_C_PREFIX_RE.search(prefix) or _CD_PREFIX_RE.search(prefix):
-            continue  # keep this quote: append nothing, let it fall through below
-        out.append(text[pos:m.start()])
-        pos = m.end()
-    out.append(text[pos:])
-    return "".join(out)
+def _quote_end(text, start):
+    """Index just past the quoted string opening at `start`, or None if unterminated.
+    Single quotes take no escapes; double quotes honour backslash escapes."""
+    if text[start] == "'":
+        end = text.find("'", start + 1)
+        return None if end == -1 else end + 1
+    i = start + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return i + 1
+        i += 1
+    return None
 
 
 def _strip_heredocs_and_quotes(command):
-    """Remove heredoc bodies and quoted strings so text inside them (e.g. `echo "git
-    commit"` or a `cat <<EOF ... git commit ... EOF` body) can't be mistaken for a real
-    command. `git commit -m "msg"` still matches: only the quoted message is removed,
-    and the verb sits outside it."""
+    """Remove heredoc bodies, comments and quoted strings so text inside them (e.g.
+    `echo "git commit"` or a `cat <<EOF ... git commit ... EOF` body) can't be mistaken
+    for a real command. `git commit -m "msg"` still matches: only the quoted message is
+    removed, and the verb sits outside it.
+
+    A small left-to-right scanner rather than regexes, so a backslash escape outside
+    quotes (`don\\'t`) can't open a phantom quote, a `<<` inside quotes or a comment
+    isn't taken for a heredoc, and a `\\`-newline continuation joins its lines. A quoted
+    string is kept when it is the value of a literal git `-C`/`-c` or a `cd` target,
+    which `_cd_prefix_dir` and `_dash_c_dir` need intact to resolve the gate's cwd."""
     out = []
-    pos = 0
-    for m in HEREDOC_RE.finditer(command):
-        if m.start() < pos:
-            continue  # inside a heredoc body already removed
-        word = m.group(1)
-        end_re = re.compile(r"\n[ \t]*" + re.escape(word) + r"[ \t]*(?=\n|$)")
-        end = end_re.search(command, m.end())
-        if not end:
-            # Not a real heredoc (e.g. `1<<3`): keep the text; a spurious check is
-            # safer than hiding a later git command.
+    pending = []  # heredoc terminator words whose bodies start at the next newline
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            if command.startswith("\n", i + 1):
+                i += 2  # line continuation: `git \<newline>commit` is one command
+                continue
+            out.append(command[i:i + 2])
+            i += 2
             continue
-        # The rest of the `<<WORD` line itself (e.g. `&& git commit` or `| tee out;
-        # git push`) is not part of the heredoc body: only what follows the next
-        # newline, up through the terminator line, is.
-        next_newline = command.find("\n", m.end())
-        if next_newline == -1:
-            out.append(command[pos:m.end()])
-            pos = end.end()
+        if ch in "'\"":
+            end = _quote_end(command, i)
+            if end is None:
+                # Unbalanced quote: keep the rest; a spurious check is safer than
+                # hiding a later git command.
+                out.append(command[i:])
+                break
+            prefix = "".join(out)
+            if _GIT_DASH_C_PREFIX_RE.search(prefix) or _CD_PREFIX_RE.search(prefix):
+                out.append(command[i:end])
+            i = end
             continue
-        out.append(command[pos:next_newline])
-        pos = end.end()
-    out.append(command[pos:])
-    stripped = "".join(out)
-    return _strip_quotes(stripped)
+        if ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
+            end = command.find("\n", i)
+            i = n if end == -1 else end
+            continue
+        if command.startswith("<<<", i):
+            out.append("<<<")  # a here-string, not a heredoc
+            i += 3
+            continue
+        if command.startswith("<<", i):
+            m = HEREDOC_RE.match(command, i)
+            if m:
+                pending.append(m.group(1) or m.group(2) or m.group(3))
+                out.append(m.group(0))
+                i = m.end()
+                continue
+        if ch == "\n" and pending:
+            # The rest of the `<<WORD` line itself (e.g. `&& git commit` or `| tee out;
+            # git push`) was scanned above; the bodies start here, one per operator.
+            out.append(ch)
+            i += 1
+            for word in pending:
+                end = re.compile(r"(?m)^[ \t]*" + re.escape(word) + r"[ \t]*$").search(command, i)
+                # No terminator: not a real heredoc (e.g. `$((1<<3))`), so keep the
+                # text; a spurious check is safer than hiding a later git command.
+                if end:
+                    i = end.end()
+            pending = []
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _native_path(path):
+    """On Windows, translate a Git Bash / MSYS drive path (`/c/Users/me`) to `C:/Users/me`
+    and expand `~`, so it can be joined with the payload cwd."""
+    path = os.path.expanduser(path)
+    if os.name == "nt":
+        path = MSYS_DRIVE_RE.sub(lambda m: m.group(1).upper() + ":/", path, count=1)
+    return path
+
+
+def _redact_diff(diff):
+    """Replace the hunks of files matching REDACT_FILE_PATTERNS with `[redacted]`,
+    keeping each file's header lines (and so its name)."""
+    out = []
+    mode = "keep"  # "keep", "header" (a redacted file's header lines) or "drop" (its hunks)
+    for line in diff.splitlines(keepends=True):
+        header = DIFF_HEADER_RE.match(line.rstrip("\r\n"))
+        if header or line.startswith("new file: "):  # the latter: untracked-file blocks
+            names = [posixpath.basename(name) for name in (header.groups() if header else ())
+                     if name]
+            redact = any(fnmatch.fnmatchcase(name.lower(), pattern)
+                         for name in names for pattern in REDACT_FILE_PATTERNS)
+            mode = "header" if redact else "keep"
+            out.append(line)
+        elif mode == "header":
+            if line.startswith(("@@", "Binary files", "GIT binary patch")):
+                out.append("[redacted]\n")
+                mode = "drop"
+            else:
+                out.append(line)
+        elif mode == "keep":
+            out.append(line)
+    return "".join(out)
+
+
+def _scrub(text):
+    """Replace common secret token shapes (API keys, tokens, private key blocks)."""
+    return SECRET_RE.sub("[redacted]", text)
 
 
 def _run_git(args, cwd, deadline=None):
@@ -263,25 +415,42 @@ def _run_git(args, cwd, deadline=None):
     return result.stdout.decode("utf-8", "surrogateescape")
 
 
-def _diff_range(op, all_flag, cwd, deadline=None):
+def _push_base(cwd, deadline=None):
+    """The ref a push is compared against: the upstream, else the push remote's
+    (remote.pushDefault, or origin) default branch from `refs/remotes/<remote>/HEAD`,
+    else origin/main, else origin/master; None when none resolves."""
+    if _run_git(["rev-parse", "--verify", "--quiet", "@{u}"], cwd, deadline) is not None:
+        return "@{u}"
+    remote = (_run_git(["config", "--get", "remote.pushDefault"], cwd, deadline) or "").strip()
+    if not remote or remote.startswith("-"):
+        remote = "origin"
+    head = _run_git(["symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"],
+                    cwd, deadline)
+    if head and head.strip():
+        return head.strip()
+    for ref in ("origin/main", "origin/master"):
+        if _run_git(["rev-parse", "--verify", "--quiet", ref], cwd, deadline) is not None:
+            return ref
+    return None
+
+
+def _diff_range(op, all_flag, cwd, deadline=None, base=None):
     if op == "commit":
         return _run_git(["diff", "HEAD"] if all_flag else ["diff", "--cached"], cwd, deadline)
-    upstream = _run_git(["diff", "@{u}...HEAD"], cwd, deadline)
-    if upstream is not None:
-        return upstream
-    return _run_git(["diff", "origin/main...HEAD"], cwd, deadline)
+    if base is None:
+        return None
+    return _run_git(["diff", f"{base}...HEAD"], cwd, deadline)
 
 
-def _diff_names(op, all_flag, cwd, deadline=None):
+def _diff_names(op, all_flag, cwd, deadline=None, base=None):
     if op == "commit":
         args = (["diff", "HEAD", "--name-only", "-z"] if all_flag
                 else ["diff", "--cached", "--name-only", "-z"])
         out = _run_git(args, cwd, deadline)
         return out
-    out = _run_git(["diff", "@{u}...HEAD", "--name-only", "-z"], cwd, deadline)
-    if out is not None:
-        return out
-    return _run_git(["diff", "origin/main...HEAD", "--name-only", "-z"], cwd, deadline)
+    if base is None:
+        return None
+    return _run_git(["diff", f"{base}...HEAD", "--name-only", "-z"], cwd, deadline)
 
 
 def _untracked_files(cwd, deadline=None):
@@ -314,9 +483,9 @@ def _cd_prefix_dir(command, git_start):
     # separator; strip it before splitting into &&/;/|| segments.
     prefix = command[:git_start].rstrip().rstrip("&|;").rstrip()
     result = None
-    # A `(` subshell opener is also a segment separator, so `(cd sub && git commit)`
-    # still finds the `cd sub` segment.
-    for segment in re.split(r"&&|\|\||;|\n|\(", prefix):
+    # A `(` subshell opener, `{` group or backtick is also a segment separator, so
+    # `(cd sub && git commit)` still finds the `cd sub` segment.
+    for segment in re.split(r"&&|\|\||;|\n|\(|\{|`", prefix):
         m = CD_RE.match(segment)
         if not m:
             continue
@@ -328,13 +497,35 @@ def _cd_prefix_dir(command, git_start):
         tokens = [t for t in tokens if not t.startswith("-") and not re.match(r"^\d*[<>]", t)]
         if len(tokens) != 1:
             continue
-        target = os.path.expanduser(tokens[0])
+        target = _native_path(tokens[0])
         result = os.path.join(result, target) if result else target
     return result
 
 
+def _git_target(command, match, cwd):
+    """(op, cwd, all_flag) for one GIT_COMMAND_RE match in the stripped command."""
+    opts_segment, op = match.group(1), match.group(2)
+    # The shell resolves -C relative to any directory an earlier cd moved to.
+    cd_dir = _cd_prefix_dir(command, match.start())
+    if cd_dir:
+        cwd = os.path.join(cwd, cd_dir)
+    dash_c_dir = _dash_c_dir(opts_segment)
+    if dash_c_dir:
+        cwd = os.path.join(cwd, _native_path(dash_c_dir))
+    # `git add … && git commit` stages nothing until it runs, so compare the work tree
+    # with HEAD instead of the (still empty) index; likewise for commit -a/--all.
+    segment = re.split(r"[;&|\n]", command[match.end():], maxsplit=1)[0]
+    all_flag = op == "commit" and (bool(ALL_FLAG_RE.search(segment))
+                                   or bool(GIT_ADD_RE.search(command[:match.start() + 1])))
+    return op, cwd, all_flag
+
+
 def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR):
     """Return the PreToolUse hook output dict, or None to leave the command unchanged.
+
+    Every git commit/push in the command is gated together: with a push anywhere the
+    operation is a push, and the diff sent is each commit's pending diff followed by
+    each push's unpushed range.
 
     All git subprocess calls in one invocation share a wall-clock budget
     (GIT_SUBPROCESS_BUDGET_SECONDS) instead of each getting its own 2 s, so a worst
@@ -350,49 +541,57 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     if not isinstance(raw_command, str):
         return None
     command = _strip_heredocs_and_quotes(raw_command)
-    match = GIT_COMMAND_RE.search(command)
-    if not match:
+    base_cwd = _native_path(payload.get("cwd") or os.getcwd())
+    targets = []
+    for match in GIT_COMMAND_RE.finditer(command):
+        target = _git_target(command, match, base_cwd)
+        if target not in targets:
+            targets.append(target)
+    if not targets:
         return None
-    opts_segment, op = match.group(1), match.group(2)
-    cwd = payload.get("cwd") or os.getcwd()
-    # The shell resolves -C relative to any directory an earlier cd moved to.
-    cd_dir = _cd_prefix_dir(command, match.start())
-    if cd_dir:
-        cwd = os.path.join(cwd, cd_dir)
-    dash_c_dir = _dash_c_dir(opts_segment)
-    if dash_c_dir:
-        cwd = os.path.join(cwd, os.path.expanduser(dash_c_dir))
-    # `git add … && git commit` stages nothing until it runs, so compare the work tree
-    # with HEAD instead of the (still empty) index; likewise for commit -a/--all.
-    segment = re.split(r"[;&|\n]", command[match.end():], maxsplit=1)[0]
-    all_flag = op == "commit" and (bool(ALL_FLAG_RE.search(segment))
-                                   or bool(GIT_ADD_RE.search(command[:match.start() + 1])))
+    op = "push" if any(t[0] == "push" for t in targets) else "commit"
+    # Commits run before the push that follows them, so their diffs come first.
+    targets.sort(key=lambda t: t[0] == "push")
 
     deadline = time.monotonic() + GIT_SUBPROCESS_BUDGET_SECONDS
-    diff = _diff_range(op, all_flag, cwd, deadline) or ""
-    names_out = _diff_names(op, all_flag, cwd, deadline)
-    names_failed = names_out is None
-    names = [n for n in (names_out or "").split("\0") if n]
-    toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline)
-    toplevel = toplevel.strip() if toplevel else None
-
-    # `git add … && git commit` / commit -a/--all diff the work tree against HEAD,
-    # which misses brand-new untracked files; fold those in as synthetic diff blocks.
+    max_diff_chars = int(cfg.get("max_diff_chars") or 0)
+    diff = ""
+    names = []
+    paths = []  # where each name's mtime is read for critic coverage
+    names_failed = False
     untracked_overflow = False
     untracked_identity = []
-    if all_flag:
-        max_diff_chars = int(cfg.get("max_diff_chars") or 0)
-        seen = set(names)
+    for target_op, cwd, all_flag in targets:
+        base = _push_base(cwd, deadline) if target_op == "push" else None
+        part = _diff_range(target_op, all_flag, cwd, deadline, base)
+        if part is None:
+            continue
+        names_out = _diff_names(target_op, all_flag, cwd, deadline, base)
+        names_failed = names_failed or names_out is None
+        part_names = [n for n in (names_out or "").split("\0") if n]
+        toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline)
+        toplevel = toplevel.strip() if toplevel else None
+        diff += part
+        for name in part_names:
+            names.append(name)
+            paths.append(Path(toplevel) / name if toplevel else Path(name))
+
+        # `git add … && git commit` / commit -a/--all diff the work tree against HEAD,
+        # which misses brand-new untracked files; fold those in as synthetic diff blocks.
+        if not all_flag:
+            continue
+        seen = set(part_names)
         untracked = _untracked_files(cwd, deadline)
-        untracked_overflow = len(untracked) > MAX_UNTRACKED
+        untracked_overflow = untracked_overflow or len(untracked) > MAX_UNTRACKED
         for name in untracked[:MAX_UNTRACKED]:
             if name in seen:
                 continue
             seen.add(name)
             # Always track the name so its mtime counts for critic coverage, even
             # once the diff text is full.
-            names.append(name)
             file_path = Path(toplevel) / name if toplevel else Path(cwd) / name
+            names.append(name)
+            paths.append(file_path)
             try:
                 info = file_path.lstat()  # never follow an untracked symlink
                 untracked_identity.append((name, info.st_mode, info.st_size,
@@ -417,8 +616,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     if isinstance(critic_ts, (int, float)):
         mtimes = []
         all_stat_ok = True
-        for name in names:
-            path = Path(toplevel) / name if toplevel else Path(name)
+        for path in paths:
             try:
                 mtimes.append(path.lstat().st_mtime)
             except OSError:
@@ -435,12 +633,14 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     diff_hash = hashlib.sha256(repr(retry_identity).encode("utf-8", "replace")).hexdigest()
     start = time.monotonic()
 
-    def log(decision, choice=None, confidence=None, needs_review_p=None):
+    def log(decision, choice=None, confidence=None, needs_review_p=None, **extra):
         if not log_fn:
             return
-        log_fn({"ts": timestamp(), "feature": "risk_gate", "op": op, "decision": decision,
-                "risk": choice, "confidence": confidence, "needs_review": needs_review_p,
-                "files": len(names), "diff_chars": len(diff), "latency_ms": elapsed_ms(start)})
+        entry = {"ts": timestamp(), "feature": "risk_gate", "op": op, "decision": decision,
+                 "risk": choice, "confidence": confidence, "needs_review": needs_review_p,
+                 "files": len(names), "diff_chars": len(diff), "latency_ms": elapsed_ms(start)}
+        entry.update(extra)
+        log_fn(entry)
 
     if covered:
         log("covered")
@@ -453,21 +653,34 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
 
     ask_state = {"operation": op, "files": names[:200]}
     if cfg.get("send_diff"):
-        ask_state["diff"] = diff[: cfg["max_diff_chars"]]
+        # Hunks of secret-looking files and common token shapes never leave the machine.
+        ask_state["diff"] = _scrub(_redact_diff(diff))[: cfg["max_diff_chars"]]
     questions = {
         "risk": {"type": "choice", "instructions": RISK_INSTRUCTIONS, "criteria": RISK_CRITERIA},
         "needs_review": {"type": "noul", "instructions": NEEDS_REVIEW_INSTRUCTIONS},
     }
-    answers = ask(cfg, "risk_gate", ask_state, questions, classify_fn)
+    errs = []
+    answers = ask(cfg, "risk_gate", ask_state, questions, classify_fn, errors=errs)
     if answers is None:
-        log("allow")
+        if errs:
+            log("allow", reason="unavailable", error=errs[0])
+        else:
+            log("allow")
         return None
     try:
         choice = answers["risk"]["choice"]
-        confidence = float(answers["risk"].get("confidence"))
     except Exception:
+        choice = None
+    if not isinstance(choice, str):
         log("allow")
         return None
+    # Confidence is only logged, so a missing, null or non-finite one doesn't skip the gate.
+    try:
+        confidence = float(answers["risk"].get("confidence"))
+    except Exception:
+        confidence = None
+    if confidence is not None and not 0.0 <= confidence <= 1.0:
+        confidence = None
     needs_review_p = noul(answers, "needs_review")
 
     risky = (choice != "none" and needs_review_p is not None
@@ -479,8 +692,13 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     def add_denied(s):
         s["denied"] = ((s.get("denied") or []) + [diff_hash])[-20:]
 
-    update_state(session_state_path(session_id, state_dir), add_denied)
-    log("deny", choice, confidence, needs_review_p)
+    extra = {}
+    try:
+        update_state(session_state_path(session_id, state_dir), add_denied)
+    except Exception as exc:
+        # Still deny: without the saved hash, the identical retry is simply checked again.
+        extra["state_error"] = type(exc).__name__
+    log("deny", choice, confidence, needs_review_p, **extra)
     reason = (f"[jev risk gate] This {op} looks risky ({choice}, p={needs_review_p:.2f}) and no "
               "critic has reviewed these files since they last changed. Run the critic subagent "
               "on this diff per CLAUDE.md, resolve its findings, then retry. If review is not "
@@ -526,7 +744,7 @@ def _parse_sections(text):
     return sections
 
 
-def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
+def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, errors=None):
     """Parse RESULT/EVIDENCE/CONFIDENCE/UNVERIFIED sections and ask Jev whether the
     report is weak. Returns (reasons, reason_codes, supported, material_gap).
 
@@ -537,7 +755,8 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
 
     Sections are parsed from the FULL text (a long report's RESULT/EVIDENCE/CONFIDENCE/
     UNVERIFIED block may come after `max_report_chars` of findings), so truncation is
-    only applied to what's actually sent to the classifier below."""
+    only applied to what's actually sent to the classifier below, after common token
+    shapes are scrubbed. `errors` is passed to `ask` (a failed call appends its reason)."""
     max_chars = cfg["max_report_chars"]
 
     sections = _parse_sections(text)
@@ -557,16 +776,16 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
     if not missing:
         quarter = max_chars // 4
         ask_state = {
-            "result": sections["RESULT"][:quarter],
-            "evidence": sections["EVIDENCE"][:quarter],
-            "unverified": sections["UNVERIFIED"][:quarter],
-            "confidence": sections["CONFIDENCE"][:quarter],
+            "result": _scrub(sections["RESULT"])[:quarter],
+            "evidence": _scrub(sections["EVIDENCE"])[:quarter],
+            "unverified": _scrub(sections["UNVERIFIED"])[:quarter],
+            "confidence": _scrub(sections["CONFIDENCE"])[:quarter],
         }
         questions = {
             "supported": {"type": "noul", "instructions": SUPPORTED_INSTRUCTIONS},
             "material_gap": {"type": "noul", "instructions": MATERIAL_GAP_INSTRUCTIONS},
         }
-        answers = ask(cfg, "report_check", ask_state, questions, classify_fn)
+        answers = ask(cfg, "report_check", ask_state, questions, classify_fn, errors=errors)
         if answers is not None:
             supported = noul(answers, "supported")
             material_gap = noul(answers, "material_gap")
@@ -605,16 +824,20 @@ def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
     session_id = payload.get("session_id")
     agent_id = payload.get("agent_id")
     start = time.monotonic()
+    errs = []
     reasons, reason_codes, supported, material_gap = _analyze_report(
-        message, cfg, classify_fn, confidence_heuristic=False)
+        message, cfg, classify_fn, confidence_heuristic=False, errors=errs)
 
     def log(decision):
         if not log_fn:
             return
-        log_fn({"ts": timestamp(), "feature": "report_check", "event": "handback",
-                "decision": decision, "subagent_type": role, "weak": bool(reasons),
-                "reasons": reason_codes, "supported": supported, "material_gap": material_gap,
-                "latency_ms": elapsed_ms(start)})
+        entry = {"ts": timestamp(), "feature": "report_check", "event": "handback",
+                 "decision": decision, "subagent_type": role, "weak": bool(reasons),
+                 "reasons": reason_codes, "supported": supported, "material_gap": material_gap,
+                 "latency_ms": elapsed_ms(start)}
+        if errs:
+            entry.update(reason="unavailable", error=errs[0])
+        log_fn(entry)
 
     if not reasons:
         log("ok")
@@ -630,7 +853,10 @@ def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
     def add_handback_denied(s):
         s["handback_denied"] = ((s.get("handback_denied") or []) + [key])[-50:]
 
-    update_state(session_state_path(session_id, state_dir), add_handback_denied)
+    try:
+        update_state(session_state_path(session_id, state_dir), add_handback_denied)
+    except Exception:
+        pass  # still deny; without the saved key the identical resend is checked again
     log("deny")
     reason = (f"[jev report check] Your report looks weak: {'; '.join(reasons)}. Before handing "
               "back, verify the key claims (run the check and cite the command and exit code) or "
@@ -685,7 +911,10 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                 s["critic_ts"] = max(s.get("critic_ts") or 0, launched)
                 s["critic_started"] = started
 
-            update_state(session_state_path(session_id, state_dir), set_critic_ts)
+            try:
+                update_state(session_state_path(session_id, state_dir), set_critic_ts)
+            except Exception:
+                pass  # persisting critic timestamps is best effort
         return None
 
     if tool_name not in ("Agent", "Task"):
@@ -709,7 +938,10 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                         started[agent_id] = now_value
                     s["critic_started"] = started
 
-                update_state(session_state_path(session_id, state_dir), add_critic_started)
+                try:
+                    update_state(session_state_path(session_id, state_dir), add_critic_started)
+                except Exception:
+                    pass  # persisting critic timestamps is best effort
             return None
         if status is not None and status != "completed":
             return None
@@ -741,7 +973,10 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
             s["critic_ts"] = max(s.get("critic_ts") or 0, launched)
             s["critic_started"] = started
 
-        update_state(session_state_path(session_id, state_dir), set_critic_ts_completed)
+        try:
+            update_state(session_state_path(session_id, state_dir), set_critic_ts_completed)
+        except Exception:
+            pass  # persisting critic timestamps is best effort
 
     if not feature_enabled(cfg, "report_check"):
         return None
@@ -750,7 +985,9 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
 
     text = _extract_report_text(completed)
     start = time.monotonic()
-    reasons, reason_codes, supported, material_gap = _analyze_report(text, cfg, classify_fn)
+    errs = []
+    reasons, reason_codes, supported, material_gap = _analyze_report(
+        text, cfg, classify_fn, errors=errs)
 
     if log_fn:
         entry = {"ts": timestamp(), "feature": "report_check", "event": "agent_done",
@@ -760,6 +997,8 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
         desc_hash = _desc_hash(tool_input.get("description"))
         if desc_hash:
             entry["desc_hash"] = desc_hash
+        if errs:
+            entry.update(reason="unavailable", error=errs[0])
         log_fn(entry)
 
     if not reasons:
@@ -774,7 +1013,8 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
 def main():
     try:
         mode = sys.argv[1] if len(sys.argv) > 1 else ""
-        payload = json.loads(sys.stdin.read() or "{}")
+        # Hook payloads are UTF-8 whatever the locale (e.g. cp1255 on Windows).
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
         cfg = load_config()
         if mode == "gate":
             output = gate(payload, cfg, log_fn=lambda entry: write_log(cfg, entry))

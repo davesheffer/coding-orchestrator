@@ -507,6 +507,176 @@ class GateTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 1.0)
         self.assertIsNotNone(jev.GIT_COMMAND_RE.search("git --work-tree x --git-dir=y --no-pager commit"))
 
+    # ---- command forms, multiple ops, push base, redaction ----
+
+    def test_command_forms_detected(self):
+        self.stage_change()
+        for i, command in enumerate((
+                "git.exe commit -m x",
+                "/usr/bin/git commit -m x",
+                "C:\\Git\\cmd\\git.exe commit -m x",
+                "{ git commit -m x; }",
+                "if true; then git commit -m x; fi",
+                "for i in 1; do git commit -m x; done",
+                "if false; then :; else git commit -m x; fi",
+                "time git commit -m x",
+                "exec git commit -m x",
+                "command git commit -m x",
+                "env GIT_EDITOR=true git commit -m x",
+                "nice -n 5 git commit -m x",
+                "sudo git commit -m x",
+                "echo don\\'t; git commit -m 'msg'",
+                'echo "<<EOF"\ngit commit -m x\nEOF\n',
+                "# <<EOF\ngit commit -m x\nEOF\n",
+                "echo `git commit -m x`",
+                "git \\\ncommit -m x",
+                "gi\\\nt commit -m x")):
+            self.calls.clear()
+            out = self.gate(self.payload(command, session_id=f"form{i}"), classify_fn=self.classify())
+            self.assertIsNotNone(out, command)
+            self.assertEqual(len(self.calls), 1, command)
+
+    def test_quoted_and_escaped_text_not_detected(self):
+        self.stage_change()
+        for i, command in enumerate((
+                'echo "git commit -m x"',
+                "echo 'don''t git commit'",
+                'echo "a \\" ; git commit -m x"',
+                "echo x # ; git commit -m x",
+                "cat <<'EOF'\n\"unbalanced\ngit commit -m y\nEOF\n",
+                "echo git.exe commit")):
+            out = self.gate(self.payload(command, session_id=f"nf{i}"), classify_fn=self.classify())
+            self.assertIsNone(out, command)
+        self.assertEqual(self.calls, [])
+
+    def test_native_path_translates_msys_drive_on_windows(self):
+        with mock.patch.object(jev.os, "name", "nt"):
+            self.assertEqual(jev._native_path("/c/Users/me/repo"), "C:/Users/me/repo")
+            self.assertEqual(jev._native_path("/d"), "D:/")
+            self.assertEqual(jev._native_path("/cd/x"), "/cd/x")
+            self.assertEqual(jev._native_path("rel/c/x"), "rel/c/x")
+        with mock.patch.object(jev.os, "name", "posix"):
+            self.assertEqual(jev._native_path("/c/Users/me"), "/c/Users/me")
+
+    @unittest.skipUnless(os.name == "nt", "Git Bash drive paths only apply on Windows")
+    def test_cd_msys_drive_path_sets_cwd(self):
+        self.stage_change()
+        resolved = self.repo.resolve()
+        msys = "/" + resolved.drive[0].lower() + resolved.as_posix()[2:]
+        out = self.gate(self.payload(f"cd {msys} && git commit -m x", cwd=tempfile.gettempdir()),
+                        classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        self.assertEqual(self.calls[0][0]["state"]["files"], ["a.txt"])
+
+    def add_remote(self, branch=None, upstream=True):
+        remote = self.repo.parent / "remote.git"
+        run_git(["init", "--bare", str(remote)], self.repo.parent)
+        run_git(["remote", "add", "origin", str(remote)], self.repo)
+        target = f"HEAD:refs/heads/{branch}" if branch else "HEAD"
+        run_git(["push", *(["-u"] if upstream else []), "origin", target], self.repo)
+        (self.repo / "pushed.txt").write_text("unpushed\n", encoding="utf-8")
+        run_git(["add", "pushed.txt"], self.repo)
+        run_git(["commit", "-m", "local"], self.repo)
+
+    def test_commit_and_push_sends_staged_and_unpushed_as_push(self):
+        self.add_remote()
+        self.stage_change()
+        out = self.gate(self.payload("git commit --amend --no-edit && git push -f"),
+                        classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        state = self.calls[0][0]["state"]
+        self.assertEqual(state["operation"], "push")
+        self.assertIn("+two", state["diff"])
+        self.assertIn("+unpushed", state["diff"])
+        self.assertEqual(sorted(state["files"]), ["a.txt", "pushed.txt"])
+        self.assertEqual(self.logs[-1]["op"], "push")
+
+    def test_push_base_uses_remote_head(self):
+        self.add_remote(branch="trunk", upstream=False)
+        run_git(["fetch", "origin"], self.repo)
+        run_git(["remote", "set-head", "origin", "trunk"], self.repo)
+        self.assertEqual(jev._push_base(self.repo), "origin/trunk")
+        out = self.gate(self.payload("git push origin HEAD:trunk"), classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        self.assertIn("+unpushed", self.calls[0][0]["state"]["diff"])
+
+    def test_push_base_falls_back_to_origin_master(self):
+        self.add_remote(branch="master", upstream=False)
+        run_git(["fetch", "origin"], self.repo)
+        self.assertEqual(jev._push_base(self.repo), "origin/master")
+        out = self.gate(self.payload("git push origin HEAD:master"), classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        self.assertEqual(self.calls[0][0]["state"]["files"], ["pushed.txt"])
+
+    def test_missing_null_or_nan_confidence_still_gates(self):
+        self.stage_change()
+        for i, confidence in enumerate(("missing", None, float("nan"), float("inf"))):
+            def fn(body, key, confidence=confidence):
+                response = risk_response()
+                if confidence == "missing":
+                    del response["answers"]["risk"]["confidence"]
+                else:
+                    response["answers"]["risk"]["confidence"] = confidence
+                return response
+            out = self.gate(self.payload("git commit -m x", session_id=f"conf{i}"), classify_fn=fn)
+            self.assertIsNotNone(out, confidence)
+            self.assertEqual(self.logs[-1]["decision"], "deny")
+            self.assertIsNone(self.logs[-1]["confidence"])
+
+    def test_deny_returned_when_state_persistence_fails(self):
+        self.stage_change()
+        with mock.patch.object(jev, "update_state", side_effect=PermissionError("in use")):
+            out = self.gate(self.payload("git commit -m x"), classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.logs[-1]["decision"], "deny")
+        self.assertEqual(self.logs[-1]["state_error"], "PermissionError")
+
+    def test_unavailable_classifier_is_logged_without_details(self):
+        self.stage_change()
+
+        def boom(body, key):
+            raise TimeoutError("secret-body test-key")
+        out = self.gate(self.payload("git commit -m x"), classify_fn=boom)
+        self.assertIsNone(out)
+        entry = self.logs[-1]
+        self.assertEqual((entry["decision"], entry["reason"], entry["error"]),
+                         ("allow", "unavailable", "TimeoutError"))
+        self.assertIn("latency_ms", entry)
+        self.assertNotIn("secret-body", json.dumps(self.logs))
+        self.assertNotIn("test-key", json.dumps(self.logs))
+
+    def test_no_key_is_logged_unavailable(self):
+        self.stage_change()
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
+            self.assertIsNone(self.gate(self.payload("git commit -m x"), classify_fn=self.classify()))
+        self.assertEqual(self.logs[-1]["error"], "NoApiKey")
+
+    def test_secret_files_and_tokens_redacted_before_sending(self):
+        token = "ghp_" + "A" * 30
+        self.stage_change(".env", "DB_PASSWORD=hunter2\n")
+        self.stage_change("server.PEM", "certificate body\n")
+        self.stage_change("a.txt", f"key = sk-{'b' * 20}\ntoken = {token}\nplain change\n")
+        out = self.gate(self.payload("git commit -m x"), classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        state = self.calls[0][0]["state"]
+        diff = state["diff"]
+        self.assertIn(".env", state["files"])
+        self.assertIn("diff --git a/.env b/.env", diff)
+        self.assertIn("diff --git a/server.PEM b/server.PEM", diff)
+        self.assertNotIn("hunter2", diff)
+        self.assertNotIn("certificate body", diff)
+        self.assertNotIn("sk-bbbb", diff)
+        self.assertNotIn(token, diff)
+        self.assertIn("+plain change", diff)
+        self.assertEqual(diff.count("[redacted]"), 4)
+
+    def test_scrub_token_shapes(self):
+        key = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----"
+        for secret in (key, "sk-" + "x" * 16, "gho_" + "1" * 20, "github_pat_" + "a" * 22,
+                       "AKIA" + "ABCDEFGHIJKLMNOP", "xoxb-123456789-abc"):
+            self.assertEqual(jev._scrub(f"before {secret} after"), "before [redacted] after", secret)
+        self.assertEqual(jev._scrub("sk-short and AKIAlower"), "sk-short and AKIAlower")
+
 
 class AgentDoneTests(unittest.TestCase):
     def setUp(self):
@@ -927,6 +1097,127 @@ class UpdateStateTests(unittest.TestCase):
             jev.update_state(self.path, lambda s: s.__setitem__("x", 1))
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {"x": 1})
 
+    def test_replace_retried_on_permission_error(self):
+        real_replace = Path.replace
+        attempts = []
+
+        def flaky(self_path, target):
+            attempts.append(self_path)
+            if len(attempts) < 3:
+                raise PermissionError("in use")
+            return real_replace(self_path, target)
+
+        with mock.patch.object(Path, "replace", flaky), \
+                mock.patch.object(jev, "REPLACE_RETRY_SECONDS", 0):
+            jev.update_state(self.path, lambda s: s.__setitem__("x", 1))
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {"x": 1})
+
+    def test_replace_gives_up_and_removes_tmp(self):
+        with mock.patch.object(Path, "replace", side_effect=PermissionError("in use")) as replace, \
+                mock.patch.object(jev, "REPLACE_RETRY_SECONDS", 0):
+            with self.assertRaises(PermissionError):
+                jev.update_state(self.path, lambda s: s.__setitem__("x", 1))
+        self.assertEqual(replace.call_count, jev.REPLACE_ATTEMPTS)
+        self.assertEqual([p.name for p in self.path.parent.iterdir()], ["jev-sess1.json.lock"])
+
+    @unittest.skipUnless(os.name == "nt", "msvcrt locking is Windows-only")
+    def test_windows_lock_excludes_concurrent_update(self):
+        self.path.parent.mkdir(parents=True)
+        with open(self.path.with_name(self.path.name + ".lock"), "a+") as held:
+            jev._msvcrt_lock(held)
+            with mock.patch.object(jev, "MSVCRT_LOCK_SECONDS", 0.05):
+                with self.assertRaises(OSError):
+                    jev.update_state(self.path, lambda s: s.__setitem__("x", 1))
+            held.seek(0)
+            jev.msvcrt.locking(held.fileno(), jev.msvcrt.LK_UNLCK, 1)
+        jev.update_state(self.path, lambda s: s.__setitem__("x", 1))
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {"x": 1})
+
+
+class PersistenceFailureTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg = jev.load_config(Path("/nonexistent/config.json"))
+        self.cfg["enabled"] = True
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.state_dir = Path(temp.name) / "state"
+        self.logs = []
+        patcher = mock.patch.object(jev, "update_state", side_effect=PermissionError("in use"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_agent_done_critic_persistence_is_best_effort(self):
+        text = "RESULT: r\nEVIDENCE: e\nCONFIDENCE: high\nUNVERIFIED: none"
+        for tool_response in ({"status": "async_launched", "agentId": "c1"},
+                              {"status": "completed", "content": [{"type": "text", "text": text}]}):
+            payload = {"tool_name": "Agent", "session_id": "sess1",
+                       "tool_input": {"subagent_type": "critic"}, "tool_response": tool_response}
+            jev.agent_done(payload, self.cfg, lambda body, key: report_response(), self.logs.append,
+                           state_dir=self.state_dir)
+        jev.agent_done({"tool_name": "SubagentHandback", "agent_type": "critic", "session_id": "s"},
+                       self.cfg, None, self.logs.append, state_dir=self.state_dir)
+        self.assertEqual(self.logs[-1]["decision"], "ok")  # the report check still ran
+
+    def test_handback_deny_returned_when_persistence_fails(self):
+        payload = {"agent_type": "builder", "agent_id": "a", "session_id": "sess1",
+                   "tool_input": {"message": "no sections"}}
+        out = jev.handback(payload, self.cfg, None, self.logs.append, state_dir=self.state_dir)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+
+class ReportUnavailableTests(unittest.TestCase):
+    REPORT = "RESULT: r\nEVIDENCE: e\nCONFIDENCE: high\nUNVERIFIED: none"
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg = jev.load_config(Path("/nonexistent/config.json"))
+        self.cfg["enabled"] = True
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.state_dir = Path(temp.name) / "state"
+        self.logs = []
+
+    @staticmethod
+    def boom(body, key):
+        raise OSError("secret-body")
+
+    def test_handback_logs_unavailable(self):
+        payload = {"agent_type": "builder", "agent_id": "a", "session_id": "sess1",
+                   "tool_input": {"message": self.REPORT}}
+        self.assertIsNone(jev.handback(payload, self.cfg, self.boom, self.logs.append,
+                                       state_dir=self.state_dir))
+        entry = self.logs[-1]
+        self.assertEqual((entry["decision"], entry["reason"], entry["error"]),
+                         ("ok", "unavailable", "OSError"))
+        self.assertNotIn("secret-body", json.dumps(self.logs))
+
+    def test_agent_done_logs_unavailable(self):
+        payload = {"tool_name": "Agent", "session_id": "sess1",
+                   "tool_input": {"subagent_type": "builder"},
+                   "tool_response": {"status": "completed",
+                                     "content": [{"type": "text", "text": self.REPORT}]}}
+        self.assertIsNone(jev.agent_done(payload, self.cfg, self.boom, self.logs.append,
+                                         state_dir=self.state_dir))
+        self.assertEqual((self.logs[-1]["reason"], self.logs[-1]["error"]), ("unavailable", "OSError"))
+
+    def test_report_text_scrubbed_before_sending(self):
+        sent = []
+
+        def fn(body, key):
+            sent.append(body["state"])
+            return report_response()
+        token = "ghp_" + "Z" * 30
+        text = f"RESULT: set key sk-{'q' * 20}\nEVIDENCE: used {token}\nCONFIDENCE: high\nUNVERIFIED: none"
+        jev._analyze_report(text, self.cfg, fn)
+        self.assertEqual(sent[0]["result"], "set key [redacted]")
+        self.assertEqual(sent[0]["evidence"], "used [redacted]")
+
 
 class SubprocessTests(unittest.TestCase):
     def test_garbage_stdin_exits_0_empty_stdout(self):
@@ -942,6 +1233,31 @@ class SubprocessTests(unittest.TestCase):
                                  env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
+
+    def test_utf8_stdin_decoded_regardless_of_locale(self):
+        # Hebrew, an emoji and curly quotes: several are undefined in cp1255/cp1252.
+        message = "RESULT: שלום אךם \U0001F600 “quoted”"
+        data = json.dumps({"tool_input": {"message": message}}, ensure_ascii=False).encode("utf-8")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TYPESAFE_API_KEY", "PYTHONUTF8", "PYTHONIOENCODING")}
+        # Unpatched: must not crash.
+        result = subprocess.run([sys.executable, str(SCRIPT), "handback"], input=data,
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        # Echo the decoded payload through main()'s output path to see what reached the
+        # classifier path.
+        probe = ("import importlib.util, sys\n"
+                 f"spec = importlib.util.spec_from_file_location('jev_guard', {str(SCRIPT)!r})\n"
+                 "jev = importlib.util.module_from_spec(spec)\n"
+                 "spec.loader.exec_module(jev)\n"
+                 "jev.handback = lambda payload, cfg, log_fn: {'echo': payload['tool_input']['message']}\n"
+                 "sys.argv = ['jev-guard.py', 'handback']\n"
+                 "sys.exit(jev.main())\n")
+        result = subprocess.run([sys.executable, "-c", probe], input=data, env=env,
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["echo"], message)
 
 
 if __name__ == "__main__":
