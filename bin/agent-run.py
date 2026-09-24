@@ -220,7 +220,7 @@ def probe(exe, cwd, settings, policy, writable, allow_host=None):
     read = cwd / (marker + '.read')
     targets = list(dict.fromkeys([cwd / marker, cwd.parent / marker,
                                   Path(tempfile.gettempdir()).resolve() / marker, ROOT / marker]))
-    if any(p.is_relative_to(cwd) for p in targets[1:]):
+    if any(p.is_relative_to(cwd.resolve()) for p in targets[1:]):
         raise RuntimeError('Workspace overlaps protected probe roots')
     read.write_text('agent-probe', encoding='utf-8')
     try:
