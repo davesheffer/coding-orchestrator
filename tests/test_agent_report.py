@@ -1,9 +1,12 @@
 """Offline tests for aggregate-only launcher telemetry."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+
+REPO = os.path.abspath(os.sep + 'repo')
 
 path = Path(__file__).resolve().parents[1] / 'bin' / 'agent-report.py'
 spec = importlib.util.spec_from_file_location('agent_report', path)
@@ -18,7 +21,7 @@ class AgentReportTests(unittest.TestCase):
             run = root / 'run-one'
             run.mkdir()
             (run / 'report.json').write_text(json.dumps({
-                'role': 'scout', 'workspace': 'C:/repo', 'status': 'completed',
+                'role': 'scout', 'workspace': REPO, 'status': 'completed',
                 'network_exception': True, 'preflight_ms': 12,
                 'attempts': [{'requested_model': 'gpt-6-luna', 'observed': {'model': 'gpt-6-luna'},
                               'duration_ms': 34}]}), encoding='utf-8')
@@ -26,7 +29,7 @@ class AgentReportTests(unittest.TestCase):
                       {'type': 'turn.completed', 'usage': {'input_tokens': 5, 'output_tokens': 2}},
                       {'type': 'item.completed', 'item': {'text': 'private task content'}}]
             (run / '0-events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events), encoding='utf-8')
-            result = reporter.summarize(root, Path('C:/repo'))
+            result = reporter.summarize(root, Path(REPO))
             self.assertEqual(result['runs'], 1)
             self.assertEqual(result['token_totals']['input_tokens'], 5)
             self.assertEqual(result['preflight_ms']['median'], 12)

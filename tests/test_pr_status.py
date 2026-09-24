@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -126,6 +127,7 @@ class GhLaunchTests(unittest.TestCase):
             output = pr_status.gh("pr", "list", "--json", "number")
         return output, calls
 
+    @unittest.skipUnless(os.name == "nt", "shutil.which applies PATHEXT only on Windows")
     def test_windows_resolves_the_wrapper_only_for_exe_or_com(self):
         with tempfile.TemporaryDirectory() as temp:
             wrapper_dir = Path(temp) / ".hunch"

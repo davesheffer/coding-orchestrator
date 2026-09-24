@@ -139,7 +139,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_probe_timeout_becomes_failed_startup_evidence(self):
         with patch.object(Path, 'write_text'), patch.object(Path, 'is_file', return_value=False), \
-             patch.object(agent.tempfile, 'gettempdir', return_value='C:/fake-temp'), \
+             patch.object(agent.tempfile, 'gettempdir', return_value=os.path.abspath(os.sep + 'fake-temp')), \
              patch.object(agent.subprocess, 'run', side_effect=subprocess.TimeoutExpired('codex', 45)):
             evidence = agent.probe('codex', Path.cwd(), {}, 'test-policy', False)
         self.assertEqual(evidence['exit'], 124)
@@ -289,7 +289,7 @@ class JevAllowlistTests(unittest.TestCase):
         def run(command, **kwargs):
             seen.append(command)
             return subprocess.CompletedProcess(command, 1, '', 'stop')
-        with patch.object(Path, 'write_text'), patch.object(Path, 'is_file', return_value=False),              patch.object(agent.tempfile, 'gettempdir', return_value='C:/fake-temp'),              patch.object(agent.subprocess, 'run', side_effect=run):
+        with patch.object(Path, 'write_text'), patch.object(Path, 'is_file', return_value=False),              patch.object(agent.tempfile, 'gettempdir', return_value=os.path.abspath(os.sep + 'fake-temp')),              patch.object(agent.subprocess, 'run', side_effect=run):
             agent.probe('codex', Path.cwd(), {}, 'test-policy', False, 'api.typesafe.ai')
         command = seen[0]
         python = command.index(agent.sys.executable, command.index('--'))
