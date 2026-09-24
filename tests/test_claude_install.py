@@ -9,8 +9,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import contextlib
+import io
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -196,18 +199,20 @@ class ClaudeInstallTests(unittest.TestCase):
             "python3 'unterminated",
         ]
         legacy = 'python3 "$HOME/.claude/relay/relay.py" stop 2>/dev/null || true'
+        windows = 'python "$HOME/.claude/relay/relay.py" stop 2>/dev/null || true'
         group = {"matcher": "*", "timeout": 5, "hooks": [
-            {"type": "command", "command": command} for command in [legacy, *preserved]
+            {"type": "command", "command": command} for command in [legacy, windows, *preserved]
         ]}
         self.home.joinpath("settings.json").write_text(json.dumps({"hooks": {"Stop": [group]}}))
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
         groups = settings["hooks"]["Stop"]
-        self.assertEqual(groups[0], {**group, "hooks": group["hooks"][1:]})
+        self.assertEqual(groups[0], {**group, "hooks": group["hooks"][2:]})
         self.assertEqual(len(groups), 2)
         commands = [h["command"] for g in groups for h in g["hooks"]]
         self.assertNotIn(legacy, commands)
+        self.assertNotIn(windows, commands)
         self.assertEqual(len(commands), len(preserved) + 1)
         before = self.snapshot()
         self.assertEqual(self.run_install().returncode, 0)
@@ -220,7 +225,8 @@ class ClaudeInstallTests(unittest.TestCase):
         bin_dir = self.home / "bin"
 
         def group(matcher, script, sub=""):
-            command = f"python3 {shlex.quote(str(bin_dir / script))}{sub} 2>/dev/null || true"
+            command = (f"{install_module.hook_python()} {shlex.quote(str(bin_dir / script))}{sub}"
+                       " 2>/dev/null || true")
             timeout = 10 if sub == " gate" else 5
             return {"matcher": matcher, "hooks": [{"type": "command", "command": command, "timeout": timeout}]}
 
@@ -243,9 +249,20 @@ class ClaudeInstallTests(unittest.TestCase):
         before = self.snapshot()
         self.assertEqual(self.run_install("--jev").returncode, 0)
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual(self.run_install().returncode, 0)
+        message = "jev: disabled (was enabled). Re-run with --jev to keep it."
+        self.assertNotIn(message, result.stdout)
+        dry = self.run_install("--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(message, dry.stdout)
+        self.assertEqual(self.snapshot(), before)
+        off = self.run_install()
+        self.assertEqual(off.returncode, 0, off.stderr)
+        self.assertIn(message, off.stdout)
         self.assertEqual(hooks(), ([user], None))
         self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["jev"], {"enabled": False})
+        again = self.run_install()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn(message, again.stdout)
         self.assertTrue((bin_dir / "jev-route.py").exists())
 
     def test_rollover_flag_sets_only_that_config_key(self):
@@ -290,11 +307,14 @@ class ClaudeInstallTests(unittest.TestCase):
                         f"python3 {guard} gate 2>/dev/null || true",
                         f"python3 {guard} agent-done",
                         f"python3 {guard} handback 2>/dev/null || true",
-                        'python3 "$HOME/.claude/bin/jev-guard.py" agent-done 2>/dev/null || true'):
+                        'python3 "$HOME/.claude/bin/jev-guard.py" agent-done 2>/dev/null || true',
+                        f"python {route} 2>/dev/null || true", f"python {guard} handback",
+                        'python "$HOME/.claude/bin/jev-guard.py" gate 2>/dev/null || true'):
             self.assertTrue(install_module.is_jev_hook(command, bin_dir), command)
         for command in (f"python3 {route} --dry 2>/dev/null || true",
                         f"python3 {route} | tee /tmp/log",
-                        f"python {route} 2>/dev/null || true",
+                        f"pythonw {route} 2>/dev/null || true",
+                        f"python3.12 {route} 2>/dev/null || true",
                         "python3 /other-project/bin/jev-route.py 2>/dev/null || true",
                         f"python3 {route} 2>/dev/null || true && audit",
                         f"python3 {route} gate 2>/dev/null || true",
@@ -303,6 +323,43 @@ class ClaudeInstallTests(unittest.TestCase):
                         f"python3 {guard} gate agent-done",
                         "python3 'unterminated", None):
             self.assertFalse(install_module.is_jev_hook(command, bin_dir), command)
+
+    def test_hook_interpreter_follows_platform_and_upgrades_strip_either_form(self):
+        with mock.patch.object(install_module.os, "name", "nt"):
+            self.assertEqual(install_module.hook_python(), "python")
+        with mock.patch.object(install_module.os, "name", "posix"):
+            self.assertEqual(install_module.hook_python(), "python3")
+        bin_dir = self.home / "bin"
+        relay = self.home / "relay/relay.py"
+        template = json.loads((ROOT / "hooks.json").read_text(encoding="utf-8"))
+        built = {}
+        for python in ("python", "python3"):
+            with mock.patch.object(install_module, "hook_python", return_value=python):
+                jev = install_module.jev_template(bin_dir)
+                settings = install_module.merge_jev_hook(
+                    install_module.merge_hooks({}, template, relay), bin_dir, True)
+            commands = [h["command"] for groups in settings["hooks"].values()
+                        for group in groups for h in group["hooks"]]
+            self.assertEqual(len(commands), 6)
+            self.assertTrue(all(command.startswith(f"{python} ") for command in commands), commands)
+            self.assertEqual(settings["hooks"]["PreToolUse"], jev["hooks"]["PreToolUse"])
+            self.assertIn(f"{python} {shlex.quote(str(relay))} stop 2>/dev/null || true", commands)
+            built[python] = settings
+        for old, new in (("python", "python3"), ("python3", "python")):
+            with mock.patch.object(install_module, "hook_python", return_value=new):
+                upgraded = install_module.merge_jev_hook(
+                    install_module.merge_hooks(built[old], template, relay), bin_dir, True)
+            self.assertEqual(upgraded, built[new])
+
+    def test_missing_hook_interpreter_is_warned(self):
+        env = {"CLAUDE_HOME": str(self.home)}
+        for found, warned in ((None, True), ("/usr/bin/python3", False)):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.dict(os.environ, env),                     mock.patch.object(install_module.shutil, "which", return_value=found),                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.assertEqual(install_module.main(["--dry-run"]), 0)
+            self.assertEqual(f"`{install_module.hook_python()}` is not on PATH" in stderr.getvalue(),
+                             warned, stderr.getvalue())
+        self.assertFalse(self.home.exists())
 
     def test_merge_jev_hook_strips_owned_hooks_from_user_and_duplicate_groups(self):
         bin_dir = self.home / "bin"

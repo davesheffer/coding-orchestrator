@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import tempfile
 from pathlib import Path
@@ -116,6 +117,16 @@ def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> byt
     return existing[:start] + block + existing[end + len(END):]
 
 
+# Hook commands run through a POSIX shell (Git Bash on Windows), where the python.org
+# installer provides `python` but not `python3`. Ownership matchers accept both forms
+# so an upgrade still strips hooks written under the other rule.
+OWNED_PYTHONS = ("python3", "python")
+
+
+def hook_python() -> str:
+    return "python" if os.name == "nt" else "python3"
+
+
 def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
     """Match only complete commands emitted by our current/legacy template."""
     if not isinstance(command, str):
@@ -129,7 +140,7 @@ def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
         "$HOME/.claude/relay/relay.py", "${HOME}/.claude/relay/relay.py",
         "~/.claude/relay/relay.py",
     }
-    return (len(parts) >= 3 and parts[0] == "python3"
+    return (len(parts) >= 3 and parts[0] in OWNED_PYTHONS
             and parts[1] in owned_paths and parts[2] == action
             and parts[3:] in ([], ["2>/dev/null", "||", "true"]))
 
@@ -142,6 +153,7 @@ JEV_HOOKS = (
     ("PostToolUse", "Agent|Task|SubagentHandback", "jev-guard.py", "agent-done"),
 )
 JEV_EVENTS = ("PreToolUse", "PostToolUse")
+JEV_DISABLED = "jev: disabled (was enabled). Re-run with --jev to keep it."
 
 
 def is_jev_hook(command: object, bin_dir: Path) -> bool:
@@ -157,7 +169,7 @@ def is_jev_hook(command: object, bin_dir: Path) -> bool:
                        f"$HOME/.claude/bin/{script}", f"${{HOME}}/.claude/bin/{script}",
                        f"~/.claude/bin/{script}"}
         args = [sub] if sub else []
-        if (len(parts) >= 2 and parts[0] == "python3" and parts[1] in owned_paths
+        if (len(parts) >= 2 and parts[0] in OWNED_PYTHONS and parts[1] in owned_paths
                 and parts[2:] in (args, args + ["2>/dev/null", "||", "true"])):
             return True
     return False
@@ -166,7 +178,7 @@ def is_jev_hook(command: object, bin_dir: Path) -> bool:
 def jev_template(bin_dir: Path) -> dict:
     hooks: dict = {event: [] for event in JEV_EVENTS}
     for event, matcher, script, sub in JEV_HOOKS:
-        command = f"python3 {shlex.quote(str(bin_dir / script))}" + (f" {sub}" if sub else "")
+        command = f"{hook_python()} {shlex.quote(str(bin_dir / script))}" + (f" {sub}" if sub else "")
         # The risk gate may run several git commands before its ≤4 s classifier call.
         hooks[event].append({"matcher": matcher, "hooks": [{
             "type": "command", "command": f"{command} 2>/dev/null || true",
@@ -232,7 +244,8 @@ def merge_hooks(existing: dict, template: dict, relay: Path) -> dict:
         for group in wanted_groups:
             copy = json.loads(json.dumps(group))
             for hook in copy["hooks"]:
-                hook["command"] = hook["command"].replace("__RELAY__", shlex.quote(str(relay)))
+                hook["command"] = hook["command"].replace(
+                    "__PYTHON__", hook_python()).replace("__RELAY__", shlex.quote(str(relay)))
             cleaned.append(copy)
         hooks[event] = cleaned
     return result
@@ -364,10 +377,12 @@ def main(argv: list[str] | None = None) -> int:
             tuned["rollover"] = args.rollover
             desired[config_path] = (json.dumps(tuned, indent=2) + "\n").encode()
     # Jev features are opt-in: --jev turns them on; installing without it turns them off,
-    # so a TYPESAFE_API_KEY in the environment alone never sends data.
+    # so a TYPESAFE_API_KEY in the environment alone never sends data. Turning off an
+    # enabled config is reported, so a routine upgrade never disables it silently.
     base = desired.get(config_path, config_existing)
     tuned = parse_json(config_path, base)
     jev = tuned.get("jev") if isinstance(tuned.get("jev"), dict) else None
+    jev_disabled = not args.jev and jev is not None and jev.get("enabled") is True
     if args.jev and (jev is None or jev.get("enabled") is not True):
         tuned["jev"] = {**(jev or {}), "enabled": True}
         desired[config_path] = (json.dumps(tuned, indent=2) + "\n").encode()
@@ -396,6 +411,10 @@ def main(argv: list[str] | None = None) -> int:
     }}
     desired[manifest_path] = (json.dumps(new_manifest, indent=2, sort_keys=True) + "\n").encode()
 
+    if shutil.which(hook_python()) is None:
+        print(f"warning: `{hook_python()}` is not on PATH; the relay and Jev hooks "
+              "will fail silently until it is", file=os.sys.stderr)
+
     changes = []
     for path, data in desired.items():
         prior = read_regular(path)
@@ -406,6 +425,8 @@ def main(argv: list[str] | None = None) -> int:
             if prior is not None:
                 print(f"backup {path}")
             print(f"write {path}")
+        if jev_disabled:
+            print(JEV_DISABLED)
         return 0
 
     for directory in directories:
@@ -421,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
     helper = dest / "bin" / "pr-status"
     if helper.exists() and not os.access(helper, os.X_OK):
         os.chmod(helper, stat.S_IMODE(helper.stat().st_mode) | stat.S_IXUSR)
+    if jev_disabled:
+        print(JEV_DISABLED)
     return 0
 
 

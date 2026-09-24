@@ -1,6 +1,6 @@
 ---
 name: scout
-description: Read-only file and symbol lookup. Use for bounded searches and summaries that would fill the main context. Escalate ambiguous analysis to the main session.
+description: File and symbol lookup, read-only by instruction; Bash is not sandboxed. Use for bounded searches and summaries that would fill the main context. Escalate ambiguous analysis to the main session.
 model: sonnet
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*
