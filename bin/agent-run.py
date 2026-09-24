@@ -196,11 +196,11 @@ except PermissionError:r['network']='DENIED'
 except OSError as e:r['network']=type(e).__name__
 def reach(host):
  # Goes through the proxy environment Codex supplies; any HTTP reply is reachable.
- import urllib.error,urllib.request
+ import http.client,urllib.error,urllib.request
  try:
-  with urllib.request.urlopen('https://'+host+'/',timeout=8):return 'CONNECTED'
+  with urllib.request.urlopen('https://'+host+'/',timeout=5):return 'CONNECTED'
  except urllib.error.HTTPError:return 'CONNECTED'
- except OSError as e:return type(e).__name__+':'+str(e)[:200]
+ except (OSError,http.client.HTTPException) as e:return type(e).__name__+':'+str(e)[:200]
 if spec.get('allow_host'):
  r['off_list']=reach(spec['off_list']);r['allow_host']=reach(spec['allow_host'])
 print(json.dumps(r))
@@ -242,7 +242,11 @@ def probe(exe, cwd, settings, policy, writable, allow_host=None):
                 path.unlink()
 
 
-PROXY_REFUSALS = ('Tunnel connection failed', 'blocked by network policy', 'blocked by policy')
+# Only an explicit policy refusal counts: http.client's CONNECT 403 or the
+# policy text in codex.exe 0.155.1's network proxy. Other CONNECT failures
+# (502, 407, ...) prove nothing.
+PROXY_REFUSALS = ('Tunnel connection failed: 403', 'blocked by network policy',
+                  'Network access was blocked by policy')
 
 
 def isolated(evidence, allow_host):
@@ -365,9 +369,10 @@ def main(argv=None):
     jev = jev_host()
     allowed = None
     for mode in ('elevated', 'unelevated'):
-        # A Jev-only allowlist is tried first; if it is not provably enforced,
-        # the same backend is retried fully offline, never more open.
-        for allow_host in ([jev, None] if jev and args.role in JEV_ROLES else [None]):
+        # Offline is probed first. A Jev-only allowlist is probed only when this
+        # backend already denies direct sockets; if offline leaks, no allowlist
+        # can be enforced and probing one would only cost startup time.
+        for allow_host in [None] + ([jev] if jev and args.role in JEV_ROLES else []):
             instructions = role['developer_instructions']
             if allow_host:
                 instructions += JEV_NOTE.format(host=allow_host)
@@ -377,19 +382,19 @@ def main(argv=None):
                                      'jev_allowlist': allow_host, **evidence})
             save()
             if evidence['exit'] != 0:
-                # The probe never ran. Try the other restricted backend, never a
-                # permissive backend. No verified filesystem result means no launch.
-                continue
+                # The probe never ran. Offline: try the other restricted backend,
+                # never a permissive one. Allowlist: keep the verified offline settings.
+                break
             if not evidence['filesystem_ok']:
                 report['status'] = 'blocked-filesystem'
                 save()
                 print(json.dumps(evidence), flush=True)
                 return 3
             fallback_mode = mode
-            if isolated(evidence, allow_host):
-                isolated_settings = settings
-                allowed = allow_host
+            if not isolated(evidence, allow_host):
                 break
+            isolated_settings = settings
+            allowed = allow_host
         if isolated_settings is not None:
             break
     report['jev_allowlist'] = allowed
