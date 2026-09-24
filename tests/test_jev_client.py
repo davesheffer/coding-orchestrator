@@ -72,6 +72,31 @@ class ClientTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
             self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, ok))
 
+    def test_ask_reports_failure_reason(self):
+        cfg = self.config({})
+
+        def boom(body, key):
+            raise OSError("secret-body")
+
+        def slow(body, key):
+            time.sleep(1)
+            return {"answers": {}}
+
+        cases = [
+            (cfg, boom, ["OSError"]),
+            ({**cfg, "timeout_seconds": 0.05}, slow, ["TimeoutError"]),
+            (cfg, lambda body, key: {"answers": []}, ["MalformedResponse"]),
+            (self.config({"features": {"shift": False}}), boom, []),
+        ]
+        for config, fn, expected in cases:
+            errors = []
+            self.assertIsNone(jev_client.ask(config, "shift", {}, {}, fn, errors=errors))
+            self.assertEqual(errors, expected)
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
+            errors = []
+            self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, boom, errors=errors))
+            self.assertEqual(errors, ["NoApiKey"])
+
     def test_noul_rejects_malformed(self):
         for answers in (None, {}, {"q": {}}, {"q": {"noul": "x"}}, {"q": {"noul": 1.5}}):
             self.assertIsNone(jev_client.noul(answers, "q"))
