@@ -110,8 +110,10 @@ fresh session injects the handoff so the new session continues the work. Only a
 prompt that starts with `relay:<id>` resumes; mentioning an id elsewhere does
 not. The handoff is injected inside a `<handoff id="...">` fence, and its NEXT
 PROMPT is presented as the previous session's recorded request. The gauge still
-applies on that turn. Handoff files are private (mode 0600 in a 0700 folder; on
-Windows, an owner-only ACL) and a new handoff never replaces an existing id.
+applies on that turn. Handoff files written by this version are private (mode
+0600 in a 0700 folder; on Windows, an owner-only ACL applied to each new file
+and to a newly created handoffs folder — an existing handoffs folder keeps its
+current ACL) and a new handoff never replaces an existing id.
 Handoffs and per-session state older than `handoff_ttl_hours` (72) are removed
 when a handoff is written and, at most once an hour, when a prompt is submitted;
 resuming a handoff refreshes its age.

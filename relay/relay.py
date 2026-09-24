@@ -3,7 +3,7 @@
 
 Subcommands:
   prompt    UserPromptSubmit hook. Injects a context gauge (amber/red zones add
-            rollover directives) or, when the prompt carries `relay:<id>`,
+            rollover directives) or, when the prompt starts with `relay:<id>`,
             injects that handoff so a fresh session continues the work.
   stop      Stop hook. In the red zone, blocks the stop ONCE per session so the
             model writes a handoff and rolls over instead of idling on a full context.
@@ -366,7 +366,10 @@ def handoff_context(hid, session_id, shift_on):
             save_state(session_id, state)
         except Exception:
             pass
-    os.utime(path)
+    try:
+        os.utime(path)
+    except OSError:
+        pass
     # The fence must stay the only closing tag, whatever the body contains.
     body = HANDOFF_CLOSE_RE.sub(r"&lt;\1", body)
     return ("[relay] This session CONTINUES earlier work: the user sent the resume prompt for handoff "
@@ -433,8 +436,12 @@ def cmd_prompt():
         sweep_if_due(cfg)
     except Exception:
         pass
-    # Continuation turns still get the gauge: a resume prompt may land in a full session.
-    gauge = gauge_context(data, cfg, session_id, prompt, continuing=bool(m))
+    # Continuation turns still get the gauge: a resume prompt may land in a full session, but a
+    # resume turn must still inject the handoff above even if the gauge path throws.
+    try:
+        gauge = gauge_context(data, cfg, session_id, prompt, continuing=bool(m))
+    except Exception:
+        gauge = None
     if gauge:
         parts.append(gauge)
     if parts:
@@ -559,33 +566,29 @@ def grade_handoff(jcfg, body):
 
 
 def write_handoff(path, text):
-    """Write a private handoff and publish it without replacing another one.
+    """Write a private handoff directly at path, without replacing another one.
 
     Returns False when path already exists, so the caller can pick a new id."""
-    tmp = path.with_name(f".{secrets.token_hex(8)}.tmp")
     fd = None
     try:
         # Handoffs carry the user's latest prompt: restrict access before writing any text.
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    try:
         if os.name == "nt":
-            _restrict_windows_state(tmp)
+            _restrict_windows_state(path)
         elif hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = None
             handle.write(text)
-        try:
-            if os.name == "nt":
-                os.rename(tmp, path)  # refuses an existing destination on Windows
-            else:
-                os.link(tmp, path)  # refuses an existing destination; rename would replace it
-        except FileExistsError:
-            return False
         return True
-    finally:
+    except BaseException:
         if fd is not None:
             os.close(fd)
-        tmp.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        raise
 
 
 def cmd_handoff(argv):
@@ -625,7 +628,7 @@ def cmd_handoff(argv):
     cfg = config()
     sweep(cfg)
     cwd = os.getcwd()
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "unknown")
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or "unknown"
     dirty = git(cwd, "status", "--porcelain")
     meta = "\n".join([
         f"- from session: {session_id}",
@@ -645,7 +648,7 @@ def cmd_handoff(argv):
     for _ in range(HANDOFF_ID_ATTEMPTS):
         hid = secrets.token_hex(4)
         path = HANDOFFS / f"{hid}.md"
-        if not path.exists() and write_handoff(path, f"# Relay handoff {hid}: {title}\n{meta}\n{body}\n"):
+        if write_handoff(path, f"# Relay handoff {hid}: {title}\n{meta}\n{body}\n"):
             break
     else:
         sys.exit("relay: could not allocate an unused handoff id; rerun the handoff.")

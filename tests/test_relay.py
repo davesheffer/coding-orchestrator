@@ -417,6 +417,31 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(len(files), 1)
         self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
 
+    def test_resume_turn_injects_handoff_even_if_gauge_path_throws(self):
+        self.seed_handoff("GOAL: old task\nSTATE: ready")
+        (self.home / "relay").mkdir(parents=True, exist_ok=True)
+        # A misconfigured (string) task_shift_min_tokens makes the `tokens <
+        # cfg["task_shift_min_tokens"]` comparison in gauge_context raise; the
+        # handoff must still be injected.
+        (self.home / "relay/config.json").write_text(
+            json.dumps({"task_shift_min_tokens": "30000"}), encoding="utf-8")
+        context = self.prompt_context("relay:1234abcd continue", tokens=50000)
+        self.assertIn('<handoff id="1234abcd">', context)
+        self.assertIn("CONTINUES", context)
+
+    def test_empty_session_id_env_is_treated_as_unknown(self):
+        body = "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks"
+        env = dict(self.env)
+        env["CLAUDE_CODE_SESSION_ID"] = ""
+        result = subprocess.run([sys.executable, str(RELAY), "handoff", "--no-open"],
+                                env=env, cwd=self.temp.name, input=body, text=True,
+                                encoding="utf-8", capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.home / "relay/state"
+        self.assertFalse((state / ".json").exists())
+        if state.is_dir():
+            self.assertEqual(list(state.glob("*.json")), [])
+
 
 if __name__ == "__main__":
     unittest.main()
