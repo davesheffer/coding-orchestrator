@@ -180,6 +180,30 @@ class EvalTests(unittest.TestCase):
         self.assertEqual(len(tasks), 30)
         self.assertEqual(Counter(t["expected"] for t in tasks), {"sonnet": 10, "opus": 10, "fable": 10})
         self.assertEqual(len({t["id"] for t in tasks}), 30)
+        # Pinned agents are never routed, so benchmark cases must use routable roles.
+        pinned = evaluator.load_config(Path("/nonexistent/config.json"))["pinned_agents"]
+        self.assertEqual([t["id"] for t in tasks if t["subagent_type"] in pinned], [])
+
+    def test_applied_accuracy_uses_route_rule(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / "agents").mkdir()
+            for name, model in (("builder", "sonnet"), ("critic", "fable")):
+                (home / "agents" / f"{name}.md").write_text(f"---\nmodel: {model}\n---\n", encoding="utf-8")
+            tasks = [
+                {"id": "a1", "subagent_type": "general-purpose", "description": "d1", "prompt": "p", "expected": "opus"},
+                {"id": "a2", "subagent_type": "general-purpose", "description": "d2", "prompt": "p", "expected": "opus"},
+                {"id": "a3", "subagent_type": "builder", "description": "d3", "prompt": "p", "expected": "sonnet"},
+                {"id": "a4", "subagent_type": "critic", "description": "d4", "prompt": "p", "expected": "fable"},
+                {"id": "a5", "subagent_type": "general-purpose", "description": "d5", "prompt": "p", "expected": "fable"},
+            ]
+            replies = {"d1": answers("opus", 0.9), "d2": answers("opus", 0.3), "d3": answers("sonnet", 0.9),
+                       "d4": answers("opus", 0.9), "d5": answers("fable", float("nan"))}
+            result = evaluator.evaluate(tasks, self.cfg, lambda state, q: replies[state["description"]], home=home)
+        self.assertEqual((result["correct"], result["accuracy"]), (4, 0.8))
+        self.assertEqual((result["applied"], result["applied_correct"], result["applied_accuracy"]), (1, 3, 0.6))
+        self.assertEqual([r["effective"] for r in result["results"]], ["opus", "inherit", "sonnet", "fable", "inherit"])
+        self.assertIn("applied accuracy: 60.0% (3/5, 1 applied)", evaluator.render(result))
 
     def test_validate_rejects_bad_benchmark(self):
         bad = {"version": 1, "tasks": [{"id": "a", "subagent_type": "x", "description": "d",

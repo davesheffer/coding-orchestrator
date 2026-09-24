@@ -14,6 +14,26 @@ spec = importlib.util.spec_from_file_location("codex_jev_hook", HOOK)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
+UNICODE_TEXT = "\u05e9\u05dc\u05d5\u05dd \u05d0\u05da \U0001f600 \u201cquoted\u201d"
+DRIVER = r"""
+import importlib.util, json, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("codex_jev_hook", sys.argv[1])
+hook = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hook)
+hook.CONFIG = Path(sys.argv[2])
+cfg = hook.settings()
+cfg["enabled"] = True
+bodies, logs = [], []
+hook.settings = lambda: cfg
+hook.log = lambda cfg, entry: logs.append(entry)
+hook.client.http_classify = lambda body, cfg, key: (
+    bodies.append(body), {"answers": {"model": {"choice": "luna", "confidence": 0.9}}})[1]
+sys.argv = sys.argv[:1]
+hook.main()
+sys.stderr.write(json.dumps({"bodies": bodies, "logs": logs}))
+"""
+
 
 class CodexJevTests(unittest.TestCase):
     def setUp(self):
@@ -67,6 +87,75 @@ class CodexJevTests(unittest.TestCase):
         with patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"}), patch.object(module, "log"):
             out = module.route(payload, cfg, classify)
         self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+
+    def route_default(self, answer, classify=None):
+        cfg = module.settings() | {"enabled": True, "min_confidence": 0.5}
+        payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "read a file"}}
+        logs = []
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"}), \
+             patch.object(module, "log", lambda cfg, entry: logs.append(entry)):
+            if classify is None:
+                with patch.object(module.client, "ask", return_value=answer):
+                    return module.route(payload, cfg), logs
+            return module.route(payload, cfg, classify), logs
+
+    def test_route_rejects_invalid_confidence(self):
+        for value in (float("nan"), float("inf"), -1, 2, None):
+            with self.subTest(value=value):
+                out, logs = self.route_default({"model": {"choice": "luna", "confidence": value}})
+                self.assertIsNone(out)
+                self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "invalid confidence"))
+                json.dumps(logs[0], allow_nan=False)
+
+    def test_route_logs_every_decision_like_jev_route(self):
+        out, logs = self.route_default({"model": {"choice": "sol", "confidence": 0.9}})
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+        entry = logs[0]
+        self.assertEqual((entry["applied"], entry["reason"], entry["subagent_type"]), (True, "applied", "default"))
+        self.assertIsInstance(entry["latency_ms"], int)
+        self.assertEqual(entry["desc_hash"], module.hashlib.sha256(b"read a file").hexdigest()[:12])
+        self.assertNotIn("read a file", json.dumps(entry))
+        out, logs = self.route_default({"model": {"choice": "sol", "confidence": 0.2}})
+        self.assertIsNone(out)
+        self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "below min_confidence"))
+
+    def test_route_logs_unavailable(self):
+        def boom(body, key):
+            raise TimeoutError("slow test-key")
+        out, logs = self.route_default(None, boom)
+        self.assertIsNone(out)
+        self.assertEqual(len(logs), 1)
+        self.assertEqual((logs[0]["applied"], logs[0]["reason"], logs[0]["error"]),
+                         (False, "unavailable", "TimeoutError"))
+        self.assertIn("latency_ms", logs[0])
+        self.assertNotIn("test-key", json.dumps(logs[0]))
+
+    def test_user_labels_are_not_overwritten(self):
+        config = Path(self.temp.name) / "config.json"
+        with patch.object(module, "CONFIG", config):
+            self.assertEqual(module.settings()["labels"], module.LABELS)
+            config.write_text(json.dumps({"jev": {"labels": {"sol": "custom", "astra": None, "opus": "x"}}}))
+            self.assertEqual(module.settings()["labels"], {"luna": module.LABELS["luna"], "sol": "custom"})
+
+    def test_utf8_stdin_is_decoded_whatever_the_locale(self):
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Agent",
+                   "tool_input": {"agent_type": "default", "message": UNICODE_TEXT}}
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        for encoding in (None, "cp1252"):
+            with self.subTest(encoding=encoding):
+                env = {k: v for k, v in self.env.items() if k not in ("PYTHONUTF8", "PYTHONIOENCODING")}
+                env["TYPESAFE_API_KEY"] = "test-key"
+                if encoding:
+                    env["PYTHONIOENCODING"] = encoding
+                result = subprocess.run([sys.executable, "-c", DRIVER, str(HOOK), str(Path(self.temp.name) / "none.json")],
+                                        input=data, env=env, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                seen = json.loads(result.stderr.decode("ascii"))
+                self.assertEqual(seen["bodies"][0]["state"]["task"], UNICODE_TEXT)
+                self.assertEqual(seen["logs"][0]["desc_hash"],
+                                 module.hashlib.sha256(UNICODE_TEXT.encode("utf-8")).hexdigest()[:12])
+                out = json.loads(result.stdout.decode("ascii"))
+                self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["message"], UNICODE_TEXT)
 
     def test_report_check_continues_once(self):
         cfg = module.settings() | {"enabled": True}

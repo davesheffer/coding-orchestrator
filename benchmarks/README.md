@@ -22,3 +22,12 @@ The specified-edit fixtures in `fixtures/` were copied to separate disposable wo
 | Claude Sonnet vs Opus, two specified edits | Original tests passed for both. Expanded invalid-record tests exposed one Sonnet error; a Sonnet repair passed. Total Sonnet cost/time including repair: about $0.106 / 42 s; Opus: about $0.230 / 51 s. | Synthetic functions, four model runs and one repair. |
 
 The raw local pilot artifacts are in the user's private `~/.codex/agent-runs/` directory. Model, version, pricing, and task mix can change; repeat on a broader frozen task set before claiming general savings.
+
+# Jev routing benchmark
+
+`jev-routing.json` holds 30 labelled subagent tasks (10 each for sonnet, opus and fable). Run `python bin/eval-jev-routing.py` (needs `TYPESAFE_API_KEY`; `--dry-run` only validates the file). It reports two numbers:
+
+- **accuracy**: the raw classifier choice against the expected tier.
+- **applied accuracy**: the model that would actually run after `bin/jev-route.py`'s own rule. Pinned agents, answers below `min_confidence` or with an invalid confidence keep the agent's frontmatter model (or `inherit`), and a choice equal to the current tier is a same-model skip.
+
+Every case uses a routable role. Agents in `pinned_agents` (by default `critic` and `fork`) are never classified in production, so adversarial-review scenarios use `general-purpose`.

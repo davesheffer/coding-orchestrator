@@ -2,8 +2,10 @@
 """Opt-in Codex lifecycle adapter for TypeSafe Jev. Fail open on API errors."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import math
 import os
 import sys
 import time
@@ -19,6 +21,11 @@ STATE = HOME / "jev" / "state"
 LOG = HOME / "jev" / "jev-log.jsonl"
 MODELS = {"luna": "gpt-6-luna", "sol": "gpt-6-sol", "astra": "gpt-6-astra"}
 PINNED = {"scout", "runner", "builder", "critic"}
+LABELS = {
+    "luna": "Bounded searches, summaries and exact offline checks.",
+    "sol": "Implementation and routine design or debugging.",
+    "astra": "Security, concurrency, migrations, data loss, public APIs or hard review.",
+}
 
 
 def guard_module():
@@ -33,11 +40,20 @@ def guard_module():
 
 def settings():
     cfg = client.load_config(CONFIG)
-    cfg["labels"] = {
-        "luna": "Bounded searches, summaries and exact offline checks.",
-        "sol": "Implementation and routine design or debugging.",
-        "astra": "Security, concurrency, migrations, data loss, public APIs or hard review.",
-    }
+    # load_config keeps only Claude tiers, so merge the user's Codex labels from the
+    # raw file the same way: over the defaults, with a null value removing a tier.
+    labels = dict(LABELS)
+    try:
+        user = json.loads(CONFIG.read_text(encoding="utf-8")).get("jev", {}).get("labels")
+    except Exception:
+        user = None
+    if isinstance(user, dict):
+        for name, rubric in user.items():
+            if rubric is None:
+                labels.pop(name, None)
+            elif isinstance(rubric, str):
+                labels[name] = rubric
+    cfg["labels"] = {k: v for k, v in labels.items() if k in MODELS}
     return cfg
 
 
@@ -45,11 +61,18 @@ def log(cfg, entry):
     client.write_log(cfg, entry, LOG)
 
 
+def desc_hash(description):
+    """sha256(description)[:12] as in bin/jev-route.py, or None if empty."""
+    if not description:
+        return None
+    return hashlib.sha256(description.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
 def route(payload, cfg, classify_fn=None):
     if payload.get("tool_name") not in ("Agent", "Task", "spawn_agent"):
         return None
     args = payload.get("tool_input")
-    if not isinstance(args, dict):
+    if not isinstance(args, dict) or not cfg["labels"]:
         return None
     role = args.get("agent_type") or args.get("subagent_type")
     if role in PINNED or role in cfg.get("pinned_agents", []):
@@ -57,23 +80,48 @@ def route(payload, cfg, classify_fn=None):
     if role not in (None, "default", "general-purpose") or args.get("model"):
         return None
     state = {"role": role or "default"}
+    task = str(args.get("message") or args.get("prompt") or "")
     if cfg.get("send_prompt", True):
-        description = str(args.get("message") or args.get("prompt") or "")
-        state["task"] = description[:cfg["max_prompt_chars"]]
+        state["task"] = task[:cfg["max_prompt_chars"]]
+    start = time.monotonic()
+    errors = []
     answers = client.ask(cfg, "route", state,
                          {"model": {"type": "choice", "instructions": "Choose the cheapest Codex model that can complete this task well.",
-                                    "criteria": cfg["labels"]}}, classify_fn)
+                                    "criteria": cfg["labels"]}}, classify_fn, errors=errors)
+    # Same shape as bin/jev-route.py entries so jev-report buckets them by agent.
+    entry = {"ts": client.timestamp(), "feature": "route", "subagent_type": role or "default",
+             "role": role or "default", "latency_ms": client.elapsed_ms(start)}
+    hashed = desc_hash(str(args.get("description") or task))
+    if hashed:
+        entry["desc_hash"] = hashed
+    if answers is None:
+        if errors:
+            log(cfg, {**entry, "applied": False, "reason": "unavailable", "error": errors[0]})
+        return None
     try:
         answer = answers["model"]
         choice = answer["choice"]
-        confidence = float(answer["confidence"])
-    except (TypeError, KeyError, ValueError):
+    except (TypeError, KeyError):
         return None
-    if choice not in MODELS or confidence < cfg["min_confidence"]:
+    try:
+        confidence = float(answer.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = None
+    if choice not in MODELS or choice not in cfg["labels"]:
+        why = "invalid label"
+    elif confidence is None or not 0.0 <= confidence <= 1.0:  # also rejects NaN
+        why = "invalid confidence"
+    elif confidence < cfg["min_confidence"]:
+        why = "below min_confidence"
+    else:
+        why = "applied"
+    if confidence is not None and not math.isfinite(confidence):
+        confidence = None  # keep the log strict JSON
+    log(cfg, {**entry, "choice": choice, "confidence": confidence, "applied": why == "applied",
+              "reason": why})
+    if why != "applied":
         return None
     updated = {**args, "model": MODELS[choice]}
-    log(cfg, {"ts": client.timestamp(), "feature": "route", "role": role or "default",
-              "choice": choice, "confidence": confidence, "applied": True})
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                     "updatedInput": updated}}
 
@@ -173,7 +221,8 @@ def grade_handoff(body, cfg, classify_fn=None):
 
 def main():
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        # Hook payloads are UTF-8 whatever the locale (e.g. cp1255 on Windows).
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
         cfg = settings()
         if len(sys.argv) > 1 and sys.argv[1] == "grade":
             result = grade_handoff(str(payload.get("handoff") or ""), cfg)

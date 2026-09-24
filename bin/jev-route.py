@@ -15,6 +15,7 @@ the script always finishes inside the hook's 5 s timeout.
 """
 import hashlib
 import json
+import math
 import re
 import sys
 import time
@@ -33,7 +34,7 @@ INSTRUCTIONS = ("Which model tier should run this subagent task? "
 
 def frontmatter_model(path):
     try:
-        text = Path(path).read_text(encoding="utf-8").replace("\r\n", "\n")
+        text = Path(path).read_text(encoding="utf-8-sig").replace("\r\n", "\n")
     except Exception:
         return None
     if not text.startswith("---\n") or "\n---" not in text[3:]:
@@ -63,13 +64,50 @@ def current_model(payload, tool_input, home=ROOT):
     return None
 
 
+def model_tier(model, tiers):
+    """The tier alias for a model: the alias itself, or the tier named inside a full
+    Claude id (claude-opus-4-1, us.anthropic.claude-3-5-haiku-...); else the model."""
+    if not isinstance(model, str):
+        return model
+    lowered = model.strip().lower()
+    if lowered in tiers:
+        return lowered
+    if "claude" in lowered:
+        for tier in tiers:
+            if re.search(rf"(?<![a-z0-9]){re.escape(tier)}(?![a-z0-9])", lowered):
+                return tier
+    return model
+
+
+def valid_confidence(confidence):
+    return isinstance(confidence, float) and math.isfinite(confidence) and 0.0 <= confidence <= 1.0
+
+
+def verdict(choice, confidence, current, cfg):
+    """Why an answer is skipped, or "applied" (shared with bin/eval-jev-routing.py)."""
+    if choice not in cfg["labels"]:
+        return "invalid label"
+    if not valid_confidence(confidence):
+        return "invalid confidence"
+    if confidence < float(cfg["min_confidence"]):
+        return "below min_confidence"
+    if choice == model_tier(current, cfg["labels"]):
+        return "same model"
+    return "applied"
+
+
+def pinned(tool_input, cfg):
+    """True when the call is never classified (pinned agent or respected explicit model)."""
+    if tool_input.get("subagent_type") in (cfg.get("pinned_agents") or []):
+        return True
+    return bool(cfg.get("respect_explicit_model") and tool_input.get("model"))
 
 
 def desc_hash(description):
     """sha256(description)[:12], or None if description is empty/missing."""
     if not description:
         return None
-    return hashlib.sha256(description.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(description.encode("utf-8", errors="replace")).hexdigest()[:12]
 
 
 def build_state(tool_input, cfg):
@@ -95,40 +133,43 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict) or not cfg["labels"]:
         return None
-    if tool_input.get("subagent_type") in (cfg.get("pinned_agents") or []):
-        return None
-    if cfg.get("respect_explicit_model") and tool_input.get("model"):
+    if pinned(tool_input, cfg):
         return None
     current = current_model(payload, tool_input, home)
     state = build_state(tool_input, cfg)
     start = time.monotonic()
-    answers = ask(cfg, "route", state, build_questions(cfg), classify_fn)
+    errors = []
+    answers = ask(cfg, "route", state, build_questions(cfg), classify_fn, errors=errors)
     latency = elapsed_ms(start)
+    entry = {"ts": timestamp(), "feature": "route", "subagent_type": state["subagent_type"],
+             "current": current or "inherit", "latency_ms": latency}
+    hashed = desc_hash(state["description"])
+    if hashed:
+        entry["desc_hash"] = hashed
+    if answers is None:
+        # Log only real failures (never the body or key); disabled features stay silent.
+        if log_fn and errors:
+            log_fn({**entry, "applied": False, "reason": "unavailable", "error": errors[0]})
+        return None
     try:
         answer = answers["model"]
         choice = answer.get("choice")
-        confidence = float(answer.get("confidence"))
         probabilities = answer.get("probabilities")
     except Exception:
         return None
-    if choice not in cfg["labels"]:
-        applied, why = False, "invalid label"
-    elif confidence < float(cfg["min_confidence"]):
-        applied, why = False, "below min_confidence"
-    elif choice == current:
-        applied, why = False, "same model"
-    else:
-        applied, why = True, "applied"
-    reason = f"jev: {current or 'inherit'} → {choice} (conf {confidence:.2f})"
+    try:
+        confidence = float(answer.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = None
+    why = verdict(choice, confidence, current, cfg)
+    applied = why == "applied"
+    conf_text = f"{confidence:.2f}" if valid_confidence(confidence) else "invalid"
+    if confidence is not None and not math.isfinite(confidence):
+        confidence = None  # keep the log strict JSON
+    reason = f"jev: {current or 'inherit'} → {choice} (conf {conf_text})"
     if log_fn:
-        entry = {"ts": timestamp(), "feature": "route",
-                 "subagent_type": state["subagent_type"],
-                 "current": current or "inherit", "choice": choice, "confidence": confidence,
-                 "probabilities": probabilities, "latency_ms": latency, "applied": applied,
-                 "reason": reason if applied else f"{reason}; skipped: {why}"}
-        hashed = desc_hash(state["description"])
-        if hashed:
-            entry["desc_hash"] = hashed
+        entry.update({"choice": choice, "confidence": confidence, "probabilities": probabilities,
+                      "applied": applied, "reason": reason if applied else f"{reason}; skipped: {why}"})
         log_fn(entry)
     if not applied:
         return None
@@ -142,7 +183,8 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
 
 def main():
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        # Hook payloads are UTF-8 whatever the locale (e.g. cp1255 on Windows).
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
         cfg = load_config()
         output = decide(payload, cfg, None, lambda entry: write_log(cfg, entry))
         if output is not None:
