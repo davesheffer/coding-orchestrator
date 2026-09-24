@@ -10,12 +10,18 @@ function handoffHome() {
 
 // Codex requests copy the handoff text, so it must be a file the helper saved under
 // <home>/handoffs. Claude requests only pre-fill the relay prompt from ~/.claude/relay.
-function isSavedHandoff(root, handoff) {
-  const folder = path.resolve(root, 'handoffs');
-  const folders = [folder];
-  try { folders.push(fs.realpathSync(folder)); } catch {}
-  const resolved = path.resolve(handoff);
-  return folders.some(parent => resolved.startsWith(parent + path.sep));
+// Resolve symlinks/junctions on both sides so a link inside handoffs cannot point
+// outside it, while still accepting a legit path that only differs by case on Windows.
+function realHandoffPath(root, handoff) {
+  let folder;
+  try { folder = fs.realpathSync(path.resolve(root, 'handoffs')); } catch { return null; }
+  let resolved;
+  try { resolved = fs.realpathSync(path.resolve(handoff)); } catch { return null; }
+  const prefix = folder + path.sep;
+  const matches = process.platform === 'win32'
+    ? resolved.toLowerCase().startsWith(prefix.toLowerCase())
+    : resolved.startsWith(prefix);
+  return matches ? resolved : null;
 }
 
 function writeAck(root, id, result) {
@@ -46,12 +52,15 @@ async function handleUri(uri) {
     const launch = path.join(root, 'launches', `${id}.json`);
     const request = JSON.parse(fs.readFileSync(launch, 'utf8'));
     fs.unlinkSync(launch);  // consume the request so its URI cannot be replayed
+    const isCodex = request.client === 'codex';
+    const resolvedHandoff = isCodex && typeof request.handoff === 'string'
+      ? realHandoffPath(root, request.handoff) : request.handoff;
     if (!['codex', 'claude'].includes(request.client) ||
         typeof request.handoff !== 'string' || typeof request.prompt !== 'string' ||
         !Number.isFinite(request.created_at) ||
         Math.abs(Date.now() / 1000 - request.created_at) > 300 ||
-        (request.client === 'codex' && !isSavedHandoff(root, request.handoff)) ||
-        !fs.statSync(request.handoff).isFile()) {
+        (isCodex && !resolvedHandoff) ||
+        !fs.statSync(resolvedHandoff).isFile()) {
       throw new Error('invalid or expired handoff request');
     }
     if (request.client === 'claude') {
@@ -60,7 +69,7 @@ async function handleUri(uri) {
       const previous = new Set(vscode.window.tabGroups.all.flatMap(group => group.tabs));
       await vscode.commands.executeCommand('chatgpt.newCodexPanel');
       await waitForNewCodexTab(previous);
-      const handoff = fs.readFileSync(path.resolve(request.handoff), 'utf8');
+      const handoff = fs.readFileSync(resolvedHandoff, 'utf8');
       await vscode.env.clipboard.writeText(`${request.prompt}\n\nSaved handoff:\n${handoff}`);
     }
     writeAck(root, id, { status: 'opened', client: request.client });

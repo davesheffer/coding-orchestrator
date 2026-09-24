@@ -12,6 +12,7 @@ import os
 import shlex
 import shutil
 import stat
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -411,9 +412,22 @@ def main(argv: list[str] | None = None) -> int:
     }}
     desired[manifest_path] = (json.dumps(new_manifest, indent=2, sort_keys=True) + "\n").encode()
 
-    if shutil.which(hook_python()) is None:
+    found_python = shutil.which(hook_python())
+    if found_python is None:
         print(f"warning: `{hook_python()}` is not on PATH; the relay and Jev hooks "
               "will fail silently until it is", file=os.sys.stderr)
+    elif os.name == "nt":
+        # The Microsoft Store's `python` app-execution alias resolves on PATH but
+        # doesn't run a real interpreter, so probe it before trusting it for hooks.
+        try:
+            works = subprocess.run([found_python, "-c", "pass"], timeout=10,
+                                   capture_output=True).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            works = False
+        if not works:
+            print(f"warning: `{found_python}` did not run a real Python interpreter "
+                  "(possibly the Microsoft Store stub); the relay and Jev hooks "
+                  "will fail silently until it does", file=os.sys.stderr)
 
     changes = []
     for path, data in desired.items():

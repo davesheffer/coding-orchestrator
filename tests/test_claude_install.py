@@ -355,10 +355,51 @@ class ClaudeInstallTests(unittest.TestCase):
         env = {"CLAUDE_HOME": str(self.home)}
         for found, warned in ((None, True), ("/usr/bin/python3", False)):
             stdout, stderr = io.StringIO(), io.StringIO()
-            with mock.patch.dict(os.environ, env),                     mock.patch.object(install_module.shutil, "which", return_value=found),                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with (mock.patch.dict(os.environ, env),
+                  mock.patch.object(install_module.shutil, "which", return_value=found),
+                  contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
                 self.assertEqual(install_module.main(["--dry-run"]), 0)
             self.assertEqual(f"`{install_module.hook_python()}` is not on PATH" in stderr.getvalue(),
                              warned, stderr.getvalue())
+        self.assertFalse(self.home.exists())
+
+    # os.name drives pathlib's PosixPath/WindowsPath selection, so it cannot be mocked
+    # away from the real platform without breaking Path() calls inside main(); each
+    # case below only runs on the platform it actually exercises.
+    @unittest.skipUnless(os.name == "nt", "Store-stub probe only runs on Windows")
+    def test_store_stub_interpreter_is_warned_on_windows(self):
+        env = {"CLAUDE_HOME": str(self.home)}
+        cases = (
+            (mock.Mock(returncode=0), False),  # probe succeeds
+            (mock.Mock(returncode=9009), True),  # Store alias prints a hint and exits 9009
+            (OSError("no such file"), True),
+            (subprocess.TimeoutExpired(cmd="python", timeout=10), True),
+        )
+        for run_effect, warned in cases:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            run_kwargs = {"side_effect": run_effect} if isinstance(run_effect, Exception) \
+                else {"return_value": run_effect}
+            with (mock.patch.dict(os.environ, env),
+                  mock.patch.object(install_module.shutil, "which", return_value="python"),
+                  mock.patch.object(install_module.subprocess, "run", **run_kwargs) as run,
+                  contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
+                self.assertEqual(install_module.main(["--dry-run"]), 0)
+            self.assertTrue(run.called)
+            self.assertEqual("did not run a real Python interpreter" in stderr.getvalue(),
+                             warned, stderr.getvalue())
+        self.assertFalse(self.home.exists())
+
+    @unittest.skipUnless(os.name == "posix", "the found-interpreter probe only runs on Windows")
+    def test_store_stub_probe_skipped_off_windows(self):
+        env = {"CLAUDE_HOME": str(self.home)}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (mock.patch.dict(os.environ, env),
+              mock.patch.object(install_module.shutil, "which", return_value="/usr/bin/python3"),
+              mock.patch.object(install_module.subprocess, "run") as run,
+              contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
+            self.assertEqual(install_module.main(["--dry-run"]), 0)
+        self.assertFalse(run.called)
+        self.assertNotIn("did not run a real Python interpreter", stderr.getvalue())
         self.assertFalse(self.home.exists())
 
     def test_merge_jev_hook_strips_owned_hooks_from_user_and_duplicate_groups(self):

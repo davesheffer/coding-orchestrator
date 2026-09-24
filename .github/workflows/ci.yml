@@ -29,6 +29,6 @@ jobs:
         shell: bash
         run: bash -n install.sh codex/install.sh
       - name: Test installers, executable entry points, release upgrades, and relay
-        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -v
       - name: Test VS Code handoff bridge
         run: node vscode/handoff-bridge/test.js

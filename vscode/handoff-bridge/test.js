@@ -67,6 +67,49 @@ Module._load = originalLoad;
       assert.match(ack.error, /invalid or expired/);
       assert.equal(fs.existsSync(path.join(root, 'launches', `${escapeId}.json`)), false);
     }
+    const escapeOutsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-orchestrator-bridge-outside-'));
+    const linkPath = path.join(root, 'handoffs', 'escape-link');
+    try {
+      fs.writeFileSync(path.join(escapeOutsideDir, 'secret.md'), 'SECRET\n');
+      fs.symlinkSync(escapeOutsideDir, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+      const linkId = '9'.repeat(32);
+      fs.writeFileSync(path.join(root, 'launches', `${linkId}.json`), JSON.stringify({
+        client: 'codex', handoff: path.join(linkPath, 'secret.md'),
+        prompt: 'Continue', created_at: Date.now() / 1000,
+      }));
+      calls.length = 0;
+      await bridge.handleUri({ path: '/open', query: `id=${linkId}` });
+      assert.equal(calls.length, 0);
+      const linkAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${linkId}.json`)));
+      assert.equal(linkAck.status, 'error');
+      assert.match(linkAck.error, /invalid or expired/);
+      assert.equal(fs.existsSync(path.join(root, 'launches', `${linkId}.json`)), false);
+    } finally {
+      fs.rmSync(linkPath, { recursive: true, force: true });
+      fs.rmSync(escapeOutsideDir, { recursive: true, force: true });
+    }
+    if (process.platform === 'win32' && /^[a-zA-Z]:/.test(root)) {
+      // A junction/symlink escape must be blocked, but a legit launch whose
+      // ORCHESTRATOR_HANDOFF_HOME only differs by drive-letter case must still work.
+      const flippedDrive = root[0] === root[0].toLowerCase() ? root[0].toUpperCase() : root[0].toLowerCase();
+      const flippedRoot = flippedDrive + root.slice(1);
+      const caseId = 'c'.repeat(32);
+      const savedEnv = process.env.ORCHESTRATOR_HANDOFF_HOME;
+      process.env.ORCHESTRATOR_HANDOFF_HOME = flippedRoot;
+      try {
+        fs.writeFileSync(path.join(root, 'launches', `${caseId}.json`), JSON.stringify({
+          client: 'codex', handoff, prompt: 'Continue via case-flipped home', created_at: Date.now() / 1000,
+        }));
+        calls.length = 0;
+        await bridge.handleUri({ path: '/open', query: `id=${caseId}` });
+        assert.deepEqual(calls.map(call => call[0]), ['chatgpt.newCodexPanel', 'clipboard']);
+        const caseAck = JSON.parse(fs.readFileSync(path.join(flippedRoot, 'acks', `${caseId}.json`)));
+        assert.equal(caseAck.status, 'opened');
+      } finally {
+        process.env.ORCHESTRATOR_HANDOFF_HOME = savedEnv;
+      }
+    }
+    calls.length = 0;
     const claudeId = 'b'.repeat(32);
     // Claude relay handoffs live under ~/.claude/relay/handoffs, outside the bridge home.
     fs.writeFileSync(path.join(root, 'launches', `${claudeId}.json`), JSON.stringify({
