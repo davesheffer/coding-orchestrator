@@ -56,8 +56,12 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual((self.home / "bin/rollover-open.py").read_bytes(),
                          (ROOT / "bin/rollover-open.py").read_bytes())
         instructions = (self.home / "CLAUDE.md").read_text(encoding="utf-8")
+        expected_python = install_module.python_command()
         expected_command = ("python " if os.name == "nt" else "") + shlex.quote(str(helper))
         self.assertIn(f"using `{expected_command}`", instructions)
+        self.assertIn(f"{expected_python} {shlex.quote(str(self.home / 'relay/relay.py'))} handoff", instructions)
+        self.assertNotIn("__PYTHON__", instructions)
+        self.assertTrue(all(command.startswith(f"{expected_python} ") for command in commands))
         if os.name == "posix":
             self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
         before = self.snapshot()
@@ -195,19 +199,21 @@ class ClaudeInstallTests(unittest.TestCase):
             'echo "relay/relay.py stop"',
             "python3 'unterminated",
         ]
-        legacy = 'python3 "$HOME/.claude/relay/relay.py" stop 2>/dev/null || true'
+        legacy = [f'{interpreter} "$HOME/.claude/relay/relay.py" stop 2>/dev/null || true'
+                  for interpreter in ("python", "python3")]
         group = {"matcher": "*", "timeout": 5, "hooks": [
-            {"type": "command", "command": command} for command in [legacy, *preserved]
+            {"type": "command", "command": command} for command in [*legacy, *preserved]
         ]}
         self.home.joinpath("settings.json").write_text(json.dumps({"hooks": {"Stop": [group]}}))
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
         groups = settings["hooks"]["Stop"]
-        self.assertEqual(groups[0], {**group, "hooks": group["hooks"][1:]})
+        self.assertEqual(groups[0], {**group, "hooks": group["hooks"][2:]})
         self.assertEqual(len(groups), 2)
         commands = [h["command"] for g in groups for h in g["hooks"]]
-        self.assertNotIn(legacy, commands)
+        for command in legacy:
+            self.assertNotIn(command, commands)
         self.assertEqual(len(commands), len(preserved) + 1)
         before = self.snapshot()
         self.assertEqual(self.run_install().returncode, 0)
@@ -220,7 +226,7 @@ class ClaudeInstallTests(unittest.TestCase):
         bin_dir = self.home / "bin"
 
         def group(matcher, script, sub=""):
-            command = f"python3 {shlex.quote(str(bin_dir / script))}{sub} 2>/dev/null || true"
+            command = f"{install_module.python_command()} {shlex.quote(str(bin_dir / script))}{sub} 2>/dev/null || true"
             timeout = 10 if sub == " gate" else 5
             return {"matcher": matcher, "hooks": [{"type": "command", "command": command, "timeout": timeout}]}
 
@@ -285,16 +291,16 @@ class ClaudeInstallTests(unittest.TestCase):
         bin_dir = self.home / "bin"
         route = shlex.quote(str(bin_dir / "jev-route.py"))
         guard = shlex.quote(str(bin_dir / "jev-guard.py"))
-        for command in (f"python3 {route} 2>/dev/null || true", f"python3 {route}",
-                        'python3 "$HOME/.claude/bin/jev-route.py" 2>/dev/null || true',
-                        f"python3 {guard} gate 2>/dev/null || true",
-                        f"python3 {guard} agent-done",
-                        f"python3 {guard} handback 2>/dev/null || true",
-                        'python3 "$HOME/.claude/bin/jev-guard.py" agent-done 2>/dev/null || true'):
-            self.assertTrue(install_module.is_jev_hook(command, bin_dir), command)
+        for interpreter in ("python", "python3"):
+            for command in (f"{interpreter} {route} 2>/dev/null || true", f"{interpreter} {route}",
+                            f'{interpreter} "$HOME/.claude/bin/jev-route.py" 2>/dev/null || true',
+                            f"{interpreter} {guard} gate 2>/dev/null || true",
+                            f"{interpreter} {guard} agent-done",
+                            f"{interpreter} {guard} handback 2>/dev/null || true",
+                            f'{interpreter} "$HOME/.claude/bin/jev-guard.py" agent-done 2>/dev/null || true'):
+                self.assertTrue(install_module.is_jev_hook(command, bin_dir), command)
         for command in (f"python3 {route} --dry 2>/dev/null || true",
                         f"python3 {route} | tee /tmp/log",
-                        f"python {route} 2>/dev/null || true",
                         "python3 /other-project/bin/jev-route.py 2>/dev/null || true",
                         f"python3 {route} 2>/dev/null || true && audit",
                         f"python3 {route} gate 2>/dev/null || true",
@@ -303,6 +309,12 @@ class ClaudeInstallTests(unittest.TestCase):
                         f"python3 {guard} gate agent-done",
                         "python3 'unterminated", None):
             self.assertFalse(install_module.is_jev_hook(command, bin_dir), command)
+
+    def test_generated_interpreter_matches_host_platform(self):
+        expected = "python" if os.name == "nt" else "python3"
+        self.assertEqual(install_module.python_command(), expected)
+        command = install_module.jev_template(self.home / "bin")["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertTrue(command.startswith(f"{expected} "))
 
     def test_merge_jev_hook_strips_owned_hooks_from_user_and_duplicate_groups(self):
         bin_dir = self.home / "bin"

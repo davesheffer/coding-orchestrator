@@ -38,7 +38,7 @@ The hook reports observed usage: GREEN means continue; AMBER means delegate read
 Write a self-contained handoff:
 
 ```bash
-python3 __RELAY__ handoff --title "<short title>" <<'HANDOFF'
+__PYTHON__ __RELAY__ handoff --title "<short title>" <<'HANDOFF'
 GOAL: intended outcome
 STATE: completed and remaining work, with paths
 DECISIONS & CONSTRAINTS: reasons, preferences, corrections, rejected approaches
