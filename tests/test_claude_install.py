@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import itertools
 import json
 import os
@@ -14,6 +15,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / "claude" / "install.py"
+_SPEC = importlib.util.spec_from_file_location("claude_install_module", INSTALL)
+install_module = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(install_module)
 
 
 class ClaudeInstallTests(unittest.TestCase):
@@ -208,6 +212,122 @@ class ClaudeInstallTests(unittest.TestCase):
         before = self.snapshot()
         self.assertEqual(self.run_install().returncode, 0)
         self.assertEqual(self.snapshot(), before)
+
+    def test_jev_hook_is_opt_in_owned_and_preserves_user_hooks(self):
+        self.home.mkdir(parents=True)
+        user = {"matcher": "Bash", "hooks": [{"type": "command", "command": "audit-bash"}]}
+        self.home.joinpath("settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [user]}}))
+        bin_dir = self.home / "bin"
+
+        def group(matcher, script, sub=""):
+            command = f"python3 {shlex.quote(str(bin_dir / script))}{sub} 2>/dev/null || true"
+            timeout = 10 if sub == " gate" else 5
+            return {"matcher": matcher, "hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+
+        def hooks():
+            settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
+            return settings["hooks"].get("PreToolUse"), settings["hooks"].get("PostToolUse")
+
+        config = self.home / "relay/config.json"
+        result = self.run_install("--jev")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["jev"], {"enabled": True})
+        self.assertEqual(hooks(), (
+            [user, group("Agent|Task", "jev-route.py"), group("Bash", "jev-guard.py", " gate"),
+             group("SubagentHandback", "jev-guard.py", " handback")],
+            [group("Agent|Task|SubagentHandback", "jev-guard.py", " agent-done")]))
+        manifest = json.loads(self.home.joinpath(".coding-orchestrator-manifest.json").read_text())
+        for name in ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py"):
+            self.assertEqual((bin_dir / name).read_bytes(), (ROOT / "bin" / name).read_bytes())
+            self.assertIn(f"bin/{name}", manifest["files"])
+        before = self.snapshot()
+        self.assertEqual(self.run_install("--jev").returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(hooks(), ([user], None))
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["jev"], {"enabled": False})
+        self.assertTrue((bin_dir / "jev-route.py").exists())
+
+    def test_rollover_flag_sets_only_that_config_key(self):
+        config = self.home / "relay/config.json"
+        self.assertEqual(self.run_install("--rollover", "copy").returncode, 0)
+        fresh = json.loads(config.read_text(encoding="utf-8"))
+        template = json.loads((ROOT / "relay/config.json").read_text(encoding="utf-8"))
+        self.assertEqual(fresh, {**template, "rollover": "copy"})
+        tuned = {"soft_tokens": 1, "hard_tokens": 2, "auto_open": False, "jev": {"log": False}}
+        config.write_text(json.dumps(tuned), encoding="utf-8")
+        before = self.snapshot()
+        dry = self.run_install("--dry-run", "--rollover", "open")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(f"write {config}", dry.stdout)
+        self.assertEqual(self.snapshot(), before)
+        result = self.run_install("--rollover", "copy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Installing without --jev also pins jev.enabled off, keeping other jev keys.
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8")),
+                         {**tuned, "rollover": "copy", "jev": {"log": False, "enabled": False}})
+        self.assertEqual(json.loads(config.with_name("config.json.bak").read_text()), tuned)
+        after = self.snapshot()
+        self.assertEqual(self.run_install("--rollover", "copy").returncode, 0)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.snapshot(), after)
+
+    def test_default_install_ignores_malformed_user_pre_tool_use(self):
+        self.home.mkdir(parents=True)
+        malformed = ["not-a-group", {"matcher": "Bash", "hooks": "not-a-list"}]
+        self.home.joinpath("settings.json").write_text(json.dumps({"hooks": {"PreToolUse": malformed}}))
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings["hooks"]["PreToolUse"], malformed)
+
+    def test_is_jev_hook_rejects_near_misses(self):
+        bin_dir = self.home / "bin"
+        route = shlex.quote(str(bin_dir / "jev-route.py"))
+        guard = shlex.quote(str(bin_dir / "jev-guard.py"))
+        for command in (f"python3 {route} 2>/dev/null || true", f"python3 {route}",
+                        'python3 "$HOME/.claude/bin/jev-route.py" 2>/dev/null || true',
+                        f"python3 {guard} gate 2>/dev/null || true",
+                        f"python3 {guard} agent-done",
+                        f"python3 {guard} handback 2>/dev/null || true",
+                        'python3 "$HOME/.claude/bin/jev-guard.py" agent-done 2>/dev/null || true'):
+            self.assertTrue(install_module.is_jev_hook(command, bin_dir), command)
+        for command in (f"python3 {route} --dry 2>/dev/null || true",
+                        f"python3 {route} | tee /tmp/log",
+                        f"python {route} 2>/dev/null || true",
+                        "python3 /other-project/bin/jev-route.py 2>/dev/null || true",
+                        f"python3 {route} 2>/dev/null || true && audit",
+                        f"python3 {route} gate 2>/dev/null || true",
+                        f"python3 {guard} 2>/dev/null || true",
+                        f"python3 {guard} rm-rf 2>/dev/null || true",
+                        f"python3 {guard} gate agent-done",
+                        "python3 'unterminated", None):
+            self.assertFalse(install_module.is_jev_hook(command, bin_dir), command)
+
+    def test_merge_jev_hook_strips_owned_hooks_from_user_and_duplicate_groups(self):
+        bin_dir = self.home / "bin"
+        template = install_module.jev_template(bin_dir)["hooks"]
+        owned = template["PreToolUse"][0]
+        owned_hook = owned["hooks"][0]
+        user_hook = {"type": "command", "command": "audit-agent"}
+        settings = {"hooks": {"PreToolUse": [
+            {"matcher": "Agent", "hooks": [user_hook, owned_hook]}, owned, owned],
+            "PostToolUse": template["PostToolUse"] * 2}}
+        removed = install_module.merge_jev_hook(settings, bin_dir, False)
+        self.assertEqual(removed["hooks"]["PreToolUse"], [{"matcher": "Agent", "hooks": [user_hook]}])
+        self.assertNotIn("PostToolUse", removed["hooks"])
+        added = install_module.merge_jev_hook(settings, bin_dir, True)
+        self.assertEqual(added["hooks"]["PreToolUse"],
+                         [{"matcher": "Agent", "hooks": [user_hook]}] + template["PreToolUse"])
+        self.assertEqual(added["hooks"]["PostToolUse"], template["PostToolUse"])
+        only_ours = install_module.merge_jev_hook({"hooks": {"PreToolUse": [owned, owned]}}, bin_dir, False)
+        self.assertNotIn("PreToolUse", only_ours["hooks"])
+
+    def test_default_install_adds_no_pre_tool_use_hook(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
+        self.assertNotIn("PreToolUse", settings["hooks"])
+        self.assertNotIn("PostToolUse", settings["hooks"])
 
     @unittest.skipUnless(os.name == "posix", "generated hook commands require a POSIX shell")
     def test_installed_relay_and_hook_work_without_install_environment(self):

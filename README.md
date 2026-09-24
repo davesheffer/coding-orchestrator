@@ -76,18 +76,63 @@ bundle commands and preserves other projects' relays and user-added commands.
 Writes are atomic per file, not across the installation; an unexpected I/O error
 can leave a partial install. Inspect backups and rerun after resolving the error.
 
-Start a new Claude Code session after installation. The existing relay handles
-the GREEN/AMBER/RED context gauge and session handoffs; see `relay/config.json`
-for its thresholds. Roles have bounded turns, explicit permission modes, narrow
-tool allowlists, and no MCP tools. Claude Code can still apply a stronger parent
-permission mode, so use `/tasks` and `/status` to confirm the effective model and
-settings when validating a new machine.
+Start a new Claude Code session after installation. Roles have bounded turns,
+explicit permission modes, narrow tool allowlists, and no MCP tools. Claude Code
+can still apply a stronger parent permission mode, so use `/tasks` and `/status`
+to confirm the effective model and settings when validating a new machine.
 
 On Windows, use `python claude/install.py --dry-run` followed by
 `python claude/install.py`. Claude's generated hooks still require a POSIX shell
 and a working `python3` command (for example, through Git Bash); native PowerShell
 installation alone does not verify those hooks. For a custom destination, set
 `CLAUDE_CONFIG_DIR` to the same directory as `CLAUDE_HOME` when launching Claude.
+
+#### Context relay and rollover
+
+The relay (`relay/relay.py`) runs as `UserPromptSubmit` and `Stop` hooks. Once a
+session is non-trivial (`task_shift_min_tokens`, default 30k), each prompt gets a
+context gauge:
+
+| Zone | Default threshold | What the model is told |
+|---|---|---|
+| GREEN | below `soft_tokens` (150k) | Work normally; roll over only if the prompt starts unrelated work |
+| AMBER | `soft_tokens` (150k) | Push reading and mechanical work to subagents; roll over at the next natural boundary |
+| RED | `hard_tokens` (250k) | Roll over now; the `Stop` hook blocks one stop to enforce it |
+
+A **handoff** is a self-contained Markdown note (goal, state, decisions, files,
+verified vs unverified, next step, and optionally the user's next prompt) that
+the model pipes to `relay.py handoff --title "<title>"`. The relay saves it as
+`relay/handoffs/<id>.md` and produces a resume prompt such as
+`relay:1a2b3c4d continue "<title>" from the handoff.` Sending that prompt in a
+fresh session injects the handoff so the new session continues the work.
+Handoffs and per-session state older than `handoff_ttl_hours` (72) are removed
+the next time a handoff is written; resuming a handoff refreshes its age.
+
+Rollover has two modes:
+
+- **`open`** (default): the relay asks the shared VS Code bridge
+  (`bin/rollover-open.py`) to open a new Claude tab. If the bridge is missing or
+  fails, it tries the editor's `vscode://anthropic.claude-code/open` URI with the
+  prompt pre-filled (Claude Code's VS Code-family extension on macOS or Windows
+  only). If neither launch is confirmed, it falls back to copy behaviour.
+- **`copy`**: no tab or editor launch is attempted. The relay only copies the
+  resume prompt to the clipboard and prints it. Start a new Claude session (a
+  new tab or `/clear`) and paste it. The clipboard is `pbcopy` on macOS, `clip`
+  on Windows, or the first of `wl-copy`, `xclip`, or `xsel` found on Linux. If
+  none works, the relay prints `clipboard unavailable` and the prompt; the
+  handoff still succeeds.
+
+Choose the mode in any of these ways (highest precedence first):
+
+1. `CLAUDE_RELAY_ROLLOVER=copy` or `open` in the environment.
+2. `"rollover": "copy"` or `"open"` in the installed `relay/config.json`. Run
+   `./install.sh --rollover copy` to set it. The flag updates only that key in
+   an existing config, keeps a backup, and respects `--dry-run`.
+3. Legacy `"auto_open": false` in `relay/config.json` still means `copy`.
+
+`relay.py handoff --no-open` behaves as `copy` for a single handoff. Without
+`--rollover`, the installer never changes an existing `relay/config.json`, which
+also holds the zone thresholds.
 
 Each relay measurement reads at most the last **8 MiB** of the transcript. Missing
 usage or a compaction boundary without subsequent usage yields **unknown**, never
@@ -97,6 +142,118 @@ Handoff files and relay input/output use UTF-8, including on Windows.
 Legacy handoffs can still be read using the machine's local encoding. If a
 handoff was moved from a different locale and cannot be decoded, the hook reports
 that it needs conversion instead of silently discarding its contents.
+
+#### Optional: Jev integrations
+
+`./install.sh --jev` turns on five opt-in hooks. They use TypeSafe's hosted Jev
+classifier (`POST https://api.typesafe.ai/v1/systemone`) to route subagents, spot
+task changes, gate risky commits, check subagent reports, and grade handoffs.
+The scripts are always installed. Only `--jev` registers the hooks and sets
+`jev.enabled` to `true` in the installed `relay/config.json`. Rerunning
+`./install.sh` without `--jev` removes only the hooks this bundle owns and sets
+`jev.enabled` back to `false`. Your own hooks and other `jev` keys stay. A
+`TYPESAFE_API_KEY` in the environment alone never turns anything on.
+
+| Feature | Runs in | Question for Jev | What happens | Sent to TypeSafe |
+|---|---|---|---|---|
+| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A confident choice that differs from the current model is applied through `updatedInput.model` | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
+| `shift` | `UserPromptSubmit` → `relay/relay.py prompt` | Does the new prompt continue the recent prompts / handoff goal? | Below `shift_low`: "TASK SHIFT DETECTED — roll over now". Above `shift_high`: the generic task-shift reminder is dropped | Last 5 prompts (500 chars each), handoff GOAL, new prompt (2,000 chars) |
+| `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds | Operation, changed file names, diff (`send_diff`, `max_diff_chars`) |
+| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A weak hand-back report is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections |
+| `handoff_grade` | `relay.py handoff` | How actionable is this handoff for a fresh session (0–4)? Is NEXT STEP concrete? Do VERIFIED claims cite commands? | Below `handoff_min_score`: prints the gaps and **exits 3 without saving**. `--accept-weak` saves anyway | The handoff body (12,000 chars) |
+
+Missing sections count as weak without asking Jev: headers must be uppercase
+with a colon (`RESULT:`, `EVIDENCE:`, `CONFIDENCE:`, `UNVERIFIED:`). A
+self-reported low or medium CONFIDENCE does not deny the hand-back by itself;
+it only adds the foreground "verify or escalate" note. Hand-back denial is for
+missing sections or a report Jev judges weak. Report checks apply to
+`report_roles`. The risk gate records a critic run from when the critic was
+launched, so edits made while it was still running need a fresh review; any
+critic run counts, and a deleted file always needs review. For
+`git add … && git commit` and `commit -a`, the gate compares the work tree
+with `HEAD`, because nothing is staged when the hook runs; new untracked files
+(`git ls-files --others --exclude-standard`) are included by name. Their
+contents are omitted because an untracked path can be a symlink outside the
+repository; review new files directly before relying on the gate's advice.
+
+`risk_gate` is advisory, not enforcement. It can be bypassed with
+`command git`, `/usr/bin/git`, `env X=1 git`, `sh -c`, a shell alias, and
+similar. It also misses `git commit <pathspec>` with nothing staged, a
+`"$(git push)"` inside double quotes, and `--git-dir`/`--work-tree` or
+`GIT_DIR`/`GIT_WORK_TREE` pointing at another repo (these are detected, but the
+gate still diffs the current directory). It understands `VAR=value git`,
+`git -c k=v`, `--no-pager`, `-C <dir>` and earlier `cd <dir>` steps in the
+same command, including
+a subshell (`cd <dir> && git add -A && git commit`, `(cd <dir> && git commit)`),
+and ignores quoted text and heredoc bodies when looking for a git commit or
+push. Git calls within one gate run share a single time budget; if it runs out,
+the gate allows the call. With more than 1,000 untracked files, only the first
+1,000 are sent, and the change always counts as needing review.
+
+`send_prompt` only applies to `route`. `shift` and `handoff_grade` always send
+the text listed in their row above; turn those features off if you want to
+avoid sending it.
+
+Everything fails open. A missing key, a disabled feature, an HTTP error, a
+malformed answer, or a timeout gives exactly the pre-Jev behaviour. Every
+classifier call has a hard deadline of `min(timeout_seconds, 4)` seconds.
+Denials and the handoff's exit 3 are the only ways a Jev hook changes the
+outcome of a call, and each can be overridden by retrying.
+
+Provide `TYPESAFE_API_KEY` in your shell environment, in the `"env"` block of
+Claude Code's `settings.json`, or as a file path in `jev.api_key_file`. The key
+is never printed or logged. Tune the integrations under the `"jev"` key of the
+installed `relay/config.json`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` (`true` after `--jev`) | Set `false` to turn every feature off without reinstalling |
+| `features` | all `true` | Per-feature switches: `route`, `shift`, `risk_gate`, `report_check`, `handoff_grade` |
+| `api_key_file` | unset | File containing the key when `TYPESAFE_API_KEY` is not set (`~` is expanded) |
+| `endpoint`, `jev_model` | TypeSafe endpoint, `"jev-latest"` | Classifier API and model. The endpoint must be `https`, or `http` only to `localhost`, `127.0.0.1`, or `::1` |
+| `timeout_seconds` | `3` | Classifier deadline, capped at 4 s |
+| `log` | `true` | Append one line per decision to `relay/jev-log.jsonl` |
+| `min_confidence` | `0.5` | route: below this, the call is left unchanged |
+| `respect_explicit_model` | `false` | route: never override a call that already sets `model` |
+| `pinned_agents` | `["critic", "fork"]` | route: subagent types that are never rerouted |
+| `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
+| `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted |
+| `shift_low`, `shift_high` | `0.25`, `0.75` | shift: probability-of-continuation thresholds |
+| `send_diff`, `max_diff_chars` | `true`, `12000` | risk_gate: send the truncated diff, or only the operation and file names |
+| `risk_min_probability` | `0.6` | risk_gate: minimum "needs review" probability to deny |
+| `report_roles` | scout, runner, builder, critic | report_check: roles whose reports are checked |
+| `report_min_support`, `report_max_gap` | `0.5`, `0.5` | report_check: evidence-support floor and material-gap ceiling |
+| `max_report_chars` | `8000` | report_check: report text considered |
+| `handoff_min_score` | `2` | handoff_grade: minimum score (0–4) to save without `--accept-weak` |
+
+Each line of `relay/jev-log.jsonl` (mode 0600, rotated to `jev-log.jsonl.1` past
+1 MiB) records the feature, the decision, the classifier's numbers, and the
+latency. `route` records `desc_hash`, a short hash of the task description, so
+`jev-report.py` can join routing decisions with report checks. Log lines never
+contain prompt, diff or report text, task descriptions, file names, commands,
+or the key. Summarize the log with:
+
+```sh
+python3 ~/.claude/bin/jev-report.py          # or --json
+```
+
+It shows routing choices per role, the confidence histogram, applied rate,
+latency, and decision counts per feature. It also shows the weak-report rate
+per model tier: a tier whose reports are often weak may be too small for the
+tasks it gets. From the repository, `python3 bin/eval-jev-routing.py` scores
+routing against the 30 labelled tasks in `benchmarks/jev-routing.json`: it
+reports accuracy, a confusion matrix, and confidence when right versus wrong.
+It makes 30 live API calls. `--dry-run` only validates the file, and
+`--labels-file` tries alternative tier rubrics. The default rubrics scored 30/30
+(the earlier wording was 25/30, with opus tasks going to sonnet). They were tuned
+on this benchmark, so check your own log with `jev-report.py` too.
+
+**Privacy:** with `--jev`, the text listed under "Sent to TypeSafe" goes to
+TypeSafe's paid third-party API. Turn off a feature under `jev.features`, or use
+`send_prompt: false` and `send_diff: false` to send less. Only while `shift` is
+on, the relay keeps your last five prompts (500 chars each) and the handoff GOAL
+line in its per-session state file `relay/state/<session>.json` (mode 0600),
+which is removed after `handoff_ttl_hours`.
 
 ### Codex
 
@@ -220,10 +377,12 @@ The installed global instructions tell it to pipe the state into the helper.
 On Windows the direct helper is `python "$env:USERPROFILE/.codex/bin/rollover-open.py" handoff --client codex --title "task"`;
 it reads the handoff from standard input. The bridge opens a new Codex tab and
 copies the complete handoff with its continuation prompt; paste it and press Enter.
-Claude's relay opens a new Claude tab with its resume prompt prefilled; press
-Enter. The helper reports whether VS Code acknowledged opening the tab, and
-prints a manual continuation prompt when it cannot confirm the launch. The
-bridge requires the corresponding Claude Code or Codex VS Code extension.
+In rollover `open` mode, Claude's relay opens a new Claude tab with its resume
+prompt prefilled; press Enter. In `copy` mode it only copies the prompt (see
+[Context relay and rollover](#context-relay-and-rollover)). The helper reports
+whether VS Code acknowledged opening the tab, and prints a manual continuation
+prompt when it cannot confirm the launch. The bridge requires the corresponding
+Claude Code or Codex VS Code extension.
 
 ## PR and CI status
 
@@ -267,6 +426,7 @@ runner. No credentials are included.
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
 | `bin/pr-status` | Shared PR/CI helper |
 | `bin/rollover-open.py`, `vscode/handoff-bridge/` | Shared handoff protocol and VS Code tab bridge |
+| `bin/jev_client.py`, `bin/jev-route.py`, `bin/jev-guard.py`, `bin/jev-report.py`, `bin/eval-jev-routing.py` | Opt-in TypeSafe Jev hooks (routing, risk gate, report check), log report and routing eval |
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
 | `tests/` | Bundle contracts, both installers, and relay behavior |

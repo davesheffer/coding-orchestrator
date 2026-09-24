@@ -1,0 +1,215 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "locate-write-log",
+      "subagent_type": "scout",
+      "description": "Find jev log writer",
+      "prompt": "Locate the function that appends entries to relay/jev-log.jsonl and the size threshold that triggers rotation. Cite path and line numbers. Do not edit files.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "run-relay-tests",
+      "subagent_type": "runner",
+      "description": "Run relay tests",
+      "prompt": "Run `python3 -m unittest tests.test_relay -v` from the repository root and report the pass/fail counts and the exact exit code. Quote any failure tracebacks verbatim, truncated to 40 lines.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "rename-constant",
+      "subagent_type": "builder",
+      "description": "Rename constant",
+      "prompt": "In bin/jev_client.py rename MAX_LOG_BYTES to MAX_JEV_LOG_BYTES and update every reference in bin/ and tests/. No other changes; run tests.test_jev_route afterwards.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "list-hook-events",
+      "subagent_type": "scout",
+      "description": "List hook events",
+      "prompt": "Read hooks.json and list every hook event name with the command it runs. Report as a table; do not edit anything.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "bump-default-timeout",
+      "subagent_type": "builder",
+      "description": "Change default timeout",
+      "prompt": "In bin/jev_client.py change DEFAULTS[\"timeout_seconds\"] from 3 to 2 and update the one test in tests/test_jev_route.py that asserts the default. Run that test file and report the exit code.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "pr-status-once",
+      "subagent_type": "runner",
+      "description": "Check PR status",
+      "prompt": "Run bin/pr-status once for the current branch and summarize the CI checks that are failing, with their names and URLs. Do not retry or poll.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "add-gitignore-entry",
+      "subagent_type": "builder",
+      "description": "Ignore rotated jev log",
+      "prompt": "Add the line `relay/jev-log.jsonl.1` to .gitignore directly below the existing `relay/jev-log.jsonl` entry. Nothing else.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "summarize-install-flags",
+      "subagent_type": "scout",
+      "description": "Summarize installer flags",
+      "prompt": "Summarize the command-line flags accepted by claude/install.py and what each one does, citing the argparse lines. Read-only.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "tricky-builder-docstring",
+      "subagent_type": "builder",
+      "description": "Refactor relay handoff flow",
+      "prompt": "Only update the module docstring at the top of relay/relay.py so it mentions the `copy` rollover mode alongside `open`; the exact new sentence is: 'Rollover mode copy puts the relay prompt on the clipboard instead of opening a tab.' Do not touch any code.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "grep-todo",
+      "subagent_type": "general-purpose",
+      "description": "Find TODOs",
+      "prompt": "Grep the repository for TODO and FIXME comments outside tests/ and list them with file:line. Do not edit files.",
+      "expected": "sonnet"
+    },
+    {
+      "id": "add-report-check-hook",
+      "subagent_type": "builder",
+      "description": "Add report check hook",
+      "prompt": "Implement a SubagentStop hook script bin/jev-report-check.py that uses jev_client.ask with the report_check feature, decides weak/strong from report_min_support and report_max_gap, and logs the result. Design the questions yourself, wire it into hooks.json and claude/install.py, and add unit tests covering disabled, timeout and weak cases.",
+      "expected": "opus"
+    },
+    {
+      "id": "fix-flaky-rollover-test",
+      "subagent_type": "general-purpose",
+      "description": "Fix flaky rollover test",
+      "prompt": "tests/test_rollover_open.py::test_opens_new_tab fails roughly one run in ten on macOS with a temp-path mismatch. The last commit resolved canonical temp paths in some tests; find the remaining spot and fix it with a regression test.",
+      "expected": "opus"
+    },
+    {
+      "id": "config-merge-refactor",
+      "subagent_type": "builder",
+      "description": "Refactor config merge",
+      "prompt": "load_config in bin/jev_client.py and the relay config loader in relay/relay.py duplicate merge logic for nested dicts. Extract a shared helper, keep existing behaviour for null-removal of labels, and update both callers and their tests.",
+      "expected": "opus"
+    },
+    {
+      "id": "design-install-tests",
+      "subagent_type": "general-purpose",
+      "description": "Tests for installer",
+      "prompt": "claude/install.py now writes the jev hooks into settings.json. Write tests that cover a fresh install, re-install idempotence, and preserving unrelated user hooks; pick fixtures and structure that fit tests/test_claude_install.py.",
+      "expected": "opus"
+    },
+    {
+      "id": "tricky-scout-debug",
+      "subagent_type": "scout",
+      "description": "Why is log empty",
+      "prompt": "Users report relay/jev-log.jsonl stays empty even though routing clearly changes models. Trace the log path from jev-route.py through write_log and the installer's copy step, reproduce with a temp install, and propose the fix with a patch.",
+      "expected": "opus"
+    },
+    {
+      "id": "codex-parity",
+      "subagent_type": "builder",
+      "description": "Port routing to Codex",
+      "prompt": "Port the jev routing hook to the Codex installer in codex/install.py so it registers the equivalent hook, adapting to Codex's config.toml format. Mirror the Claude tests where the concepts overlap.",
+      "expected": "opus"
+    },
+    {
+      "id": "relay-handoff-validation",
+      "subagent_type": "builder",
+      "description": "Validate handoff fields",
+      "prompt": "relay.py handoff accepts any text. Add validation that warns (not fails) when GOAL, NEXT STEP or VERIFIED sections are missing, keep the CLI output stable for existing callers, and add tests for each warning.",
+      "expected": "opus"
+    },
+    {
+      "id": "agent-run-retry",
+      "subagent_type": "general-purpose",
+      "description": "Retry transient errors",
+      "prompt": "bin/agent-run.py gives up on the first HTTP 429 from the model API. Add bounded retries with backoff for 429/503 only, make the delays injectable for tests, and cover success-after-retry and give-up cases.",
+      "expected": "opus"
+    },
+    {
+      "id": "report-json-schema",
+      "subagent_type": "builder",
+      "description": "Stabilize report output",
+      "prompt": "bin/agent-report.py emits ad-hoc JSON. Define a versioned output shape, update the producer and the two consumers in bin/, and add tests that pin the schema while tolerating older reports.",
+      "expected": "opus"
+    },
+    {
+      "id": "debug-frontmatter",
+      "subagent_type": "general-purpose",
+      "description": "Frontmatter model ignored",
+      "prompt": "current_model() in bin/jev-route.py returns None for agents whose .md files use CRLF and a BOM. Reproduce, fix the parser without breaking the existing cases, and add tests for BOM, CRLF and quoted values.",
+      "expected": "opus"
+    },
+    {
+      "id": "routing-architecture",
+      "subagent_type": "general-purpose",
+      "description": "Plan routing v2",
+      "prompt": "Decide whether model routing should stay a PreToolUse hook or move into the orchestrator prompt, weighing latency, fail-open guarantees, user overrides and observability. Produce a recommendation with rejected alternatives and a migration plan.",
+      "expected": "fable"
+    },
+    {
+      "id": "critic-risk-gate",
+      "subagent_type": "critic",
+      "description": "Review risk gate diff",
+      "prompt": "Adversarially review the uncommitted risk_gate change: can a crafted commit message or diff make the gate return allow for a push that should be denied, or leak diff text into the log? Attack the claim that it is fail-closed for high-risk pushes.",
+      "expected": "fable"
+    },
+    {
+      "id": "tricky-short-concurrency",
+      "subagent_type": "general-purpose",
+      "description": "Log rotation",
+      "prompt": "Several hook processes append to relay/jev-log.jsonl concurrently while one may rotate it with os.replace. Determine whether entries can be lost, duplicated or interleaved across the rotation boundary on macOS and Linux, and design a fix that stays stdlib-only and lock-free if possible.",
+      "expected": "fable"
+    },
+    {
+      "id": "api-key-exposure",
+      "subagent_type": "general-purpose",
+      "description": "Audit key handling",
+      "prompt": "Audit every path by which TYPESAFE_API_KEY or api_key_file content could reach logs, exception messages, subprocess environments or relay handoffs. Rank the findings by exploitability and recommend mitigations.",
+      "expected": "fable"
+    },
+    {
+      "id": "unclear-hang",
+      "subagent_type": "general-purpose",
+      "description": "Session hangs sometimes",
+      "prompt": "About once a day a Claude session stalls for exactly five seconds before every Agent call, with no errors logged. Nobody knows whether it is the jev hook, the relay gauge, or the client; find the root cause.",
+      "expected": "fable"
+    },
+    {
+      "id": "tricky-scout-threat-model",
+      "subagent_type": "scout",
+      "description": "Look at endpoint check",
+      "prompt": "Is endpoint_allowed in bin/jev_client.py sufficient to stop the API key being sent to an attacker-controlled host, considering userinfo tricks, IPv6 literals, DNS rebinding for localhost and redirects followed by urllib? Give a verdict with concrete bypasses if any.",
+      "expected": "fable"
+    },
+    {
+      "id": "critic-installer",
+      "subagent_type": "critic",
+      "description": "Review installer change",
+      "prompt": "Review the installer diff that rewrites settings.json hooks in place. Attack atomicity (crash mid-write), concurrent installs, symlinked settings files and preservation of user hooks; report each finding with a reproduction.",
+      "expected": "fable"
+    },
+    {
+      "id": "fail-open-policy",
+      "subagent_type": "general-purpose",
+      "description": "Fail-open or closed",
+      "prompt": "Jev features are fail-open, but the risk gate could arguably be fail-closed for pushes. Decide the policy per feature, considering outage behaviour, user trust and bypass incentives, and write the decision record.",
+      "expected": "fable"
+    },
+    {
+      "id": "calibration-strategy",
+      "subagent_type": "general-purpose",
+      "description": "Confidence calibration",
+      "prompt": "Router confidences are almost all above 0.99 yet a third of routed tasks later produce weak reports. Figure out whether the classifier, the label rubrics, or our tier join is wrong, and design an evaluation that can tell them apart.",
+      "expected": "fable"
+    },
+    {
+      "id": "deadline-thread-race",
+      "subagent_type": "critic",
+      "description": "Check deadline helper",
+      "prompt": "call_with_deadline leaves a daemon thread running after a timeout. Reason about whether a late result, exception, or interpreter shutdown can corrupt hook output or the log, and whether the 5 s hook budget can still be exceeded.",
+      "expected": "fable"
+    }
+  ]
+}

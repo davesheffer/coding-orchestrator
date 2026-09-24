@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Safely install the Claude Code orchestration bundle.
 
-Usage: install.py [--force] [--dry-run]
+Usage: install.py [--force] [--dry-run] [--jev] [--rollover {open,copy}]
 """
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ LEGACY_MANAGED_HASHES = {
     },
 }
 MANIFEST = ".coding-orchestrator-manifest.json"
+JEV_SCRIPTS = ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py")
 
 
 def fail(message: str) -> None:
@@ -133,6 +134,89 @@ def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
             and parts[3:] in ([], ["2>/dev/null", "||", "true"]))
 
 
+# (event, matcher, script, subcommand) for every opt-in Jev hook this installer owns.
+JEV_HOOKS = (
+    ("PreToolUse", "Agent|Task", "jev-route.py", None),
+    ("PreToolUse", "Bash", "jev-guard.py", "gate"),
+    ("PreToolUse", "SubagentHandback", "jev-guard.py", "handback"),
+    ("PostToolUse", "Agent|Task|SubagentHandback", "jev-guard.py", "agent-done"),
+)
+JEV_EVENTS = ("PreToolUse", "PostToolUse")
+
+
+def is_jev_hook(command: object, bin_dir: Path) -> bool:
+    """Match only complete opt-in Jev hook commands emitted by this installer."""
+    if not isinstance(command, str):
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    for _, _, script, sub in JEV_HOOKS:
+        owned_paths = {str(bin_dir / script), str(Path.home() / ".claude/bin" / script),
+                       f"$HOME/.claude/bin/{script}", f"${{HOME}}/.claude/bin/{script}",
+                       f"~/.claude/bin/{script}"}
+        args = [sub] if sub else []
+        if (len(parts) >= 2 and parts[0] == "python3" and parts[1] in owned_paths
+                and parts[2:] in (args, args + ["2>/dev/null", "||", "true"])):
+            return True
+    return False
+
+
+def jev_template(bin_dir: Path) -> dict:
+    hooks: dict = {event: [] for event in JEV_EVENTS}
+    for event, matcher, script, sub in JEV_HOOKS:
+        command = f"python3 {shlex.quote(str(bin_dir / script))}" + (f" {sub}" if sub else "")
+        # The risk gate may run several git commands before its ≤4 s classifier call.
+        hooks[event].append({"matcher": matcher, "hooks": [{
+            "type": "command", "command": f"{command} 2>/dev/null || true",
+            "timeout": 10 if sub == "gate" else 5}]})
+    return {"hooks": hooks}
+
+
+def strip_owned(groups: list, event: str, owned) -> list:
+    cleaned = []
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks", []), list):
+            fail(f"settings.json hooks.{event} contains an invalid group")
+        kept = [h for h in group.get("hooks", [])
+                if not (isinstance(h, dict) and h.get("type") == "command"
+                        and owned(h.get("command")))]
+        if kept or not group.get("hooks"):
+            copy = dict(group)
+            copy["hooks"] = kept
+            cleaned.append(copy)
+    return cleaned
+
+
+def merge_jev_hook(existing: dict, bin_dir: Path, enabled: bool) -> dict:
+    """Remove owned Jev hooks, then re-add the groups only when opted in."""
+    result = json.loads(json.dumps(existing))
+    hooks = result.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        fail("settings.json hooks must be an object")
+    template = jev_template(bin_dir)["hooks"]
+    for event in JEV_EVENTS:
+        have = hooks.get(event, [])
+        owned = (isinstance(have, list) and any(
+            isinstance(group, dict) and isinstance(group.get("hooks"), list)
+            and any(isinstance(h, dict) and h.get("type") == "command"
+                    and is_jev_hook(h.get("command"), bin_dir) for h in group["hooks"])
+            for group in have))
+        if not enabled and not owned:
+            continue  # nothing of ours to remove: leave user hooks unvalidated
+        if not isinstance(have, list):
+            fail(f"settings.json hooks.{event} must be an array")
+        cleaned = strip_owned(have, event, lambda command: is_jev_hook(command, bin_dir))
+        if enabled:
+            cleaned.extend(template[event])
+        if cleaned:
+            hooks[event] = cleaned
+        else:
+            hooks.pop(event, None)
+    return result
+
+
 def merge_hooks(existing: dict, template: dict, relay: Path) -> dict:
     result = json.loads(json.dumps(existing))
     hooks = result.setdefault("hooks", {})
@@ -143,17 +227,8 @@ def merge_hooks(existing: dict, template: dict, relay: Path) -> dict:
         have = hooks.setdefault(event, [])
         if not isinstance(have, list):
             fail(f"settings.json hooks.{event} must be an array")
-        cleaned = []
-        for group in have:
-            if not isinstance(group, dict) or not isinstance(group.get("hooks", []), list):
-                fail(f"settings.json hooks.{event} contains an invalid group")
-            kept = [h for h in group.get("hooks", [])
-                    if not (isinstance(h, dict) and h.get("type") == "command"
-                            and is_old_relay_hook(h.get("command"), relay, action))]
-            if kept or not group.get("hooks"):
-                copy = dict(group)
-                copy["hooks"] = kept
-                cleaned.append(copy)
+        cleaned = strip_owned(have, event,
+                              lambda command: is_old_relay_hook(command, relay, action))
         for group in wanted_groups:
             copy = json.loads(json.dumps(group))
             for hook in copy["hooks"]:
@@ -219,6 +294,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--jev", action="store_true",
+                        help="enable the TypeSafe Jev hooks (model routing, risk gate, report check)")
+    parser.add_argument("--rollover", choices=("open", "copy"),
+                        help="relay handoffs open a new Claude tab, or only copy the relay prompt")
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parents[1]
@@ -243,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
     managed_sources[dest / "relay" / "relay.py"] = (root / "relay" / "relay.py").read_bytes()
     managed_sources[dest / "bin" / "pr-status"] = (root / "bin" / "pr-status").read_bytes()
     managed_sources[dest / "bin" / "rollover-open.py"] = (root / "bin" / "rollover-open.py").read_bytes()
+    for name in JEV_SCRIPTS:
+        managed_sources[dest / "bin" / name] = (root / "bin" / name).read_bytes()
 
     directories = (dest, dest / "agents", dest / "relay", dest / "relay" / "handoffs",
                    dest / "relay" / "state", dest / "bin")
@@ -270,10 +351,29 @@ def main(argv: list[str] | None = None) -> int:
     desired = dict(managed_sources)
     desired[claude_path] = merge_instructions(claude_existing, source_claude, claude_path)
     merged_settings = merge_hooks(settings, hook_template, dest / "relay" / "relay.py")
+    merged_settings = merge_jev_hook(merged_settings, dest / "bin", args.jev)
     merged_settings.setdefault("model", "claude-opus-5-5")
     desired[settings_path] = (json.dumps(merged_settings, indent=2) + "\n").encode()
     if config_existing is None:
         desired[config_path] = (root / "relay" / "config.json").read_bytes()
+    if args.rollover:
+        # Update only the rollover key; other user-tuned settings stay as they are.
+        base = desired.get(config_path, config_existing)
+        tuned = parse_json(config_path, base)
+        if tuned.get("rollover") != args.rollover:
+            tuned["rollover"] = args.rollover
+            desired[config_path] = (json.dumps(tuned, indent=2) + "\n").encode()
+    # Jev features are opt-in: --jev turns them on; installing without it turns them off,
+    # so a TYPESAFE_API_KEY in the environment alone never sends data.
+    base = desired.get(config_path, config_existing)
+    tuned = parse_json(config_path, base)
+    jev = tuned.get("jev") if isinstance(tuned.get("jev"), dict) else None
+    if args.jev and (jev is None or jev.get("enabled") is not True):
+        tuned["jev"] = {**(jev or {}), "enabled": True}
+        desired[config_path] = (json.dumps(tuned, indent=2) + "\n").encode()
+    elif not args.jev and jev is not None and jev.get("enabled") is not False:
+        tuned["jev"] = {**jev, "enabled": False}
+        desired[config_path] = (json.dumps(tuned, indent=2) + "\n").encode()
 
     conflicts = []
     for path, data in managed_sources.items():
@@ -310,7 +410,8 @@ def main(argv: list[str] | None = None) -> int:
 
     for directory in directories:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    executable = {dest / "bin" / "pr-status"}
+    executable = {dest / "bin" / name
+                  for name in ("pr-status", "jev-route.py", "jev-guard.py", "jev-report.py")}
     for path, data, prior in changes:
         if prior is not None:
             backup = create_backup(path, prior)

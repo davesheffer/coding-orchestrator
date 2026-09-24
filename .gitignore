@@ -5,3 +5,8 @@ __pycache__/
 .hunch-cache/
 .test-tmp/
 *.vsix
+.env
+relay/jev-log.jsonl
+relay/jev-log.jsonl.1
+relay/state/
+relay/handoffs/

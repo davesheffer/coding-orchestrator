@@ -23,6 +23,7 @@ class RelayTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR"))
         self.home = Path(self.temp.name) / "claude"
         self.env = os.environ | {"CLAUDE_HOME": str(self.home)}
+        self.env.pop("CLAUDE_RELAY_ROLLOVER", None)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -94,6 +95,88 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("bridge acknowledged test launch", result.stdout)
 
+    def rollover_fixture(self, config=None, clipboard=True):
+        """Fake bridge helper that leaves a marker, fake clipboard tools, editor env set."""
+        marker = Path(self.temp.name) / "helper-ran"
+        helper = self.home / "bin" / "rollover-open.py"
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_text(f"open({str(marker)!r}, 'w').write('ran')\nprint('bridge acknowledged')\n",
+                          encoding="utf-8")
+        if config is not None:
+            (self.home / "relay").mkdir(parents=True, exist_ok=True)
+            (self.home / "relay/config.json").write_text(json.dumps(config), encoding="utf-8")
+        fake_bin = Path(self.temp.name) / "fake-bin"
+        fake_bin.mkdir(exist_ok=True)
+        clip_out = Path(self.temp.name) / "clipboard.txt"
+        if clipboard:
+            for name in ("pbcopy", "wl-copy"):
+                tool = fake_bin / name
+                tool.write_text('#!/bin/sh\nexec /bin/cat > "$CLIP_OUT"\n', encoding="utf-8")
+                tool.chmod(0o755)
+        self.env.update({"PATH": str(fake_bin), "CLIP_OUT": str(clip_out),
+                         "CLAUDE_CODE_ENTRYPOINT": "claude-vscode",
+                         "__CFBundleIdentifier": "com.microsoft.VSCode"})
+        return marker, clip_out
+
+    def handoff(self, *args):
+        body = "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks"
+        return self.run_relay("handoff", "--title", "test", *args, input_text=body, cwd=self.temp.name)
+
+    @unittest.skipUnless(os.name == "posix", "fake clipboard tools are shell scripts")
+    def test_copy_mode_copies_without_bridge_or_editor(self):
+        marker, clip_out = self.rollover_fixture({"rollover": "copy"})
+        result = self.handoff()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertNotIn("editor session", result.stdout)
+        prompt = clip_out.read_text(encoding="utf-8")
+        self.assertRegex(prompt, r'^relay:[a-f0-9]{8} continue "test" from the handoff\.$')
+        self.assertIn(f"relay prompt copied to the clipboard: {prompt}", result.stdout)
+        self.assertIn("start a new Claude session (new tab or /clear) and paste it", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "fake clipboard tools are shell scripts")
+    def test_env_override_wins_over_config(self):
+        marker, _ = self.rollover_fixture({"rollover": "open"})
+        self.env["CLAUDE_RELAY_ROLLOVER"] = "copy"
+        result = self.handoff()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertIn("relay prompt copied to the clipboard", result.stdout)
+        marker, _ = self.rollover_fixture({"rollover": "copy"})
+        self.env["CLAUDE_RELAY_ROLLOVER"] = "open"
+        result = self.handoff()
+        self.assertTrue(marker.exists())
+        self.assertIn("bridge acknowledged", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "fake clipboard tools are shell scripts")
+    def test_legacy_auto_open_false_means_copy_and_no_open_still_copies(self):
+        marker, _ = self.rollover_fixture({"auto_open": False})
+        result = self.handoff()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertIn("relay prompt copied to the clipboard", result.stdout)
+        marker, _ = self.rollover_fixture({"rollover": "open"})
+        result = self.handoff("--no-open")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertIn("relay prompt copied to the clipboard", result.stdout)
+
+    def test_rollover_mode_resolution(self):
+        with patch.dict(os.environ, {"CLAUDE_RELAY_ROLLOVER": ""}):
+            self.assertEqual(relay_module.rollover_mode({"auto_open": True}), "open")
+            self.assertEqual(relay_module.rollover_mode({"auto_open": False}), "copy")
+            self.assertEqual(relay_module.rollover_mode({"auto_open": False, "rollover": "open"}), "open")
+        with patch.dict(os.environ, {"CLAUDE_RELAY_ROLLOVER": "COPY"}):
+            self.assertEqual(relay_module.rollover_mode({"rollover": "open"}), "copy")
+
+    def test_clipboard_failure_still_prints_prompt(self):
+        marker, _ = self.rollover_fixture({"rollover": "copy"}, clipboard=False)
+        result = self.handoff()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertIn("clipboard unavailable", result.stdout)
+        self.assertRegex(result.stdout, r'relay:[a-f0-9]{8} continue "test" from the handoff\.')
+
     def test_unicode_handoff_round_trips_with_non_utf8_defaults(self):
         self.env.update({"PYTHONUTF8": "0", "PYTHONIOENCODING": "ascii",
                          "LC_ALL": "C", "PYTHONCOERCECLOCALE": "0"})
@@ -116,6 +199,7 @@ class RelayTests(unittest.TestCase):
         path.write_bytes(body.encode("cp1252"))
         output = io.StringIO()
         with patch.object(relay_module, "HANDOFFS", handoffs), \
+                patch.object(relay_module, "STATE", self.home / "relay/state"), \
                 patch.object(relay_module.locale, "getencoding", return_value="cp1252", create=True), \
                 patch.object(relay_module.sys, "stdin", io.StringIO('{"prompt":"relay:1234abcd"}')), \
                 contextlib.redirect_stdout(output):
@@ -130,6 +214,7 @@ class RelayTests(unittest.TestCase):
         (handoffs / "1234abcd.md").write_bytes(b"invalid \x81 encoding")
         output = io.StringIO()
         with patch.object(relay_module, "HANDOFFS", handoffs), \
+                patch.object(relay_module, "STATE", self.home / "relay/state"), \
                 patch.object(relay_module.locale, "getencoding", return_value="cp1252", create=True), \
                 patch.object(relay_module.sys, "stdin", io.StringIO('{"prompt":"relay:1234abcd"}')), \
                 contextlib.redirect_stdout(output):

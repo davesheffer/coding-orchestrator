@@ -3,5 +3,5 @@
   "hard_tokens": 250000,
   "task_shift_min_tokens": 30000,
   "handoff_ttl_hours": 72,
-  "auto_open": true
+  "rollover": "open"
 }
