@@ -78,8 +78,11 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # --super-prefix, --config-env), or any other --long-option (with or without =value).
 # Only a literal -C sets cwd (see _dash_c_dir); -c and --long-options are matched so
 # they don't get mistaken for the subcommand. The arg may be a quoted string (e.g. -C
-# "dir with space") or a bare \S+ token.
-_OPT_ARG = r"""(?:"[^"]*"|'[^']*'|\S+)"""
+# "dir with space") or a bare \S+ token. The alternatives start with different chars
+# (`"`, `'`, anything else), so a quoted value has exactly one way to match; with a
+# plain \S+ alternative it had two, and repeated `-C "a"` options backtracked
+# exponentially.
+_OPT_ARG = r"""(?:"[^"]*"\S*|'[^']*'\S*|[^\s"']\S*)"""
 _LONG_VALUE_OPTS = r"(?:--git-dir|--work-tree|--namespace|--super-prefix|--config-env)"
 # The value-taking names are excluded from the generic --long-option branch and their
 # space-separated value may not start with `-`, so each token has exactly one way to
@@ -343,6 +346,10 @@ def _strip_heredocs_and_quotes(command):
     tail = ""  # last (roughly) PREFIX_WINDOW_CHARS of "".join(out); see its definition
     pending = []  # (word, dash_form) heredoc terminators whose bodies start at the next newline
     trimmed = False
+    # Depth of unclosed `((`/`$((` arithmetic, counted in the scanned command text
+    # itself (not the bounded tail, which a long run of blanks inside `$((` can push
+    # the opener out of).
+    arith = 0
     # word -> ([starts], [ends]) of every terminator-shaped line, and the same for
     # unindented lines only; built on the first heredoc so each body end is a bisect
     # rather than a regex search to the end of the input (quadratic on many
@@ -404,9 +411,20 @@ def _strip_heredocs_and_quotes(command):
             emit("<<<")  # a here-string, not a heredoc
             i += 3
             continue
+        if command.startswith("((", i):
+            arith += 1
+            emit("((")
+            i += 2
+            continue
+        if arith and command.startswith("))", i):
+            arith -= 1
+            emit("))")
+            i += 2
+            continue
         # `<<` inside an unclosed `((`/`$((` is a shift (`$((1<<3))`), not a heredoc;
-        # taking it for one would hide the lines up to a numeric "terminator".
-        if command.startswith("<<", i) and tail.rfind("((") <= tail.rfind("))"):
+        # taking it for one would hide the lines up to a numeric "terminator". A stray
+        # unclosed `((` only makes a real heredoc body get scanned (a spurious check).
+        if command.startswith("<<", i) and not arith:
             m = HEREDOC_RE.match(command, i)
             if m:
                 word = m.group(2) or m.group(3) or m.group(4)

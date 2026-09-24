@@ -565,6 +565,15 @@ class GateTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 2.0)
         # Every match is resolved: the last push keeps its own directory.
         self.assertIn(("push", os.path.join("/repo", "other"), False), targets)
+        # Repeated quoted global options once backtracked exponentially (25 s at 26).
+        for n in (30, 60):
+            for command in ("git " + '-C "a" ' * n + "status; git push --force",
+                            "git " + "-c 'x=y' " * n + "status; git push --force",
+                            "git -c x=" + "a" * 600 + ' -C "s"' * n + " status; git push --force"):
+                start = time.monotonic()
+                ops = [t[0] for t in jev._scan_targets(command, "/repo")]
+                self.assertLess(time.monotonic() - start, 2.0, command[:40])
+                self.assertEqual(ops, ["push"], command[:40])
 
     def test_substitution_env_value_detected(self):
         for command, op in (("FOO=$(date) git push", "push"),
@@ -581,6 +590,17 @@ class GateTests(unittest.TestCase):
     def test_arithmetic_shift_is_not_a_heredoc(self):
         command = "echo $((1<<3))\ngit push --force\n3\n"
         self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
+        # The `$((` opener far behind the `<<` (a long blank or newline run) is still
+        # tracked, so the push after it is not hidden as a heredoc body.
+        for pad in (" " * 600, "\n" * 600):
+            command = "x=$((1" + pad + "<<3\n)); git push --force\n3\n"
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
+        # Nested parens inside the arithmetic keep it open until its own `))`.
+        command = "echo $(( (1+2) <<3 ))\ngit push\n3\n"
+        self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
+        # A real heredoc after a closed arithmetic still hides its body.
+        command = "echo $((1<<3)); cat <<EOF\ngit push\nEOF\n"
+        self.assertEqual(jev._scan_targets(command, "/repo"), [])
 
     # ---- command forms, multiple ops, push base, redaction ----
 
