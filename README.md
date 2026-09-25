@@ -194,14 +194,18 @@ features. Your own hooks and other `jev` keys stay. A
 | `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A choice that differs from the current model is applied through `updatedInput.model` when confident enough: moving to a stronger tier needs less confidence than moving to a weaker one, and a task escalates when stronger tiers together are likely enough | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
 | `shift` | `UserPromptSubmit` → `relay/relay.py prompt` | Does the new prompt continue the recent prompts / handoff goal? | Below `shift_low`: "TASK SHIFT DETECTED — roll over now". Above `shift_high`: the generic task-shift reminder is dropped | Last 5 prompts (500 chars each), handoff GOAL, new prompt (2,000 chars) |
 | `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds | Operation, changed file names, diff (`send_diff`, `max_diff_chars`) |
-| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A weak hand-back report is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections |
+| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A hand-back report with missing sections or unsupported EVIDENCE is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections |
 | `handoff_grade` | `relay.py handoff` | How actionable is this handoff for a fresh session (0–4)? Is NEXT STEP concrete? Do VERIFIED claims cite commands? | Below `handoff_min_score`: prints the gaps and **exits 3 without saving**. `--accept-weak` saves anyway | The handoff body (12,000 chars) |
 
-Missing sections count as weak without asking Jev: headers must be uppercase
-with a colon (`RESULT:`, `EVIDENCE:`, `CONFIDENCE:`, `UNVERIFIED:`). A
-self-reported low or medium CONFIDENCE does not deny the hand-back by itself;
-it only adds the foreground "verify or escalate" note. Hand-back denial is for
-missing sections or a report Jev judges weak. Report checks apply to
+Missing sections count as weak without asking Jev: headers must be uppercase,
+followed by a colon or alone on their line (`RESULT:`, `EVIDENCE`,
+`CONFIDENCE:`, `UNVERIFIED:`). A self-reported low or medium CONFIDENCE, or a
+material UNVERIFIED item, does not deny the hand-back by itself: listing gaps
+honestly is what the report should do, and verifying them is the orchestrator's
+job. Both only add the foreground "verify or escalate" note. Hand-back denial is
+for missing sections or EVIDENCE that Jev judges not to support RESULT. When a
+report arrives through `SubagentHandback`, the later `Agent` result is only a
+pointer to it and is not checked again. Report checks apply to
 `report_roles`. The risk gate records a critic run from when the critic was
 launched, so edits made while it was still running need a fresh review; any
 critic run counts, and a deleted file always needs review. For

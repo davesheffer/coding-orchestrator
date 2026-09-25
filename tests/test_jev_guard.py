@@ -556,6 +556,26 @@ class AgentDoneTests(unittest.TestCase):
         self.assertIn("missing", out["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(calls, [])
 
+    def test_handback_stub_is_skipped(self):
+        def fn(body, key):
+            raise AssertionError("should not be called")
+        text = ("This agent's report was delivered to you as a message from \"a1\" "
+                "(its SubagentHandback call). Read it there; it is not repeated here.")
+        self.assertIsNone(self.agent_done(self.report_payload(text=text), classify_fn=fn))
+        self.assertEqual(self.logs[-1]["decision"], "skipped_handback_stub")
+
+    def test_stub_phrase_inside_report_is_still_checked(self):
+        text = "done. the report was delivered to you as a message (its SubagentHandback call)"
+        out = self.agent_done(self.report_payload(text=text), classify_fn=lambda b, k: report_response())
+        self.assertIn("missing", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_material_gap_nudges_agent_done(self):
+        text = ("RESULT: did the thing\nEVIDENCE: ran tests, exit 0\n"
+                "CONFIDENCE: high\nUNVERIFIED: prod config untested")
+        out = self.agent_done(self.report_payload(text=text),
+                              classify_fn=lambda b, k: report_response(supported=0.95, material_gap=0.9))
+        self.assertIn("material unverified", out["hookSpecificOutput"]["additionalContext"])
+
     def test_medium_confidence_is_weak(self):
         text = ("RESULT: did the thing\nEVIDENCE: ran tests, exit 0\n"
                 "CONFIDENCE: medium\nUNVERIFIED: none")
@@ -846,6 +866,16 @@ class HandbackTests(unittest.TestCase):
         self.assertIsNone(out)
         self.assertEqual(self.logs[-1]["decision"], "ok")
 
+    def test_material_gap_alone_does_not_deny(self):
+        def fn(body, key):
+            return report_response(supported=0.95, material_gap=0.9)
+        out = self.handback(self.payload(message=("RESULT: approve\nEVIDENCE: ran tests, exit 0\n"
+                                                  "CONFIDENCE: high\nUNVERIFIED: full suite not run")),
+                            classify_fn=fn)
+        self.assertIsNone(out)
+        self.assertEqual(self.logs[-1]["decision"], "ok")
+        self.assertEqual(self.logs[-1]["material_gap"], 0.9)
+
     def test_missing_sections_still_deny(self):
         def fn(body, key):
             raise AssertionError("should not be called")
@@ -862,6 +892,12 @@ class SectionParsingTests(unittest.TestCase):
     def test_header_without_colon_not_matched(self):
         text = "RESULT here is what happened"
         self.assertEqual(jev._parse_sections(text), {})
+
+    def test_header_alone_on_its_line_matched(self):
+        text = "RESULT: ship\n\nEVIDENCE\n- ran tests, exit 0\n\n**CONFIDENCE**\nhigh\nUNVERIFIED: none"
+        sections = jev._parse_sections(text)
+        self.assertEqual(sections["EVIDENCE"], "- ran tests, exit 0")
+        self.assertEqual(sections["CONFIDENCE"], "high")
 
     def test_uppercase_header_with_colon_matched(self):
         text = "RESULT: did it\nEVIDENCE: ran it\nCONFIDENCE: high\nUNVERIFIED: none"

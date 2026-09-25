@@ -131,7 +131,8 @@ def subagent_stop(payload, cfg, classify_fn=None):
             guard.update_state(guard.session_state_path(sid, STATE), complete)
     if not client.feature_enabled(cfg, "report_check") or role not in cfg.get("report_roles", []):
         return None
-    reasons, codes, supported, gap = guard._analyze_report(message, cfg, classify_fn, confidence_heuristic=False)
+    reasons, codes, supported, gap = guard._analyze_report(message, cfg, classify_fn, confidence_heuristic=False,
+                                                            gap_blocks=False)
     log(cfg, {"ts": client.timestamp(), "feature": "report_check", "role": role,
               "weak": bool(reasons), "reasons": codes, "supported": supported, "material_gap": gap})
     if reasons and not payload.get("stop_hook_active"):

@@ -122,10 +122,15 @@ SUPPORTED_INSTRUCTIONS = ("The EVIDENCE (commands run, exit codes, file:line ref
 MATERIAL_GAP_INSTRUCTIONS = ("UNVERIFIED lists something material to whether RESULT is correct "
                               "or safe to rely on.")
 SECTION_NAMES = ("RESULT", "EVIDENCE", "CONFIDENCE", "UNVERIFIED")
-# Case-sensitive UPPERCASE headers with a required colon, so prose like "Result of git
-# diff..." doesn't overmatch; optional leading markdown (#, *, -, >) is still allowed.
+# Case-sensitive UPPERCASE headers followed by a colon or alone on their line, so prose
+# like "Result of git diff..." or "RESULT here is..." doesn't overmatch; optional leading
+# markdown (#, *, -, >) is still allowed.
 SECTION_RE = re.compile(
-    r"(?m)^[ \t]*[#*\-> \t]*\**(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)\**[ \t]*:\**[ \t]*")
+    r"(?m)^[ \t]*[#*\-> \t]*\**(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)\**[ \t]*(?::\**[ \t]*|\r?$)")
+# What the Agent tool returns when the report itself went through SubagentHandback,
+# which the handback check already saw.
+HANDBACK_STUB_RE = re.compile(
+    r"\s*This agent's report was delivered to you as a message\b.*?\(its SubagentHandback call\)", re.S)
 
 
 def _desc_hash(description):
@@ -526,7 +531,7 @@ def _parse_sections(text):
     return sections
 
 
-def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
+def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_blocks=True):
     """Parse RESULT/EVIDENCE/CONFIDENCE/UNVERIFIED sections and ask Jev whether the
     report is weak. Returns (reasons, reason_codes, supported, material_gap).
 
@@ -534,6 +539,9 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
     applies to the PostToolUse agent-done nudge (a foreground report can be told to
     verify or escalate more), but not to the SubagentHandback deny path (a read-only
     critic can't escalate, so low/medium confidence alone must not block it).
+    `gap_blocks` likewise gates the material-gap verdict: an honest UNVERIFIED list is
+    what the report should contain, and verifying it is the main session's job, so
+    the deny paths log the gap without blocking on it.
 
     Sections are parsed from the FULL text (a long report's RESULT/EVIDENCE/CONFIDENCE/
     UNVERIFIED block may come after `max_report_chars` of findings), so truncation is
@@ -572,7 +580,7 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
             material_gap = noul(answers, "material_gap")
             if supported is not None and supported < cfg["report_min_support"]:
                 reasons.append(f"evidence weakly supports result (p={supported:.2f})")
-            if material_gap is not None and material_gap >= cfg["report_max_gap"]:
+            if gap_blocks and material_gap is not None and material_gap >= cfg["report_max_gap"]:
                 reasons.append(f"material unverified claims (p={material_gap:.2f})")
 
     reason_codes = []
@@ -606,7 +614,7 @@ def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
     agent_id = payload.get("agent_id")
     start = time.monotonic()
     reasons, reason_codes, supported, material_gap = _analyze_report(
-        message, cfg, classify_fn, confidence_heuristic=False)
+        message, cfg, classify_fn, confidence_heuristic=False, gap_blocks=False)
 
     def log(decision):
         if not log_fn:
@@ -749,6 +757,11 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
         return None
 
     text = _extract_report_text(completed)
+    if HANDBACK_STUB_RE.match(text) and not SECTION_RE.search(text):
+        if log_fn:
+            log_fn({"ts": timestamp(), "feature": "report_check", "event": "agent_done",
+                    "decision": "skipped_handback_stub", "subagent_type": subagent_type})
+        return None
     start = time.monotonic()
     reasons, reason_codes, supported, material_gap = _analyze_report(text, cfg, classify_fn)
 
