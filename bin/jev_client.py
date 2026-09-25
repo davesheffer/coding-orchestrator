@@ -173,24 +173,46 @@ def http_classify(body, cfg, key):
         return json.loads(response.read().decode("utf-8"))
 
 
-def ask(cfg, feature, state, questions, classify_fn=None):
+def ask(cfg, feature, state, questions, classify_fn=None, errors=None):
     """Return the Jev `answers` dict, or None (disabled, no key, error, timeout).
 
     classify_fn(body, key) returns the parsed response; it defaults to the HTTP
-    call and always runs under the hard deadline.
+    call and always runs under the hard deadline. When `errors` is a list, a
+    failed call appends a short reason (the exception class name, "NoApiKey" or
+    "MalformedResponse") so callers can log it; never the body or the key.
+    Disabled features and disallowed endpoints append nothing.
     """
     if not feature_enabled(cfg, feature) or not endpoint_allowed(cfg.get("endpoint")):
         return None
     key = api_key(cfg)
     if not key:
+        if errors is not None:
+            errors.append("NoApiKey")
         return None
     fn = classify_fn or (lambda body, k: http_classify(body, cfg, k))
     body = {"state": state, "model": cfg["jev_model"], "questions": questions}
     try:
         answers = call_with_deadline(fn, (body, key), effective_timeout(cfg))["answers"]
-    except Exception:
+    except Exception as exc:
+        if errors is not None:
+            errors.append(type(exc).__name__)
         return None
-    return answers if isinstance(answers, dict) else None
+    if not isinstance(answers, dict):
+        if errors is not None:
+            errors.append("MalformedResponse")
+        return None
+    return answers
+
+
+def safe_repr(value, limit=80):
+    """ASCII-safe, length-bounded repr of a possibly-malformed logged value.
+
+    repr() escapes lone surrogates and control characters, so the result is
+    always encodable as UTF-8 JSON text; long values are truncated with their
+    original repr length noted instead of writing the raw (possibly huge) value.
+    """
+    text = repr(value)
+    return text if len(text) <= limit else f"{text[:limit]}... (len {len(text)})"
 
 
 def noul(answers, name):
@@ -223,6 +245,11 @@ def write_log(cfg, entry, path=None):
                 os.chmod(path, 0o600)
             except OSError:
                 pass
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            line = json.dumps(entry, ensure_ascii=False)
+            try:
+                line.encode("utf-8")
+            except UnicodeEncodeError:
+                line = json.dumps(entry)  # a lone surrogate from the classifier: escape, don't drop
+            handle.write(line + "\n")
     except Exception:
         pass

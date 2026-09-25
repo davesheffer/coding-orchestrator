@@ -149,8 +149,8 @@
       "expected": "fable"
     },
     {
-      "id": "critic-risk-gate",
-      "subagent_type": "critic",
+      "id": "review-risk-gate",
+      "subagent_type": "general-purpose",
       "description": "Review risk gate diff",
       "prompt": "Adversarially review the uncommitted risk_gate change: can a crafted commit message or diff make the gate return allow for a push that should be denied, or leak diff text into the log? Attack the claim that it is fail-closed for high-risk pushes.",
       "expected": "fable"
@@ -184,8 +184,8 @@
       "expected": "fable"
     },
     {
-      "id": "critic-installer",
-      "subagent_type": "critic",
+      "id": "review-installer",
+      "subagent_type": "general-purpose",
       "description": "Review installer change",
       "prompt": "Review the installer diff that rewrites settings.json hooks in place. Attack atomicity (crash mid-write), concurrent installs, symlinked settings files and preservation of user hooks; report each finding with a reproduction.",
       "expected": "fable"
@@ -206,7 +206,7 @@
     },
     {
       "id": "deadline-thread-race",
-      "subagent_type": "critic",
+      "subagent_type": "general-purpose",
       "description": "Check deadline helper",
       "prompt": "call_with_deadline leaves a daemon thread running after a timeout. Reason about whether a late result, exception, or interpreter shutdown can corrupt hook output or the log, and whether the 5 s hook budget can still be exceeded.",
       "expected": "fable"

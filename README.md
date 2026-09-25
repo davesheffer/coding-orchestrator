@@ -277,11 +277,14 @@ latency, and decision counts per feature. It also shows the weak-report rate
 per model tier: a tier whose reports are often weak may be too small for the
 tasks it gets. From the repository, `python3 bin/eval-jev-routing.py` scores
 routing against the 30 labelled tasks in `benchmarks/jev-routing.json`: it
-reports accuracy, a confusion matrix, and confidence when right versus wrong.
-It makes 30 live API calls. `--dry-run` only validates the file, and
-`--labels-file` tries alternative tier rubrics. The default rubrics scored 30/30
-(the earlier wording was 25/30, with opus tasks going to sonnet). They were tuned
-on this benchmark, so check your own log with `jev-report.py` too.
+reports accuracy, a confusion matrix, confidence when right versus wrong, and
+applied accuracy: the model that would actually run after `jev-route.py`'s own
+rule (pinned agents, low or invalid confidence and same-tier choices keep the
+current model). It makes 30 live API calls. `--dry-run` only validates the file,
+and `--labels-file` tries alternative tier rubrics. The last recorded run of the
+default rubrics (30/30) predates a change to some benchmark tasks' subagent
+types, so rerun it before relying on that number. The rubrics were tuned on this
+benchmark, so check your own log with `jev-report.py` too.
 
 **Privacy:** with `--jev`, the text listed under "Sent to TypeSafe" goes to
 TypeSafe's paid third-party API. Turn off a feature under `jev.features`, or use
