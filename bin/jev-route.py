@@ -3,8 +3,10 @@
 
 Reads a Claude Code PreToolUse payload on stdin. For Agent/Task calls it asks
 TypeSafe's hosted Jev classifier which tier (sonnet/opus/fable) should run the
-task and, when the answer is confident and different, rewrites the tool
-input's `model`. Configuration lives under the "jev" key of
+task and, when the answer is confident enough and different, rewrites the tool
+input's `model`. Moving to a stronger tier needs less confidence than moving to
+a weaker one, and a task escalates when the stronger tiers together are likely
+enough, because under-routing costs more than over-routing. Configuration lives under the "jev" key of
 `<install>/relay/config.json`; the API key comes from TYPESAFE_API_KEY or
 `jev.api_key_file`.
 
@@ -22,13 +24,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
-    AGENT_MODELS, CONFIG_PATH, DEFAULTS, LOG_PATH, MAX_DEADLINE_SECONDS, MAX_LOG_BYTES, ROOT,
+    AGENT_MODELS, CONFIG_PATH, DEFAULTS, LOG_PATH, MAX_DEADLINE_SECONDS, MAX_LOG_BYTES, ROOT, TIER_RANK,
+    stronger_tier,
     api_key, ask, call_with_deadline, effective_timeout, elapsed_ms, endpoint_allowed, http_classify,
     load_config, timestamp, write_log)
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 INSTRUCTIONS = ("Which model tier should run this subagent task? "
-                "Pick the cheapest tier that can do it well.")
+                "Pick the least expensive tier that will reliably do it well; "
+                "when torn between two tiers, pick the stronger one.")
 
 
 def frontmatter_model(path):
@@ -80,6 +84,25 @@ def build_state(tool_input, cfg):
     return state
 
 
+def escalation(current, choice, probabilities, cfg):
+    """(tier, mass) when the classifier keeps the current tier but stronger tiers
+    together carry at least escalate_mass probability; else None."""
+    if current not in TIER_RANK or choice != current:
+        return None
+    ranks = {t: r for t, r in TIER_RANK.items() if t in cfg["labels"]}
+    return stronger_tier(probabilities, ranks, TIER_RANK[current], cfg["escalate_mass"])
+
+
+def threshold(current, choice, cfg):
+    """Upgrades need little confidence, downgrades a lot; unknown direction uses min_confidence."""
+    if current in TIER_RANK and choice in TIER_RANK:
+        if TIER_RANK[choice] > TIER_RANK[current]:
+            return float(cfg["upgrade_min_confidence"])
+        if TIER_RANK[choice] < TIER_RANK[current]:
+            return float(cfg["downgrade_min_confidence"])
+    return float(cfg["min_confidence"])
+
+
 def build_questions(cfg):
     return {"model": {"type": "choice", "instructions": INSTRUCTIONS, "criteria": cfg["labels"]}}
 
@@ -111,21 +134,30 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         probabilities = answer.get("probabilities")
     except Exception:
         return None
+    escalated = escalation(current, choice, probabilities, cfg) if choice in cfg["labels"] else None
+    applied_model = escalated[0] if escalated else choice
     if choice not in cfg["labels"]:
         applied, why = False, "invalid label"
-    elif confidence < float(cfg["min_confidence"]):
-        applied, why = False, "below min_confidence"
+    elif escalated:
+        applied, why = True, "applied"
     elif choice == current:
         applied, why = False, "same model"
+    elif confidence < threshold(current, choice, cfg):
+        applied, why = False, "below confidence threshold"
     else:
         applied, why = True, "applied"
-    reason = f"jev: {current or 'inherit'} → {choice} (conf {confidence:.2f})"
+    if escalated:
+        reason = f"jev: {current} → {applied_model} (escalated, P(stronger) {escalated[1]:.2f})"
+    else:
+        reason = f"jev: {current or 'inherit'} → {choice} (conf {confidence:.2f})"
     if log_fn:
         entry = {"ts": timestamp(), "feature": "route",
                  "subagent_type": state["subagent_type"],
                  "current": current or "inherit", "choice": choice, "confidence": confidence,
                  "probabilities": probabilities, "latency_ms": latency, "applied": applied,
                  "reason": reason if applied else f"{reason}; skipped: {why}"}
+        if escalated:
+            entry["escalated_to"] = applied_model
         hashed = desc_hash(state["description"])
         if hashed:
             entry["desc_hash"] = hashed
@@ -136,7 +168,7 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
         "permissionDecisionReason": reason,
-        "updatedInput": {**tool_input, "model": choice},
+        "updatedInput": {**tool_input, "model": applied_model},
     }}
 
 

@@ -78,3 +78,5 @@ class RolloverOpenTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             saved = next((Path(temp) / "handoffs").glob("*.md"))
             self.assertIn("להמשיך", saved.read_text(encoding="utf-8"))
+            self.assertIn(f"Open a new Codex session and send: Continue from the attached handoff file {saved.resolve()}",
+                          result.stdout.decode("utf-8", "replace"))

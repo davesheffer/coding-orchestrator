@@ -86,6 +86,74 @@ class DecideTests(unittest.TestCase):
     def test_below_threshold_is_noop(self):
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(confidence=0.3)))
 
+    def test_upgrade_needs_only_upgrade_confidence(self):
+        out = self.decide(self.payload, self.cfg, self.classify(choice="opus", confidence=0.4))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+
+    def test_downgrade_needs_high_confidence(self):
+        self.payload["tool_input"]["model"] = "opus"
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.7)))
+        out = self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.85))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "sonnet")
+
+    def test_unknown_current_uses_min_confidence(self):
+        del self.payload["tool_input"]["model"]
+        self.payload["tool_input"]["subagent_type"] = "general-purpose"
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="opus", confidence=0.4)))
+
+    def probs(self, choice, confidence, probabilities):
+        def fn(body, key):
+            return {"answers": {"model": {"type": "choice", "choice": choice,
+                                          "confidence": confidence, "probabilities": probabilities}}}
+        return fn
+
+    def test_escalates_when_stronger_tiers_are_likely(self):
+        logs = []
+        fn = self.probs("sonnet", 0.55, {"sonnet": 0.55, "opus": 0.3, "fable": 0.15})
+        out = self.decide(self.payload, self.cfg, fn, logs.append)
+        hook = out["hookSpecificOutput"]
+        self.assertEqual(hook["updatedInput"]["model"], "opus")
+        self.assertEqual(hook["permissionDecisionReason"],
+                         "jev: sonnet → opus (escalated, P(stronger) 0.45)")
+        self.assertTrue(logs[0]["applied"])
+        self.assertEqual(logs[0]["choice"], "sonnet")
+        self.assertEqual(logs[0]["escalated_to"], "opus")
+
+    def test_escalation_ignores_bad_probabilities(self):
+        for bad in ("nan", float("inf"), 10, -0.5, None):
+            fn = self.probs("sonnet", 0.6, {"sonnet": 0.6, "opus": bad})
+            self.assertIsNone(self.decide(self.payload, self.cfg, fn), bad)
+
+    def test_escalation_only_when_classifier_keeps_current(self):
+        self.payload["tool_input"]["model"] = "opus"
+        fn = self.probs("sonnet", 0.55, {"sonnet": 0.55, "opus": 0.05, "fable": 0.4})
+        self.assertIsNone(self.decide(self.payload, self.cfg, fn))
+
+    def test_escalation_tie_prefers_stronger_tier(self):
+        fn = self.probs("sonnet", 0.5, {"sonnet": 0.5, "opus": 0.25, "fable": 0.25})
+        out = self.decide(self.payload, self.cfg, fn)
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "fable")
+
+    def test_non_numeric_route_config_falls_back_to_defaults(self):
+        cfg = self.load({"escalate_mass": "high", "upgrade_min_confidence": None,
+                         "downgrade_min_confidence": "nan", "min_confidence": 0.7})
+        self.assertEqual(cfg["escalate_mass"], 0.4)
+        self.assertEqual(cfg["upgrade_min_confidence"], 0.35)
+        self.assertEqual(cfg["downgrade_min_confidence"], 0.8)
+        self.assertEqual(cfg["min_confidence"], 0.7)
+        cfg = self.load({"escalate_mass": 5, "downgrade_min_confidence": True, "min_confidence": -1})
+        self.assertEqual((cfg["escalate_mass"], cfg["downgrade_min_confidence"], cfg["min_confidence"]),
+                         (1.0, 0.8, 0.0))
+
+    def test_no_escalation_below_mass(self):
+        fn = self.probs("sonnet", 0.7, {"sonnet": 0.7, "opus": 0.2, "fable": 0.1})
+        self.assertIsNone(self.decide(self.payload, self.cfg, fn))
+
+    def test_escalation_ignores_removed_tiers_and_bad_values(self):
+        cfg = {**self.cfg, "labels": {k: v for k, v in self.cfg["labels"].items() if k != "fable"}}
+        fn = self.probs("sonnet", 0.6, {"sonnet": 0.6, "opus": "x", "fable": 0.4})
+        self.assertIsNone(self.decide(self.payload, cfg, fn))
+
     def test_pinned_critic_is_noop(self):
         self.payload["tool_input"]["subagent_type"] = "critic"
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify()))

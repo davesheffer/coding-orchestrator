@@ -89,7 +89,7 @@ The preceding critic-only procedure remains available for manual restricted laun
 
 ## Continuity
 
-Use native Codex compaction to continue within the same session; no context gauge is installed. For a fresh-session rollover, write a self-contained handoff and run `python <CODEX_HOME>/bin/rollover-open.py handoff --client codex --title "<short title>"` with the handoff body on stdin. The helper saves it and requests a new VS Code Codex tab through the installed bridge. Report whether the bridge acknowledged the launch; if it did not, give the user the saved path and continuation prompt. A handoff preserves:
+Use native Codex compaction to continue within the same session; no context gauge is installed. For a fresh-session rollover, write a self-contained handoff and run `python3 <CODEX_HOME>/bin/rollover-open.py handoff --client codex --no-open --title "<short title>"` (use `python` on Windows) with the handoff body on stdin. The helper saves it and prints a continuation prompt; give the user that prompt verbatim to paste into a new Codex session. Drop `--no-open` only when the user asks for a new tab to open automatically. A handoff preserves:
 
 ```text
 GOAL: intended outcome

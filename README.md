@@ -191,17 +191,21 @@ features. Your own hooks and other `jev` keys stay. A
 
 | Feature | Runs in | Question for Jev | What happens | Sent to TypeSafe |
 |---|---|---|---|---|
-| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A confident choice that differs from the current model is applied through `updatedInput.model` | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
+| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A choice that differs from the current model is applied through `updatedInput.model` when confident enough: moving to a stronger tier needs less confidence than moving to a weaker one, and a task escalates when stronger tiers together are likely enough | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
 | `shift` | `UserPromptSubmit` → `relay/relay.py prompt` | Does the new prompt continue the recent prompts / handoff goal? | Below `shift_low`: "TASK SHIFT DETECTED — roll over now". Above `shift_high`: the generic task-shift reminder is dropped | Last 5 prompts (500 chars each), handoff GOAL, new prompt (2,000 chars) |
 | `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds | Operation, changed file names, diff (`send_diff`, `max_diff_chars`) |
-| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A weak hand-back report is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections |
+| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A hand-back report with missing sections or unsupported EVIDENCE is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections |
 | `handoff_grade` | `relay.py handoff` | How actionable is this handoff for a fresh session (0–4)? Is NEXT STEP concrete? Do VERIFIED claims cite commands? | Below `handoff_min_score`: prints the gaps and **exits 3 without saving**. `--accept-weak` saves anyway | The handoff body (12,000 chars) |
 
-Missing sections count as weak without asking Jev: headers must be uppercase
-with a colon (`RESULT:`, `EVIDENCE:`, `CONFIDENCE:`, `UNVERIFIED:`). A
-self-reported low or medium CONFIDENCE does not deny the hand-back by itself;
-it only adds the foreground "verify or escalate" note. Hand-back denial is for
-missing sections or a report Jev judges weak. Report checks apply to
+Missing sections count as weak without asking Jev: headers must be uppercase,
+followed by a colon or alone on their line (`RESULT:`, `EVIDENCE`,
+`CONFIDENCE:`, `UNVERIFIED:`). A self-reported low or medium CONFIDENCE, or a
+material UNVERIFIED item, does not deny the hand-back by itself: listing gaps
+honestly is what the report should do, and verifying them is the orchestrator's
+job. Both only add the foreground "verify or escalate" note. Hand-back denial is
+for missing sections or EVIDENCE that Jev judges not to support RESULT. When a
+report arrives through `SubagentHandback`, the later `Agent` result is only a
+pointer to it and is not checked again. Report checks apply to
 `report_roles`. The risk gate records a critic run from when the critic was
 launched, so edits made while it was still running need a fresh review; any
 critic run counts, and a deleted file always needs review. For
@@ -248,7 +252,9 @@ installed `relay/config.json`:
 | `endpoint`, `jev_model` | TypeSafe endpoint, `"jev-latest"` | Classifier API and model. The endpoint must be `https`, or `http` only to `localhost`, `127.0.0.1`, or `::1` |
 | `timeout_seconds` | `3` | Classifier deadline, capped at 4 s |
 | `log` | `true` | Append one line per decision to `relay/jev-log.jsonl` |
-| `min_confidence` | `0.5` | route: below this, the call is left unchanged |
+| `upgrade_min_confidence`, `downgrade_min_confidence` | `0.35`, `0.8` | route: confidence needed to move to a stronger or weaker tier than the current one. Moving up is easy because under-routing is the costly error |
+| `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
+| `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
 | `respect_explicit_model` | `false` | route: never override a call that already sets `model` |
 | `pinned_agents` | `["critic", "fork"]` | route: subagent types that are never rerouted |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
@@ -355,7 +361,10 @@ recent prompts, a Git diff, a subagent report, or a handoff to TypeSafe;
 adjust `jev.features` and the shared privacy settings in the Jev section above.
 
 Codex Jev routes only unnamed/default subagents; named scout, runner, builder,
-and critic roles keep their configured models. It checks risky `git commit` or
+and critic roles keep their configured models. Choosing the weakest model
+(luna) needs `downgrade_min_confidence`, other choices need `min_confidence`,
+and `escalate_mass` moves a task to a stronger model when the stronger models
+are likely enough; an unsure answer leaves the parent's model. It checks risky `git commit` or
 `git push` calls, asks weak subagent reports for one more pass, detects clear
 task shifts, and grades Codex handoffs written through `rollover-open.py`.
 The Git check is advisory and can be overridden by retrying the same command.

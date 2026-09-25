@@ -59,7 +59,7 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
         raise ValueError("Claude handoffs require a relay:<id> resume token")
     request_id = secrets.token_hex(16)
     prompt = (f"{resume_token} continue from the saved handoff." if client == "claude"
-              else f"Continue from the attached handoff file {handoff}. Verify the listed state before acting.")
+              else codex_prompt(handoff))
     root = home()
     write_json(root / "launches" / f"{request_id}.json", {
         "client": client, "handoff": str(handoff), "prompt": prompt,
@@ -84,6 +84,10 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
             return "Claude tab launch acknowledged with the continuation prompt pre-filled. Press Enter there."
         return f"Editor could not open the {client} tab: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
     return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
+
+
+def codex_prompt(handoff) -> str:
+    return f"Continue from the attached handoff file {handoff}. Verify the listed state before acting."
 
 
 def save_codex(title: str, body: str) -> Path:
@@ -135,7 +139,9 @@ def main(argv=None) -> int:
             check_jev_handoff(body, args.accept_weak)
             path = save_codex(args.title, body)
             print(f"handoff saved: {path}")
-            if not args.no_open:
+            if args.no_open:
+                print(f"Open a new Codex session and send: {codex_prompt(path)}")
+            else:
                 message = launch("codex", path)
                 print(message)
                 return 0 if "tab launch acknowledged" in message else 2
