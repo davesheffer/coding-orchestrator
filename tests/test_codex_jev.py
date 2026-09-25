@@ -102,6 +102,16 @@ class CodexJevTests(unittest.TestCase):
             payload["stop_hook_active"] = True
             self.assertIsNone(module.subagent_stop(payload, cfg))
 
+    def test_report_check_does_not_block_on_material_gap(self):
+        cfg = module.settings() | {"enabled": True}
+        payload = {"agent_type": "scout", "session_id": "session", "agent_id": "agent",
+                   "last_assistant_message": "RESULT: done\nEVIDENCE: ran tests, exit 0\n"
+                                             "CONFIDENCE: high\nUNVERIFIED: prod config untested"}
+        response = {"answers": {"supported": {"type": "noul", "noul": 0.95},
+                                "material_gap": {"type": "noul", "noul": 0.95}}}
+        with patch.object(module, "STATE", Path(self.temp.name) / "state"), patch.object(module, "log"):
+            self.assertIsNone(module.subagent_stop(payload, cfg, classify_fn=lambda b, k: response))
+
     def test_shift_context_preserves_latest_user_instruction(self):
         cfg = module.settings() | {"enabled": True}
         with patch.object(module, "STATE", Path(self.temp.name) / "state"), patch.object(module, "log"), \

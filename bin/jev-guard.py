@@ -128,9 +128,19 @@ SECTION_NAMES = ("RESULT", "EVIDENCE", "CONFIDENCE", "UNVERIFIED")
 SECTION_RE = re.compile(
     r"(?m)^[ \t]*[#*\-> \t]*\**(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)\**[ \t]*(?::\**[ \t]*|\r?$)")
 # What the Agent tool returns when the report itself went through SubagentHandback,
-# which the handback check already saw.
+# which the handback check already saw. Full match on the exact stub (plus the optional
+# agentId / <usage> trailer) so a sectionless report can't ride in behind the phrase.
+# Observed: 'This agent's report was delivered to you as a message from "<id>" (its
+# SubagentHandback call). Read it there; it is not repeated here.' then "agentId: <id>
+# (use SendMessage with to: '<id>', summary: '<5-10 word recap>' to continue this agent)"
+# and "<usage>subagent_tokens: N ... duration_ms: N</usage>".
 HANDBACK_STUB_RE = re.compile(
-    r"\s*This agent's report was delivered to you as a message\b.*?\(its SubagentHandback call\)", re.S)
+    r"\s*This agent['\u2019]s report was delivered to you as a message"
+    r"(?: from \"[\w-]{1,100}\")? \(its SubagentHandback call\)\."
+    r"(?: Read it there; it is not repeated here\.)?"
+    r"(?:\s*agentId: [\w-]{1,100}(?: \(use SendMessage with to: '[\w-]{1,100}', "
+    r"summary: '[^'\n]{0,100}' to continue this agent\))?)?"
+    r"(?:\s*<usage>(?:\s*\w+: [\w.]+)*\s*</usage>)?\s*")
 
 
 def _desc_hash(description):
@@ -527,7 +537,12 @@ def _parse_sections(text):
     for i, m in enumerate(matches):
         name = m.group(1).upper()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        sections[name] = text[m.end():end].strip()
+        body = text[m.end():end].strip()
+        # Last non-empty wins: a quoted block or stale verdict earlier in the report yields
+        # to the real one, and an empty bare header (e.g. the format quoted inside
+        # EVIDENCE) can't wipe out a section.
+        if body or name not in sections:
+            sections[name] = body
     return sections
 
 
@@ -757,7 +772,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
         return None
 
     text = _extract_report_text(completed)
-    if HANDBACK_STUB_RE.match(text) and not SECTION_RE.search(text):
+    if HANDBACK_STUB_RE.fullmatch(text):
         if log_fn:
             log_fn({"ts": timestamp(), "feature": "report_check", "event": "agent_done",
                     "decision": "skipped_handback_stub", "subagent_type": subagent_type})
