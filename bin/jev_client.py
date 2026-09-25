@@ -12,6 +12,7 @@ opinion" and keep their pre-Jev behaviour. Nothing here logs prompt, diff or
 report text, or the key.
 """
 import json
+import math
 import os
 import threading
 import time
@@ -23,6 +24,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "relay" / "config.json"
 LOG_PATH = ROOT / "relay" / "jev-log.jsonl"
 AGENT_MODELS = ("sonnet", "opus", "haiku", "fable")
+TIER_RANK = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3}
+ROUTE_NUMBERS = ("min_confidence", "upgrade_min_confidence", "downgrade_min_confidence", "escalate_mass")
 FEATURES = ("route", "shift", "risk_gate", "report_check", "handoff_grade")
 MAX_DEADLINE_SECONDS = 4.0
 MAX_LOG_BYTES = 1 << 20
@@ -37,6 +40,14 @@ DEFAULTS = {
     "features": {name: True for name in FEATURES},
     # route
     "min_confidence": 0.5,
+    # Under-routing is the costly error, so moving to a stronger tier is easy and
+    # moving to a weaker one is hard. min_confidence still covers moves whose
+    # direction is unknown (no current model).
+    "upgrade_min_confidence": 0.35,
+    "downgrade_min_confidence": 0.8,
+    # Escalate when Jev keeps the current tier but the stronger tiers together are
+    # this likely (Codex, which has no current tier: stronger than Jev's choice).
+    "escalate_mass": 0.4,
     "respect_explicit_model": False,
     "pinned_agents": ["critic", "fork"],
     "max_prompt_chars": 6000,
@@ -94,7 +105,40 @@ def load_config(path=CONFIG_PATH):
     cfg["features"] = features
     if not isinstance(cfg.get("pinned_agents"), list):
         cfg["pinned_agents"] = []
+    for key in ROUTE_NUMBERS:
+        try:
+            cfg[key] = float(cfg[key])
+        except (TypeError, ValueError):
+            cfg[key] = DEFAULTS[key]
+        if isinstance(user.get(key), bool) or not math.isfinite(cfg[key]):
+            cfg[key] = DEFAULTS[key]
+        cfg[key] = min(1.0, max(0.0, cfg[key]))
     return cfg
+
+
+def probability(value):
+    """value as a float in [0, 1], else None."""
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return None
+    return p if math.isfinite(p) and 0.0 <= p <= 1.0 else None
+
+
+def stronger_tier(probabilities, ranks, floor, mass_needed):
+    """(tier, mass) for the likeliest tier ranked above floor when the tiers above
+    floor together reach mass_needed; ties go to the stronger tier. Else None."""
+    if not isinstance(probabilities, dict):
+        return None
+    stronger = {}
+    for tier, value in probabilities.items():
+        p = probability(value)
+        if tier in ranks and ranks[tier] > floor and p is not None:
+            stronger[tier] = p
+    mass = sum(stronger.values())
+    if not stronger or mass < mass_needed:
+        return None
+    return max(stronger, key=lambda t: (stronger[t], ranks[t])), mass
 
 
 def feature_enabled(cfg, name):

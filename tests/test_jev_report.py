@@ -125,6 +125,11 @@ class ReportTests(unittest.TestCase):
             "sonnet": {"total": 1, "weak": 1, "weak_rate": 1.0},
         })
 
+    def test_report_check_tier_join_uses_escalated_tier(self):
+        escalated = {**route("task", "sonnet", 0.6), "escalated_to": "fable"}
+        summary = report.summarize([escalated, check("task", True)])["report_check"]
+        self.assertEqual(list(summary["per_tier"]), ["fable"])
+
     def test_report_check_tier_join_legacy_description(self):
         entries = [
             route("legacy-task", "sonnet", 0.9, legacy=True),

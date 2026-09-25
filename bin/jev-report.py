@@ -140,7 +140,7 @@ def effective_tiers(entries):
         if feature == "route" and entry.get("applied") is True and entry.get("choice"):
             key = join_key(entry)
             if key is not None:
-                last_applied[key] = str(entry["choice"])
+                last_applied[key] = str(entry.get("escalated_to") or entry["choice"])
         elif feature == "report_check":
             model = entry.get("model")
             if isinstance(model, str) and model:

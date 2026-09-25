@@ -58,6 +58,30 @@ class CodexJevTests(unittest.TestCase):
             out = module.route(payload, cfg)
         self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-luna")
 
+    def route_with(self, answer):
+        cfg = module.settings() | {"enabled": True}
+        payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "fix it"}}
+        with patch.object(module.client, "ask", return_value={"model": answer}), \
+             patch.object(module, "log") as log:
+            out = module.route(payload, cfg)
+        self.logged = log.call_args and log.call_args[0][1]
+        return out and out["hookSpecificOutput"]["updatedInput"]["model"]
+
+    def test_route_weakest_model_needs_high_confidence(self):
+        self.assertIsNone(self.route_with({"choice": "luna", "confidence": 0.7}))
+        self.assertEqual(self.route_with({"choice": "sol", "confidence": 0.6}), "gpt-6-sol")
+
+    def test_route_escalates_when_stronger_models_are_likely(self):
+        answer = {"choice": "luna", "confidence": 0.55,
+                  "probabilities": {"luna": 0.55, "sol": 0.35, "astra": 0.1}}
+        self.assertEqual(self.route_with(answer), "gpt-6-sol")
+        self.assertEqual((self.logged["choice"], self.logged["escalated_to"], self.logged["escalated_mass"]),
+                         ("luna", "sol", 0.45))
+        answer = {"choice": "sol", "confidence": 0.8, "probabilities": {"sol": 0.8, "astra": 0.2}}
+        self.assertEqual(self.route_with(answer), "gpt-6-sol")
+        answer = {"choice": "luna", "confidence": 0.9, "probabilities": {"luna": 0.9, "sol": "nan"}}
+        self.assertEqual(self.route_with(answer), "gpt-6-luna")
+
     def test_route_respects_send_prompt_false(self):
         cfg = module.settings() | {"enabled": True, "send_prompt": False}
         payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "PRIVATE-TASK-SENTINEL"}}
