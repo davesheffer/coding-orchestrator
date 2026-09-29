@@ -12,6 +12,8 @@ import subprocess
 import sys
 import time
 
+CLAIMED_GRACE = 3.0  # extra seconds for an ack once the bridge has claimed the request
+
 
 def home() -> Path:
     return Path(os.environ.get("ORCHESTRATOR_HANDOFF_HOME") or
@@ -61,7 +63,8 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
     prompt = (f"{resume_token} continue from the saved handoff." if client == "claude"
               else codex_prompt(handoff))
     root = home()
-    write_json(root / "launches" / f"{request_id}.json", {
+    request = root / "launches" / f"{request_id}.json"
+    write_json(request, {
         "client": client, "handoff": str(handoff), "prompt": prompt,
         "created_at": time.time(),
     })
@@ -69,21 +72,70 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
     try:
         open_uri(uri)
     except (OSError, subprocess.CalledProcessError) as exc:
+        try:
+            request.unlink()
+        except OSError:
+            pass
         return f"Editor launch failed ({exc}). Open a new {client} tab and send: {prompt}"
     ack = root / "acks" / f"{request_id}.json"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    result = wait_for_ack(ack, timeout)
+    if result is None:
+        # The bridge claims a request by deleting it, so withdrawing it settles the race:
+        # an unclaimed request can no longer open a late second tab beside the fallback.
+        withdrawn = withdraw(request, CLAIMED_GRACE)
+        if withdrawn is None:
+            result = wait_for_ack(ack, 0)
+            if result is None:
+                return (f"Editor launch was not confirmed and the request could not be withdrawn "
+                        f"({request} is locked), so a {client} tab may still open late. "
+                        f"If none appears, open a new {client} tab and send: {prompt}")
+        elif withdrawn:
+            return (f"The VS Code handoff bridge did not pick up the request within {timeout:g}s "
+                    f"(VS Code still starting, or the extension is missing, disabled, or from another "
+                    f"version; if this repeats, reinstall it from vscode/handoff-bridge). "
+                    f"Open a new {client} tab and send: {prompt}")
+        else:
+            result = wait_for_ack(ack, CLAIMED_GRACE)
+    if result is None:
+        return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
+    if result.get("status") == "opened":
+        if client == "codex":
+            return "Codex tab launch acknowledged; handoff and continuation prompt copied. Paste and send it."
+        return "Claude tab launch acknowledged with the continuation prompt pre-filled. Press Enter there."
+    return f"Editor could not open the {client} tab: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
+
+
+def wait_for_ack(path: Path, seconds: float):
+    deadline = time.monotonic() + seconds
+    while True:
         try:
-            result = json.loads(ack.read_text(encoding="utf-8"))
+            result = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            if time.monotonic() >= deadline:
+                return None
             time.sleep(0.1)
             continue
-        if result.get("status") == "opened":
-            if client == "codex":
-                return "Codex tab launch acknowledged; handoff and continuation prompt copied. Paste and send it."
-            return "Claude tab launch acknowledged with the continuation prompt pre-filled. Press Enter there."
-        return f"Editor could not open the {client} tab: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
-    return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return result
+
+
+def withdraw(request: Path, seconds: float):
+    """True if the request was deleted unclaimed, False if the bridge claimed it first,
+    None if it stayed locked (a Windows sharing violation, e.g. a scanner) for `seconds`."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            request.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.1)
 
 
 def codex_prompt(handoff) -> str:
