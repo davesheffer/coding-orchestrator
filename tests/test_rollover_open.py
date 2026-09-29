@@ -47,6 +47,74 @@ class RolloverOpenTests(unittest.TestCase):
             self.assertIn("acknowledged", result)
             self.assertIn("Paste and send", result)
 
+    def test_request_names_the_editor_hosts_that_may_open_it(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "editor_hosts", return_value=[4321, 8765]):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+            seen = []
+
+            def capture(uri):
+                request_id = uri.split("id=", 1)[1]
+                seen.append(json.loads((Path(temp) / "launches" / f"{request_id}.json").read_text()))
+
+            with patch.object(rollover, "open_uri", side_effect=capture):
+                rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertEqual(seen[0]["hosts"], [4321, 8765])
+
+    def test_editor_hosts_are_ancestors_inside_an_extension_host(self):
+        with patch.dict(os.environ, {"VSCODE_CRASH_REPORTER_PROCESS_TYPE": "extensionHost"}):
+            hosts = rollover.editor_hosts()
+        self.assertIn(os.getppid(), hosts)
+        self.assertNotIn(os.getpid(), hosts)
+
+    def test_editor_hosts_empty_outside_an_extension_host(self):
+        env = {k: v for k, v in os.environ.items() if k != "VSCODE_CRASH_REPORTER_PROCESS_TYPE"}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(rollover, "parent_map", side_effect=AssertionError("not needed")):
+            self.assertEqual(rollover.editor_hosts(), [])
+
+    def test_editor_hosts_survive_a_process_table_failure(self):
+        with patch.dict(os.environ, {"VSCODE_CRASH_REPORTER_PROCESS_TYPE": "extensionHost"}), \
+                patch.object(rollover, "parent_map", side_effect=OSError("denied")):
+            self.assertEqual(rollover.editor_hosts(), [])
+
+    def test_editor_hosts_stop_at_this_vscode_instance(self):
+        parents = {100: 90, 90: 80, 80: 70, 70: 60}
+        env = {"VSCODE_CRASH_REPORTER_PROCESS_TYPE": "extensionHost", "VSCODE_PID": "80"}
+        with patch.dict(os.environ, env), \
+                patch.object(rollover, "parent_map", return_value=parents), \
+                patch.object(rollover.os, "getpid", return_value=100):
+            self.assertEqual(rollover.editor_hosts(), [90, 80])
+
+    def test_editor_hosts_cycle_without_vscode_pid_terminates(self):
+        parents = {100: 90, 90: 80, 80: 90}
+        env = {k: v for k, v in os.environ.items() if k != "VSCODE_PID"}
+        env["VSCODE_CRASH_REPORTER_PROCESS_TYPE"] = "extensionHost"
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(rollover, "parent_map", return_value=parents), \
+                patch.object(rollover.os, "getpid", return_value=100):
+            self.assertEqual(rollover.editor_hosts(), [90, 80])
+
+    def test_launch_failure_after_the_bridge_claimed_still_reports_the_ack(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "CLAIMED_GRACE", 0.5):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+
+            def claim_then_fail(uri):
+                request_id = uri.split("id=", 1)[1]
+                (Path(temp) / "launches" / f"{request_id}.json").unlink()
+                rollover.write_json(Path(temp) / "acks" / f"{request_id}.json", {"status": "opened"})
+                raise OSError("code exited late")
+
+            with patch.object(rollover, "open_uri", side_effect=claim_then_fail):
+                result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertIn("acknowledged", result)
+            self.assertNotIn("Editor launch failed", result)
+
     def test_unclaimed_request_is_withdrawn_and_blames_the_bridge(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
