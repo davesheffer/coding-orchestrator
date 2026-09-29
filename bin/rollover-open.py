@@ -78,14 +78,17 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
     if result is None:
         # The bridge claims a request by deleting it, so withdrawing it settles the race:
         # an unclaimed request can no longer open a late second tab beside the fallback.
-        try:
-            request.unlink()
-        except OSError:  # already claimed, or still held open by the bridge on Windows
-            result = wait_for_ack(ack, CLAIMED_GRACE)
-        else:
-            return (f"The VS Code handoff bridge did not pick up the request (extension missing, disabled, "
-                    f"or from another version; reinstall it from vscode/handoff-bridge). "
+        withdrawn = withdraw(request, CLAIMED_GRACE)
+        if withdrawn is None:
+            return (f"Editor launch was not confirmed and the request could not be withdrawn "
+                    f"({request} is locked), so a {client} tab may still open late. "
+                    f"If none appears, open a new {client} tab and send: {prompt}")
+        if withdrawn:
+            return (f"The VS Code handoff bridge did not pick up the request within {timeout:g}s "
+                    f"(VS Code still starting, or the extension is missing, disabled, or from another "
+                    f"version; if this repeats, reinstall it from vscode/handoff-bridge). "
                     f"Open a new {client} tab and send: {prompt}")
+        result = wait_for_ack(ack, CLAIMED_GRACE)
     if result is None:
         return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
     if result.get("status") == "opened":
@@ -99,8 +102,30 @@ def wait_for_ack(path: Path, seconds: float):
     deadline = time.monotonic() + seconds
     while True:
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            result = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.1)
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return result
+
+
+def withdraw(request: Path, seconds: float):
+    """True if the request was deleted unclaimed, False if the bridge claimed it first,
+    None if it stayed locked (a Windows sharing violation, e.g. a scanner) for `seconds`."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            request.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
             if time.monotonic() >= deadline:
                 return None
             time.sleep(0.1)

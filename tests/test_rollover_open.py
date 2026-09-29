@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -77,24 +78,63 @@ class RolloverOpenTests(unittest.TestCase):
 
     def test_ack_after_claim_within_grace_is_reported(self):
         with tempfile.TemporaryDirectory() as temp, \
-                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}):
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "CLAIMED_GRACE", 5):
             handoff = Path(temp) / "handoff.md"
             handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
-            request_ids = []
+            timers = []
 
-            def claim(uri):
-                request_ids.append(uri.split("id=", 1)[1])
-                (Path(temp) / "launches" / f"{request_ids[0]}.json").unlink()
+            def claim_then_ack_late(uri):
+                request_id = uri.split("id=", 1)[1]
+                (Path(temp) / "launches" / f"{request_id}.json").unlink()
+                timer = threading.Timer(0.3, rollover.write_json,
+                                        (Path(temp) / "acks" / f"{request_id}.json", {"status": "opened"}))
+                timers.append(timer)
+                timer.start()
 
-            def late_ack(path, seconds):
-                if seconds == rollover.CLAIMED_GRACE:
-                    return {"status": "opened"}
-                return None
-
-            with patch.object(rollover, "open_uri", side_effect=claim), \
-                    patch.object(rollover, "wait_for_ack", side_effect=late_ack):
+            with patch.object(rollover, "open_uri", side_effect=claim_then_ack_late):
                 result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            timers[0].join()
             self.assertIn("acknowledged", result)
+            self.assertEqual(list((Path(temp) / "acks").iterdir()), [])
+
+    def test_locked_request_is_withdrawn_once_the_lock_clears(self):
+        real_unlink = Path.unlink
+        attempts = []
+
+        def locked_twice(path, *args, **kwargs):
+            if path.parent.name == "launches" and len(attempts) < 2:
+                attempts.append(path)
+                raise PermissionError(32, "being used by another process")
+            return real_unlink(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "open_uri"):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+            with patch.object(Path, "unlink", autospec=True, side_effect=locked_twice):
+                result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertEqual(len(attempts), 2)
+            self.assertIn("did not pick up the request", result)
+            self.assertEqual(list((Path(temp) / "launches").iterdir()), [])
+
+    def test_request_that_stays_locked_warns_of_a_late_tab(self):
+        def always_locked(path, *args, **kwargs):
+            raise PermissionError(32, "being used by another process")
+
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "open_uri"), \
+                patch.object(rollover, "CLAIMED_GRACE", 0):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+            with patch.object(Path, "unlink", autospec=True, side_effect=always_locked):
+                result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertIn("could not be withdrawn", result)
+            self.assertIn("may still open late", result)
+            self.assertIn("relay:1234abcd", result)
+            self.assertNotIn("acknowledged", result)
 
     def test_codex_handoff_saves_body(self):
         with tempfile.TemporaryDirectory() as temp, \
