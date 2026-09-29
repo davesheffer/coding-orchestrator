@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -96,6 +97,39 @@ class ClientTests(unittest.TestCase):
             errors = []
             self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, boom, errors=errors))
             self.assertEqual(errors, ["NoApiKey"])
+
+    def test_write_log_appends_when_rotation_fails(self):
+        path = self.dir / "jev-log.jsonl"
+        path.write_text("x" * (jev_client.MAX_LOG_BYTES + 1) + "\n", encoding="utf-8")
+        with mock.patch.object(jev_client.os, "replace", side_effect=PermissionError("in use")):
+            jev_client.write_log({}, {"n": 1}, path)
+        self.assertEqual(path.read_text(encoding="utf-8").splitlines()[-1], '{"n": 1}')
+        self.assertFalse(path.with_name(path.name + ".1").exists())
+
+    def test_write_log_rotates(self):
+        path = self.dir / "jev-log.jsonl"
+        path.write_text("x" * (jev_client.MAX_LOG_BYTES + 1) + "\n", encoding="utf-8")
+        jev_client.write_log({}, {"n": 1}, path)
+        self.assertEqual(path.read_text(encoding="utf-8"), '{"n": 1}\n')
+        self.assertTrue(path.with_name(path.name + ".1").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACLs")
+    def test_write_log_restricts_windows_acl_on_create_only(self):
+        path = self.dir / "jev-log.jsonl"
+        real = jev_client._restrict_windows_file
+        with mock.patch.object(jev_client, "_restrict_windows_file", side_effect=real) as restrict:
+            jev_client.write_log({}, {"n": 1}, path)
+            jev_client.write_log({}, {"n": 2}, path)
+        restrict.assert_called_once_with(path)
+        self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 2)
+        acl = subprocess.run(["icacls", str(path)], capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("(I)", acl)
+
+    @unittest.skipIf(os.name == "nt", "POSIX modes")
+    def test_write_log_mode_0600(self):
+        path = self.dir / "jev-log.jsonl"
+        jev_client.write_log({}, {"n": 1}, path)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_noul_rejects_malformed(self):
         for answers in (None, {}, {"q": {}}, {"q": {"noul": "x"}}, {"q": {"noul": 1.5}}):

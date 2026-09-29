@@ -441,9 +441,10 @@ class ClaudeInstallTests(unittest.TestCase):
         env["HOME"] = str(Path(self.temp.name) / "unrelated-home")
         relay = self.home / "relay/relay.py"
         instructions = self.home.joinpath("CLAUDE.md").read_text(encoding="utf-8")
-        self.assertIn(f"python3 {shlex.quote(str(relay))} handoff", instructions)
+        self.assertIn(f"{install_module.hook_python()} {shlex.quote(str(relay))} handoff", instructions)
         self.assertNotIn("__RELAY__", instructions)
         self.assertNotIn("__PR_STATUS__", instructions)
+        self.assertNotIn("__PYTHON__", instructions)
         self.home.joinpath("relay/config.json").write_text('{"auto_open": false}')
         handoff = subprocess.run([sys.executable, str(relay), "handoff", "--no-open"],
                                  env=env, input="GOAL: recover custom installation\nNEXT STEP: run checks",
