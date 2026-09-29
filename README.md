@@ -356,7 +356,8 @@ The Codex installer:
   `bin/agent-run.py` launcher, and `bin/agent-report.py` under
   `${CODEX_HOME:-$HOME/.codex}`. Claude Code does not need to be installed.
 - Merges the marked orchestrator section into global `AGENTS.md`, preserving
-  content outside that section. Existing instructions receive a backup when
+  content outside that section. The rollover command in it uses `python` on
+  Windows and `python3` elsewhere. Existing instructions receive a backup when
   changed. A global `AGENTS.override.md` is left alone and reported because it
   can shadow `AGENTS.md`.
 - Creates `config.toml` from `codex/config.example.toml` only when absent.
