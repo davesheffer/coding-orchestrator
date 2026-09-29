@@ -320,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
     pr_status = shlex.quote(str(dest / "bin/pr-status"))
     if os.name == "nt":
         pr_status = "python " + pr_status
-    source_claude = source_claude.replace(
+    source_claude = source_claude.replace(b"__PYTHON__", hook_python().encode()).replace(
         b"__RELAY__", shlex.quote(str(dest / "relay/relay.py")).encode()
     ).replace(b"__PR_STATUS__", pr_status.encode())
     managed_block(source_claude, root / "CLAUDE.md")

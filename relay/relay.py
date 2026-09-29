@@ -258,7 +258,7 @@ def sweep_if_due(cfg):
 
 HOW = ("To roll over: write GOAL, STATE, DECISIONS & CONSTRAINTS, FILES, VERIFIED vs UNVERIFIED, "
        "NEXT STEP and NEXT PROMPT; pipe the handoff to "
-       f"`python3 {shlex.quote(str(Path(__file__).resolve()))} handoff --title \"<short title>\"` "
+       f"`{'python' if os.name == 'nt' else 'python3'} {shlex.quote(str(Path(__file__).resolve()))} handoff --title \"<short title>\"` "
        "(body on stdin via quoted heredoc; if the shell rejects it, e.g. `unexpected EOF`, write the body "
        "to a file with your file tool and redirect it with `< file` instead of retrying). Report the script's actual result; if it only saves/copies "
        "a relay prompt, tell the user how to start the new session. Then stop here.")
