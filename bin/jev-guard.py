@@ -44,7 +44,6 @@ import fnmatch
 import hashlib
 import json
 import os
-import posixpath
 import re
 import shlex
 import subprocess
@@ -163,15 +162,38 @@ _LOOSE_KEEP_RE = re.compile(
 _CD_SPLIT_RE = re.compile(r"&&|\|\||;|\n|\(|\{|`")
 # A line that could end a heredoc (`WORD`, or indented for the `<<-` form).
 _TERMINATOR_LINE_RE = re.compile(r"(?m)^([ \t]*)([\w.-]+)[ \t]*\r?$")
-# Staged files whose hunks are never sent to Jev (matched case-insensitively against the
-# file's base name); only the file name and a `[redacted]` marker go out.
+# Staged files whose hunks are never sent to Jev (matched case-insensitively against every
+# component of the file's path, directories included, so `secrets/db.yaml` matches too);
+# only the file name and a `[redacted]` marker go out.
 REDACT_FILE_PATTERNS = (".env*", "*.env", "*.pem", "*.key", "*secret*", "id_rsa*", "*.p12", "*.pfx",
                          "credentials*", "*.jks", "*.keystore")
-# Token shapes scrubbed from diff and report text before it is sent.
+# Token shapes scrubbed from diff and report text before it is sent. A key body may not
+# contain another marker or cross a hunk/file boundary, so each BEGIN scans only up to the
+# next one (linear time).
 SECRET_RE = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"
+    r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
+    r"(?:(?!-----(?:BEGIN|END) |\ndiff --git |\n@@).)*"
+    r"-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
     r"|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}"
     r"|xox[abpr]-[\w-]{10,}", re.DOTALL)
+# Private key markers left unpaired after SECRET_RE, e.g. a hunk that edits only one end.
+KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
+KEY_END_RE = re.compile(r"-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
+# A line (after an optional diff prefix and indentation) that looks like key body; an
+# unpaired marker next to one redacts to its hunk's end/start, otherwise only itself.
+KEY_LINE_RE = re.compile(r"[+\- ]?[ \t]*[A-Za-z0-9+/=]{16,}[ \t\r\n]*$")
+# Where _scrub splits text into hunks, so an unpaired marker redacts only its own hunk.
+HUNK_SPLIT_RE = re.compile(r"(?m)^(?=@@|diff --git )")
+# Any long base64 run (key body, even mid-line or indented), scrubbed anywhere; a diff
+# line's leading `+`/`-` is kept. Runs with base64url `-`/`_` (JWK, tokens) are redacted
+# only if they mix upper, lower and digits or hold a standard run, sparing identifiers.
+BASE64_RUN_RE = re.compile(r"(?m)(^[+-]|(?<![\w+/=-]))[\w+/=-]{40,}(?![\w+/=-])", re.ASCII)
+STD_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{40}")
+# A short base64-only line (a key's last body line), scrubbed in hunks that held key material.
+KEY_TAIL_LINE_RE = re.compile(r"(?m)^([+\- ]?[ \t]*)[A-Za-z0-9+/]{8,}={0,2}(?=[ \t]*\r?$)")
+# A hunk header; git appends the nearest preceding "function" line to it, which can be a
+# key body line, so everything after the closing `@@` is dropped.
+HUNK_HEADER_RE = re.compile(r"^(@@+ (?:[-+]\d+(?:,\d+)? )+@@+)[^\r\n]*")
 DIFF_HEADER_RE = re.compile(r"^diff --git (?:\"?a/(.*?)\"?) (?:\"?b/(.*?)\"?)$")
 # Forced onto every `git diff` the guard runs so the parsed header shape (matched by
 # DIFF_HEADER_RE above) can't be defeated by the user's own git config: diff.noprefix
@@ -516,16 +538,18 @@ def _native_path(path):
 
 def _redact_diff(diff):
     """Replace the hunks of files matching REDACT_FILE_PATTERNS with `[redacted]`,
-    keeping each file's header lines (and so its name)."""
+    keeping each file's header lines (and so its name), and drop the context text git
+    appends to every hunk header."""
     out = []
     mode = "keep"  # "keep", "header" (a redacted file's header lines) or "drop" (its hunks)
     for line in diff.splitlines(keepends=True):
+        line = HUNK_HEADER_RE.sub(r"\1", line, count=1)
         header = DIFF_HEADER_RE.match(line.rstrip("\r\n"))
         if header or line.startswith("new file: "):  # the latter: untracked-file blocks
-            names = [posixpath.basename(name) for name in (header.groups() if header else ())
-                     if name]
-            redact = any(fnmatch.fnmatchcase(name.lower(), pattern)
-                         for name in names for pattern in REDACT_FILE_PATTERNS)
+            parts = [part for name in (header.groups() if header else ()) if name
+                     for part in name.split("/")]
+            redact = any(fnmatch.fnmatchcase(part.lower(), pattern)
+                         for part in parts for pattern in REDACT_FILE_PATTERNS)
             mode = "header" if redact else "keep"
             out.append(line)
         elif mode == "header":
@@ -539,9 +563,85 @@ def _redact_diff(diff):
     return "".join(out)
 
 
+def _diff_prefix(diff, limit):
+    """Bound the text scrubbed for sending to a generous multiple of `limit` so huge diffs
+    stay fast. The cut falls on a line boundary: a secret split mid-line could otherwise
+    escape its pattern, and whole lines keep key blocks detectable (an unpaired BEGIN
+    followed by body lines redacts to its hunk's end)."""
+    size = max(int(limit or 0), 0) * 4 + (1 << 16)
+    if len(diff) <= size:
+        return diff
+    cut = diff.rfind("\n", 0, size)
+    if cut < 0:
+        return "[diff omitted: first line too long]\n"
+    return diff[: cut + 1]
+
+
+def _scrub_key_markers(lines):
+    """Redact the private key markers left unpaired in one hunk's lines: an END just after
+    a key body line redacts from the hunk's start (keeping its `@@` line), a BEGIN just
+    before one to the hunk's end, and any other marker (e.g. a prose mention) only itself.
+    Returns the lines and whether any marker was found."""
+    def blank(line):
+        return not line.strip(" \t\r\n+-")
+
+    found = False
+    cut, prev = None, None  # prev: the last non-blank line before the current one
+    for i, line in enumerate(lines):
+        if KEY_END_RE.search(line):
+            found = True
+            if prev is not None and KEY_LINE_RE.match(lines[prev]):
+                cut = i
+        if not blank(line):
+            prev = i
+    if cut is not None:
+        for end in KEY_END_RE.finditer(lines[cut]):
+            pass
+        start = 1 if cut and HUNK_SPLIT_RE.match(lines[0]) else 0
+        lines[start:cut + 1] = ["[redacted]" + lines[cut][end.end():]]
+    begin_at, nxt = None, None  # nxt: the first non-blank line after the current one
+    for i in range(len(lines) - 1, -1, -1):
+        if KEY_BEGIN_RE.search(lines[i]):
+            found = True
+            if nxt is not None and KEY_LINE_RE.match(lines[nxt]):
+                begin_at = i
+        if not blank(lines[i]):
+            nxt = i
+    if begin_at is not None:
+        begin = KEY_BEGIN_RE.search(lines[begin_at])
+        newline = "\n" if lines[-1].endswith("\n") else ""
+        lines[begin_at:] = [lines[begin_at][:begin.start()] + "[redacted]" + newline]
+    if found:
+        lines = [KEY_END_RE.sub("[redacted]", KEY_BEGIN_RE.sub("[redacted]", line))
+                 for line in lines]
+    return lines, found
+
+
 def _scrub(text):
-    """Replace common secret token shapes (API keys, tokens, private key blocks)."""
-    return SECRET_RE.sub("[redacted]", text)
+    """Replace common secret token shapes (API keys, tokens, private key blocks, long
+    base64 runs). Unpaired key markers are handled per hunk (report text is one hunk) by
+    _scrub_key_markers, and a hunk that held key material also loses short base64 lines."""
+    def redact_run(match):
+        nonlocal runs
+        # Only standard-alphabet runs (PEM key body) hint at a short last key line;
+        # base64url runs (JWK, tokens) are redacted without widening the scrub.
+        run = match.group(0)[len(match.group(1)):]
+        if STD_BASE64_RUN_RE.search(match.group(0)):  # the old match, diff `+` included
+            runs = True
+        elif "/" in run or "+" in run or not all(
+                re.search(c, run) for c in ("[A-Z]", "[a-z]", "[0-9]")):
+            return match.group(0)  # a path, long identifier or separator, not a key
+        return match.group(1) + "[redacted]"
+
+    hunks = []
+    for hunk in HUNK_SPLIT_RE.split(SECRET_RE.sub("[redacted]", text)):
+        lines, found = _scrub_key_markers(hunk.splitlines(keepends=True))
+        runs = False
+        hunk = BASE64_RUN_RE.sub(redact_run, "".join(lines))
+        if found or runs:
+            hunk = KEY_TAIL_LINE_RE.sub(r"\1[redacted]", hunk)
+        hunks.append(hunk)
+    return "".join(hunks)
 
 
 def _run_git(args, cwd, deadline=None):
@@ -842,7 +942,8 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     ask_state = {"operation": op, "files": names[:200]}
     if cfg.get("send_diff"):
         # Hunks of secret-looking files and common token shapes never leave the machine.
-        ask_state["diff"] = _scrub(_redact_diff(diff))[: cfg["max_diff_chars"]]
+        ask_state["diff"] = _scrub(_redact_diff(_diff_prefix(diff, cfg["max_diff_chars"])))[
+            : cfg["max_diff_chars"]]
     questions = {
         "risk": {"type": "choice", "instructions": RISK_INSTRUCTIONS, "criteria": RISK_CRITERIA},
         "needs_review": {"type": "noul", "instructions": NEEDS_REVIEW_INSTRUCTIONS},

@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -849,6 +850,192 @@ class GateTests(unittest.TestCase):
                        "AKIA" + "ABCDEFGHIJKLMNOP", "xoxb-123456789-abc"):
             self.assertEqual(jev._scrub(f"before {secret} after"), "before [redacted] after", secret)
         self.assertEqual(jev._scrub("sk-short and AKIAlower"), "sk-short and AKIAlower")
+
+    def test_secret_directories_redacted_before_sending(self):
+        (self.repo / "secrets").mkdir()
+        (self.repo / "config" / "Credentials").mkdir(parents=True)
+        self.stage_change("secrets/db.yaml", "password: hunter2\n")
+        self.stage_change("config/Credentials/prod.json", "{\"key\": \"hunter3\"}\n")
+        self.stage_change("a.txt", "plain change\n")
+        out = self.gate(self.payload("git commit -m x"), classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        diff = self.calls[0][0]["state"]["diff"]
+        self.assertIn("diff --git a/secrets/db.yaml b/secrets/db.yaml", diff)
+        self.assertNotIn("hunter2", diff)
+        self.assertNotIn("hunter3", diff)
+        self.assertIn("+plain change", diff)
+        self.assertEqual(diff.count("[redacted]"), 2)
+
+    def test_redact_diff_matches_every_path_component(self):
+        def file_diff(name, body="+value = 1\n"):
+            return (f"diff --git a/{name} b/{name}\nindex 1..2 100644\n--- a/{name}\n"
+                    f"+++ b/{name}\n@@ -0,0 +1 @@\n{body}")
+        for name in ("secrets/db.yaml", "credentials/prod.json", "config/credentials/prod.json",
+                     ".env.d/x", "deploy/SECRETS/nested/deep/app.yaml", "keys/server.pem",
+                     "my dir/secret stuff/a b.txt"):
+            out = jev._redact_diff(file_diff(name, "+hunter2\n"))
+            self.assertNotIn("hunter2", out, name)
+            self.assertIn(f"diff --git a/{name} b/{name}", out, name)
+            self.assertIn("[redacted]", out, name)
+        # A rename out of (or into) a secret directory redacts too.
+        rename = "diff --git a/secrets/a.yaml b/public/a.yaml\n@@ -1 +1 @@\n+hunter2\n"
+        self.assertNotIn("hunter2", jev._redact_diff(rename))
+        for name in ("src/app.py", "docs/keyboard.md", "src/envelope/x.py"):
+            self.assertEqual(jev._redact_diff(file_diff(name)), file_diff(name), name)
+
+    def test_scrub_partial_private_keys(self):
+        body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+        head = "diff --git a/k.txt b/k.txt\n--- a/k.txt\n+++ b/k.txt\n"
+        # A hunk that edits only the middle of a key: no BEGIN or END in it.
+        mid = f"{head}@@ -5,3 +5,3 @@\n {body}\n-{body[::-1]}\n+{body.lower()}\n"
+        out = jev._scrub(mid)
+        self.assertNotIn(body, out)
+        self.assertNotIn(body.lower(), out)
+        self.assertEqual(out, f"{head}@@ -5,3 +5,3 @@\n [redacted]\n-[redacted]\n+[redacted]\n")
+        # BEGIN only: redacted to the end of its hunk; the next hunk is kept.
+        begin = (f"{head}@@ -1,2 +1,2 @@\n context\n+-----BEGIN RSA PRIVATE KEY-----\n+{body[:20]}\n"
+                 "@@ -9 +9 @@\n+plain change\n")
+        out = jev._scrub(begin)
+        self.assertNotIn(body[:20], out)
+        self.assertEqual(out, f"{head}@@ -1,2 +1,2 @@\n context\n+[redacted]\n"
+                              "@@ -9 +9 @@\n+plain change\n")
+        # END only: redacted from the start of its hunk; its `@@` line and earlier hunks stay.
+        end = (f"{head}@@ -1 +1 @@\n+plain change\n@@ -20,2 +20,2 @@\n {body[:20]}\n"
+               "+-----END OPENSSH PRIVATE KEY-----\n+after\n")
+        out = jev._scrub(end)
+        self.assertNotIn(body[:20], out)
+        self.assertEqual(out, f"{head}@@ -1 +1 @@\n+plain change\n@@ -20,2 +20,2 @@\n"
+                              "[redacted]\n+after\n")
+        # Report text (not a diff) is one hunk.
+        self.assertEqual(jev._scrub(f"see\n-----BEGIN PRIVATE KEY-----\n{body[:20]}"), "see\n[redacted]")
+        self.assertEqual(jev._scrub(f"{body[:20]}\n-----END PRIVATE KEY-----\nok"), "[redacted]\nok")
+        self.assertEqual(jev._scrub(f"line\n{body}\r\nok"), "line\n[redacted]\r\nok")
+
+    def test_mid_key_edit_from_real_git_diff_is_scrubbed(self):
+        # git appends the nearest preceding line starting with a letter (here a key body
+        # line) to each hunk header, and the hunk itself holds only body lines.
+        body = [f"MIIE{chr(65 + i) * 60}" for i in range(8)]
+        lines = ["-----BEGIN RSA PRIVATE KEY-----", *body, "QUJDREVGRw==", "-----END RSA PRIVATE KEY-----"]
+        self.stage_change("key.txt", "\n".join(lines) + "\n")
+        run_git(["commit", "-m", "key"], self.repo)
+        lines[5] = "MIIE" + "z" * 60
+        self.stage_change("key.txt", "\n".join(lines) + "\n")
+        out = self.gate(self.payload("git commit -m x"), classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        diff = self.calls[0][0]["state"]["diff"]
+        self.assertIn("diff --git a/key.txt b/key.txt", diff)
+        self.assertIsNone(re.search(r"[A-Za-z0-9+/=]{40,}", diff))
+        for line in body + [lines[5]]:
+            self.assertNotIn(line[:16], diff)
+        headers = [line for line in diff.splitlines() if line.startswith("@@")]
+        self.assertTrue(headers)
+        for line in headers:
+            self.assertTrue(line.endswith("@@"), line)
+
+    def test_redact_diff_drops_hunk_header_context(self):
+        diff = ("diff --git a/k b/k\n@@ -6,7 +6,7 @@ MIIEowIBAAKCAQEA\n+x\n"
+                "@@@ -1,2 -1,2 +1,3 @@@ def secret_context():\r\n+y\n")
+        self.assertEqual(jev._redact_diff(diff),
+                         "diff --git a/k b/k\n@@ -6,7 +6,7 @@\n+x\n@@@ -1,2 -1,2 +1,3 @@@\r\n+y\n")
+
+    def test_scrub_base64_runs_anywhere(self):
+        body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+        body2 = "VbdsvL4KFu7a5K0Nm2tRg9lYIj6nHc8XqVjO1pYr+Tq7KxZcAeD3sW0fBn/EhUg="
+        cases = {
+            # Indented YAML / Helm value.
+            f"+tls:\n+  key: |\n+    {body}\n+    {body2}\n":
+                "+tls:\n+  key: |\n+    [redacted]\n+    [redacted]\n",
+            # Trailing whitespace.
+            f"@@ -1 +1 @@\n+{body}   \n": "@@ -1 +1 @@\n+[redacted]   \n",
+            # A JSON one-liner with literal `\n` separators.
+            f'+  "key": "{body}\\n{body2}\\n",\n': '+  "key": "[redacted]\\[redacted]\\n",\n',
+            # Mid-line.
+            f"tls.key: {body} # rotated\n": "tls.key: [redacted] # rotated\n",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(jev._scrub(text), expected, text)
+
+    def test_scrub_base64url_runs(self):
+        jwk = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7a"
+        cases = {
+            f'+  "d": "{jwk}-_Qx",\n': '+  "d": "[redacted]",\n',
+            f"-{jwk}_x\n": "-[redacted]\n",
+            # A standard run beside `_` is still redacted, without the tail-line scrub
+            # widening to short code lines when only base64url runs matched.
+            f"x = key_{'Ab1' * 14}\n": "x = [redacted]\n",
+            "@@ -1 +1 @@\n+# " + "-" * 60 + "\n+    continue\n": None,
+            "+SOME_VERY_LONG_CONSTANT_NAME_FOR_THE_CONFIG_1 = 2\n": None,
+            "+++ b/src/Feature1/some_component_name/handler_v2.py\n": None,
+            # The diff `+` still counts toward a standard 40-char run, as before.
+            "\n+" + "9" * 39 + "---:\n": "\n+[redacted]:\n",
+        }
+        cases = {k: k if v is None else v for k, v in cases.items()}
+        for text, expected in cases.items():
+            self.assertEqual(jev._scrub(text), expected, text)
+
+    def test_diff_prefix_cuts_on_a_line_boundary(self):
+        self.assertEqual(jev._diff_prefix("a\nb\n", 10), "a\nb\n")
+        size = 10 * 4 + (1 << 16)
+        token = "ghp_" + "A" * 36
+        diff = "x" * (size - 20) + "\n+" + token + "\n"
+        self.assertEqual(jev._diff_prefix(diff, 10), "x" * (size - 20) + "\n")
+        self.assertEqual(jev._diff_prefix("+" + "x" * size + "\n+" + token + "\n", 10),
+                         "[diff omitted: first line too long]\n")
+        key = "+-----BEGIN RSA PRIVATE KEY-----\n" + "+" + "Q" * 60 + "\n"
+        diff = "@@ -1 +1 @@\n" + key * (size // len(key) + 2)
+        sent = jev._scrub(jev._redact_diff(jev._diff_prefix(diff, 10)))
+        self.assertEqual(sent, "@@ -1 +1 @@\n+[redacted]\n")
+
+    def test_scrub_pgp_blocks_and_short_last_lines(self):
+        body = "lQOYBGE5ZmMBCADGzC3hQ8e8ZJ1dHtQx1Fs0V2uJp4bKsX7cTnWmY9RaE6oLvIqg"
+        block = f"-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n{body}\n=Ab12\n-----END PGP PRIVATE KEY BLOCK-----"
+        self.assertEqual(jev._scrub(f"before {block} after"), "before [redacted] after")
+        begin = f"@@ -1,4 +1,4 @@\n+-----BEGIN PGP PRIVATE KEY BLOCK-----\n+\n+{body}\n+ZmOo12Qx==\n"
+        self.assertEqual(jev._scrub(begin), "@@ -1,4 +1,4 @@\n+[redacted]\n")
+        # A mid-key hunk: the key's short last line goes too, other hunks keep theirs.
+        mid = f"@@ -5,3 +5,3 @@\n {body}\n+ZmOo12Qx==\n context line\n@@ -30 +30 @@\n+unchanged\n"
+        self.assertEqual(jev._scrub(mid), "@@ -5,3 +5,3 @@\n [redacted]\n+[redacted]\n context line\n"
+                                          "@@ -30 +30 @@\n+unchanged\n")
+
+    def test_scrub_key_pairs_do_not_cross_files(self):
+        body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+        diff = ("diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n+-----BEGIN RSA PRIVATE KEY-----\n"
+                f"+{body[:30]}\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -8,3 +8,3 @@\n"
+                f" {body[30:]}\n+-----END RSA PRIVATE KEY-----\n+plain change\n")
+        self.assertEqual(jev._scrub(diff),
+                         "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n+[redacted]\n"
+                         "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -8,3 +8,3 @@\n"
+                         "[redacted]\n+plain change\n")
+
+    def test_scrub_prose_marker_mention_keeps_rest(self):
+        for text, expected in (
+                ("fixed regex for -----BEGIN RSA PRIVATE KEY----- markers; 3 tests pass\nAll good",
+                 "fixed regex for [redacted] markers; 3 tests pass\nAll good"),
+                ("Preamble line\n-----END PRIVATE KEY-----\nrest of report",
+                 "Preamble line\n[redacted]\nrest of report"),
+                ("-----BEGIN OPENSSH PRIVATE KEY-----\n\nsee above", "[redacted]\n\nsee above")):
+            self.assertEqual(jev._scrub(text), expected)
+
+    def test_scrub_keeps_ordinary_code_lines(self):
+        text = ("+    very_long_identifier_name_with_underscores_everywhere_in_it = 1\n"
+                "-    return some_function_call(argument_one, argument_two, arg_three)\n"
+                " # A long comment line with spaces that goes past forty characters\n"
+                "+    self.assertEqual(result.value, expected_value_for_this_case)\n"
+                "+short0123456789\n")
+        self.assertEqual(jev._scrub(text), text)
+
+    def test_scrub_adversarial_input_is_fast(self):
+        for text in ("-----BEGIN RSA PRIVATE KEY-----" + "A" * 1_000_000,
+                     "-----BEGIN RSA PRIVATE KEY-----\n" * 32_000,
+                     "-----END RSA PRIVATE KEY-----\n" * 32_000,
+                     "-----BEGIN " + "A" * 1_000_000,
+                     "@@ -1 +1 @@\n-----BEGIN PRIVATE KEY-----\n" * 25_000,
+                     "+" + "A" * 1_000_000 + " x\n",
+                     "\n" * 1_000_000 + "-----END RSA PRIVATE KEY-----"):
+            started = time.monotonic()
+            out = jev._scrub(text)
+            self.assertLess(time.monotonic() - started, 3.0, text[:40])
+            self.assertNotIn("A" * 40, out)
 
 
 class AgentDoneTests(unittest.TestCase):
