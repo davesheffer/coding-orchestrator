@@ -135,6 +135,12 @@ class ClientTests(unittest.TestCase):
         for answers in (None, {}, {"q": {}}, {"q": {"noul": "x"}}, {"q": {"noul": 1.5}}):
             self.assertIsNone(jev_client.noul(answers, "q"))
 
+    def test_probability_is_strict(self):
+        for bad in (True, False, "0.5", 10 ** 400, float("nan"), float("inf"), -0.1, 1.5, None, [0.5]):
+            self.assertIsNone(jev_client.probability(bad), repr(bad)[:20])
+        self.assertEqual([jev_client.probability(v) for v in (0, 1, 0.25)], [0.0, 1.0, 0.25])
+        self.assertIs(jev_client.coerce_confidence, jev_client.probability)
+
     def test_http_classify_disables_redirects(self):
         cfg = self.config({})
         response = mock.MagicMock()

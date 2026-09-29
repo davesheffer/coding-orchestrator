@@ -2,6 +2,7 @@
 """Opt-in Codex lifecycle adapter for TypeSafe Jev. Fail open on API errors."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -22,6 +23,11 @@ RANK = {"luna": 0, "sol": 1, "astra": 2}
 INSTRUCTIONS = ("Choose the least expensive Codex model that will reliably complete this task well; "
                 "when torn between two models, choose the stronger one.")
 PINNED = {"scout", "runner", "builder", "critic"}
+LABELS = {
+    "luna": "Bounded searches, summaries and exact offline checks.",
+    "sol": "Implementation and routine design or debugging.",
+    "astra": "Security, concurrency, migrations, data loss, public APIs or hard review.",
+}
 
 
 def guard_module():
@@ -36,11 +42,20 @@ def guard_module():
 
 def settings():
     cfg = client.load_config(CONFIG)
-    cfg["labels"] = {
-        "luna": "Bounded searches, summaries and exact offline checks.",
-        "sol": "Implementation and routine design or debugging.",
-        "astra": "Security, concurrency, migrations, data loss, public APIs or hard review.",
-    }
+    # load_config keeps only Claude tiers, so merge the user's Codex labels from the
+    # raw file the same way: over the defaults, with a null value removing a tier.
+    labels = dict(LABELS)
+    try:
+        user = json.loads(CONFIG.read_text(encoding="utf-8")).get("jev", {}).get("labels")
+    except Exception:
+        user = None
+    if isinstance(user, dict):
+        for name, rubric in user.items():
+            if rubric is None:
+                labels.pop(name, None)
+            elif isinstance(rubric, str):
+                labels[name] = rubric
+    cfg["labels"] = {k: v for k, v in labels.items() if k in MODELS}
     return cfg
 
 
@@ -48,11 +63,18 @@ def log(cfg, entry):
     client.write_log(cfg, entry, LOG)
 
 
+def desc_hash(description):
+    """sha256(description)[:12] as in bin/jev-route.py, or None if empty."""
+    if not description:
+        return None
+    return hashlib.sha256(description.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
 def route(payload, cfg, classify_fn=None):
     if payload.get("tool_name") not in ("Agent", "Task", "spawn_agent"):
         return None
     args = payload.get("tool_input")
-    if not isinstance(args, dict):
+    if not isinstance(args, dict) or not cfg["labels"]:
         return None
     role = args.get("agent_type") or args.get("subagent_type")
     if role in PINNED or role in cfg.get("pinned_agents", []):
@@ -60,33 +82,55 @@ def route(payload, cfg, classify_fn=None):
     if role not in (None, "default", "general-purpose") or args.get("model"):
         return None
     state = {"role": role or "default"}
+    task = str(args.get("message") or args.get("prompt") or "")
     if cfg.get("send_prompt", True):
-        description = str(args.get("message") or args.get("prompt") or "")
-        state["task"] = description[:cfg["max_prompt_chars"]]
+        state["task"] = task[:cfg["max_prompt_chars"]]
+    start = time.monotonic()
+    errors = []
     answers = client.ask(cfg, "route", state,
                          {"model": {"type": "choice", "instructions": INSTRUCTIONS,
-                                    "criteria": cfg["labels"]}}, classify_fn)
+                                    "criteria": cfg["labels"]}}, classify_fn, errors=errors)
+    # Same shape as bin/jev-route.py entries so jev-report buckets them by agent.
+    entry = {"ts": client.timestamp(), "feature": "route", "subagent_type": role or "default",
+             "role": role or "default", "latency_ms": client.elapsed_ms(start)}
+    hashed = desc_hash(str(args.get("description") or task))
+    if hashed:
+        entry["desc_hash"] = hashed
+    if answers is None:
+        if errors:
+            log(cfg, {**entry, "applied": False, "reason": "unavailable", "error": errors[0]})
+        return None
     try:
         answer = answers["model"]
         choice = answer["choice"]
-        confidence = float(answer["confidence"])
-    except (TypeError, KeyError, ValueError):
+    except (TypeError, KeyError):
+        # Malformed shape (e.g. answers["model"] is a string), same as client.ask()'s own check.
+        log(cfg, {**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
-    if choice not in MODELS:
-        return None
-    # Without a model the subagent inherits the parent's, so only the weakest
-    # model is a likely downgrade; it needs downgrade_min_confidence.
-    escalated = client.stronger_tier(answer.get("probabilities"), RANK, RANK[choice], cfg["escalate_mass"])
-    if not escalated and confidence < (cfg["downgrade_min_confidence"] if RANK[choice] == 0
-                                       else cfg["min_confidence"]):
-        return None
-    applied_model = escalated[0] if escalated else choice
-    updated = {**args, "model": MODELS[applied_model]}
-    entry = {"ts": client.timestamp(), "feature": "route", "role": role or "default",
-             "choice": choice, "confidence": confidence, "applied": True}
+    confidence = client.coerce_confidence(answer.get("confidence"))
+    escalated = None
+    if not isinstance(choice, str) or choice not in MODELS or choice not in cfg["labels"]:
+        why = "invalid label"
+    elif confidence is None:
+        why = "invalid confidence"
+    else:
+        # Without a model the subagent inherits the parent's, so only the weakest
+        # model is a likely downgrade; it needs downgrade_min_confidence.
+        # Escalate only to models the user kept in jev.labels.
+        ranks = {t: r for t, r in RANK.items() if t in cfg["labels"]}
+        escalated = client.stronger_tier(answer.get("probabilities"), ranks, RANK[choice], cfg["escalate_mass"])
+        floor = cfg["downgrade_min_confidence"] if RANK[choice] == 0 else cfg["min_confidence"]
+        why = "applied" if escalated or confidence >= float(floor) else "below confidence threshold"
+    # Never write a raw non-string/oversized choice; repr() is UTF-8-safe (handles lone surrogates too).
+    display_choice = client.safe_repr(choice) if why == "invalid label" else choice
+    record = {**entry, "choice": display_choice, "confidence": confidence, "applied": why == "applied",
+              "reason": why}
     if escalated:
-        entry.update(escalated_to=applied_model, escalated_mass=round(escalated[1], 4))
-    log(cfg, entry)
+        record.update(escalated_to=escalated[0], escalated_mass=round(escalated[1], 4))
+    log(cfg, record)
+    if why != "applied":
+        return None
+    updated = {**args, "model": MODELS[escalated[0] if escalated else choice]}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                     "updatedInput": updated}}
 
@@ -187,7 +231,8 @@ def grade_handoff(body, cfg, classify_fn=None):
 
 def main():
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        # Hook payloads are UTF-8 whatever the locale (e.g. cp1255 on Windows).
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
         cfg = settings()
         if len(sys.argv) > 1 and sys.argv[1] == "grade":
             result = grade_handoff(str(payload.get("handoff") or ""), cfg)

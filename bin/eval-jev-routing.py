@@ -4,7 +4,10 @@
 Loads benchmarks/jev-routing.json (tasks with an expected tier), asks the Jev
 classifier the same question bin/jev-route.py asks, sequentially, and reports
 accuracy, a confusion matrix, per-tier recall, confidence by outcome and the
-list of misses. The route feature is forced on so the result does not depend
+list of misses. "Applied accuracy" scores what the router would actually run:
+jev-route's own rule (pinned_agents, min_confidence, same-model skip) decides
+whether the choice is applied, otherwise the agent keeps its frontmatter model
+(or "inherit"). The route feature is forced on so the result does not depend
 on the user's feature toggles. `--labels-file` swaps in candidate rubrics
 ({tier: rubric}) for tuning. `--dry-run` only validates the benchmark.
 
@@ -78,14 +81,16 @@ def mean(values):
     return round(sum(values) / len(values), 4) if values else None
 
 
-def evaluate(tasks, cfg, classify_fn=None, router=None):
+def evaluate(tasks, cfg, classify_fn=None, router=None, home=None):
     """Classify each task and score it against its expected tier.
 
     classify_fn(state, questions) returns the Jev `answers` dict (or None on
     failure); it defaults to jev_client.ask for the route feature. Any failure
-    or unusable answer is recorded as "error".
+    or unusable answer is recorded as "error". Agent frontmatter models are read
+    from `home` (default: this install), as jev-route does.
     """
     router = router or load_router()
+    home = router.ROOT if home is None else home
     if classify_fn is None:
         classify_fn = lambda state, questions: ask(cfg, "route", state, questions)  # noqa: E731
     questions = router.build_questions(cfg)
@@ -98,25 +103,35 @@ def evaluate(tasks, cfg, classify_fn=None, router=None):
     results, misses = [], []
     for task in tasks:
         state = router.build_state(task, cfg)
+        current = router.current_model({}, task, home)
         choice, confidence, probabilities = ERROR, None, None
         try:
             answer = (classify_fn(state, questions) or {})["model"]
             if answer.get("choice") in cfg["labels"]:
                 choice = answer["choice"]
-                confidence = float(answer.get("confidence"))
-                probabilities = answer.get("probabilities")
+                confidence = router.coerce_confidence(answer.get("confidence"))
+                # Dict only, probabilities or None: a NaN-bearing list isn't strict-JSON safe.
+                probabilities = router.sanitize_probabilities(answer.get("probabilities"), cfg["labels"])
         except Exception:
             choice, confidence, probabilities = ERROR, None, None
         predicted = choice if choice in columns else ERROR
         confusion[task["expected"]][predicted] += 1
+        # Pinned agents are still classified for raw accuracy, but production never
+        # routes them, so they keep their own model.
+        why, model, _ = (("pinned", None, None) if router.pinned(task, cfg)
+                         else router.verdict(choice, confidence, current, cfg, probabilities))
+        effective = model if why == "applied" else choice if why == "same model" else (
+            router.model_tier(current, router.TIER_RANK) or "inherit")
         result = {"id": task["id"], "expected": task["expected"], "got": predicted,
                   "confidence": confidence, "probabilities": probabilities,
-                  "correct": predicted == task["expected"]}
+                  "correct": predicted == task["expected"], "applied": why == "applied",
+                  "effective": effective, "applied_correct": effective == task["expected"]}
         results.append(result)
         if not result["correct"]:
             misses.append({"id": task["id"], "expected": task["expected"], "got": predicted,
                            "conf": confidence})
     correct = sum(1 for r in results if r["correct"])
+    applied_correct = sum(1 for r in results if r["applied_correct"])
     recall = {}
     for tier in tiers:
         total = sum(confusion[tier].values())
@@ -125,6 +140,8 @@ def evaluate(tasks, cfg, classify_fn=None, router=None):
     return {
         "total": len(results), "correct": correct, "errors": sum(1 for r in results if r["got"] == ERROR),
         "accuracy": round(correct / len(results), 4) if results else None,
+        "applied": sum(1 for r in results if r["applied"]), "applied_correct": applied_correct,
+        "applied_accuracy": round(applied_correct / len(results), 4) if results else None,
         "labels": columns, "confusion": confusion, "recall": recall,
         "mean_confidence": {
             "overall": mean(confidences),
@@ -146,6 +163,8 @@ def render(report):
     width = max(len(c) for c in cols + ["expected"]) + 2
     lines = [f"accuracy: {fmt(report['accuracy'], True)} ({report['correct']}/{report['total']}, "
              f"{report['errors']} errors)",
+             f"applied accuracy: {fmt(report['applied_accuracy'], True)} "
+             f"({report['applied_correct']}/{report['total']}, {report['applied']} applied)",
              "confusion (rows expected, cols predicted):",
              "  " + "expected".ljust(width) + "".join(c.rjust(width) for c in cols)]
     for row, counts in report["confusion"].items():
@@ -201,7 +220,7 @@ def main(argv=None):
         print("no API key: set TYPESAFE_API_KEY or jev.api_key_file", file=sys.stderr)
         return 2
     report = evaluate(tasks, cfg)
-    print(json.dumps(report, sort_keys=True) if args.json else render(report))
+    print(json.dumps(report, sort_keys=True, allow_nan=False) if args.json else render(report))
     return 0
 
 

@@ -121,12 +121,21 @@ def load_config(path=CONFIG_PATH):
 
 
 def probability(value):
-    """value as a float in [0, 1], else None."""
+    """value as a float in [0, 1], else None.
+
+    Rejects bool and str. float() raises OverflowError on a huge int (a JSON
+    number with hundreds of digits), which counts as invalid instead of raising.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
     try:
         p = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, ValueError, TypeError):
         return None
     return p if math.isfinite(p) and 0.0 <= p <= 1.0 else None
+
+
+coerce_confidence = probability  # a classifier confidence follows the same rule
 
 
 def stronger_tier(probabilities, ranks, floor, mass_needed):
@@ -252,6 +261,17 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None):
     return answers
 
 
+def safe_repr(value, limit=80):
+    """UTF-8-safe, length-bounded repr of a possibly-malformed logged value.
+
+    repr() escapes lone surrogates and control characters, so the result is
+    always encodable as UTF-8 JSON text; long values are truncated with their
+    original repr length noted instead of writing the raw (possibly huge) value.
+    """
+    text = repr(value)
+    return text if len(text) <= limit else f"{text[:limit]}... (len {len(text)})"
+
+
 def noul(answers, name):
     """The yes-probability of a noul answer, or None if absent/malformed."""
     try:
@@ -323,6 +343,11 @@ def write_log(cfg, entry, path=None):
                     os.chmod(path, 0o600)
                 except OSError:
                     pass
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            line = json.dumps(entry, ensure_ascii=False)
+            try:
+                line.encode("utf-8")
+            except UnicodeEncodeError:
+                line = json.dumps(entry)  # a lone surrogate from the classifier: escape, don't drop
+            handle.write(line + "\n")
     except Exception:
         pass
