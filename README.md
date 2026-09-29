@@ -34,7 +34,10 @@ the mapping applies if that tier is used for a future role.
 The Claude installer sets `claude-opus-5-5` as the main-session default when no
 model is already selected in user settings; existing explicit choices remain
 untouched. Its named scout, runner, and builder roles use Sonnet, and its critic
-uses Fable. [Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
+uses Fable. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
+follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
+Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
+[Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
 is required for Opus 5.5. These are routing defaults, not a promise of access on every plan.
 Check your model picker and adjust the role definitions for your account.
 
