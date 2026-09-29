@@ -72,6 +72,10 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
     try:
         open_uri(uri)
     except (OSError, subprocess.CalledProcessError) as exc:
+        try:
+            request.unlink()
+        except OSError:
+            pass
         return f"Editor launch failed ({exc}). Open a new {client} tab and send: {prompt}"
     ack = root / "acks" / f"{request_id}.json"
     result = wait_for_ack(ack, timeout)
@@ -80,15 +84,18 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
         # an unclaimed request can no longer open a late second tab beside the fallback.
         withdrawn = withdraw(request, CLAIMED_GRACE)
         if withdrawn is None:
-            return (f"Editor launch was not confirmed and the request could not be withdrawn "
-                    f"({request} is locked), so a {client} tab may still open late. "
-                    f"If none appears, open a new {client} tab and send: {prompt}")
-        if withdrawn:
+            result = wait_for_ack(ack, 0)
+            if result is None:
+                return (f"Editor launch was not confirmed and the request could not be withdrawn "
+                        f"({request} is locked), so a {client} tab may still open late. "
+                        f"If none appears, open a new {client} tab and send: {prompt}")
+        elif withdrawn:
             return (f"The VS Code handoff bridge did not pick up the request within {timeout:g}s "
                     f"(VS Code still starting, or the extension is missing, disabled, or from another "
                     f"version; if this repeats, reinstall it from vscode/handoff-bridge). "
                     f"Open a new {client} tab and send: {prompt}")
-        result = wait_for_ack(ack, CLAIMED_GRACE)
+        else:
+            result = wait_for_ack(ack, CLAIMED_GRACE)
     if result is None:
         return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
     if result.get("status") == "opened":

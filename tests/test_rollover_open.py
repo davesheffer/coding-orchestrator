@@ -136,6 +136,38 @@ class RolloverOpenTests(unittest.TestCase):
             self.assertIn("relay:1234abcd", result)
             self.assertNotIn("acknowledged", result)
 
+    def test_locked_request_still_reports_an_ack_already_written(self):
+        def always_locked(path, *args, **kwargs):
+            if path.parent.name == "launches":
+                raise PermissionError(32, "being used by another process")
+
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "CLAIMED_GRACE", 0):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+            calls = []
+
+            def ack_after_first_poll(path, seconds):
+                calls.append(seconds)
+                return {"status": "opened"} if len(calls) > 1 else None
+
+            with patch.object(rollover, "open_uri"), \
+                    patch.object(rollover, "wait_for_ack", side_effect=ack_after_first_poll), \
+                    patch.object(Path, "unlink", autospec=True, side_effect=always_locked):
+                result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertIn("acknowledged", result)
+
+    def test_failed_launcher_removes_its_request(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "open_uri", side_effect=OSError("no handler")):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+            result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertIn("Editor launch failed", result)
+            self.assertEqual(list((Path(temp) / "launches").iterdir()), [])
+
     def test_codex_handoff_saves_body(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}):
