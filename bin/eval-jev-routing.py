@@ -111,7 +111,7 @@ def evaluate(tasks, cfg, classify_fn=None, router=None, home=None):
                 choice = answer["choice"]
                 confidence = router.coerce_confidence(answer.get("confidence"))
                 # Dict only, probabilities or None: a NaN-bearing list isn't strict-JSON safe.
-                probabilities = router.sanitize_probabilities(answer.get("probabilities"))
+                probabilities = router.sanitize_probabilities(answer.get("probabilities"), cfg["labels"])
         except Exception:
             choice, confidence, probabilities = ERROR, None, None
         predicted = choice if choice in columns else ERROR
@@ -121,7 +121,7 @@ def evaluate(tasks, cfg, classify_fn=None, router=None, home=None):
         why, model, _ = (("pinned", None, None) if router.pinned(task, cfg)
                          else router.verdict(choice, confidence, current, cfg, probabilities))
         effective = model if why == "applied" else choice if why == "same model" else (
-            router.model_tier(current, cfg["labels"]) or "inherit")
+            router.model_tier(current, router.TIER_RANK) or "inherit")
         result = {"id": task["id"], "expected": task["expected"], "got": predicted,
                   "confidence": confidence, "probabilities": probabilities,
                   "correct": predicted == task["expected"], "applied": why == "applied",

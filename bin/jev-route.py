@@ -70,8 +70,8 @@ def current_model(payload, tool_input, home=ROOT):
 
 
 def model_tier(model, tiers):
-    """The tier alias for a model: the alias itself, or the tier named inside a full
-    Claude id (claude-opus-4-1, us.anthropic.claude-3-5-haiku-...); else the model."""
+    """The tier alias for a model: the alias itself, or the tier from `tiers` named inside
+    a full Claude id (claude-opus-4-1 is opus when "opus" is in tiers); else the model."""
     if not isinstance(model, str):
         return model
     lowered = model.strip().lower()
@@ -88,22 +88,26 @@ def valid_confidence(confidence):
     return isinstance(confidence, float) and math.isfinite(confidence) and 0.0 <= confidence <= 1.0
 
 
-def sanitize_probabilities(probabilities):
-    """The probabilities dict for logging: dict only, values that aren't a probability become None."""
+def sanitize_probabilities(probabilities, labels):
+    """The probabilities dict for logging: dict only, configured labels only (keys are
+    classifier-controlled), values that aren't a probability become None."""
     if not isinstance(probabilities, dict):
         return None
-    return {k: coerce_confidence(v) for k, v in probabilities.items()}
+    return {k: coerce_confidence(v) for k, v in probabilities.items() if k in labels}
 
 
 def verdict(choice, confidence, current, cfg, probabilities=None):
     """(why, model, escalated_mass): why an answer is skipped, or "applied" with the
     model to run (shared with bin/eval-jev-routing.py). escalated_mass is set when
     the classifier kept the current tier but stronger tiers together are likely enough."""
+    if not isinstance(current, str):
+        current = None  # e.g. a dict/list tool_input.model: treat as unknown
     if not isinstance(choice, str) or choice not in cfg["labels"]:
         return "invalid label", None, None
     if not valid_confidence(confidence):
         return "invalid confidence", None, None
-    tier = model_tier(current, cfg["labels"])
+    # Resolve against every known tier, so thresholds don't depend on which labels are kept.
+    tier = model_tier(current, TIER_RANK)
     escalated = escalation(tier, choice, probabilities, cfg)
     if escalated:
         return "applied", escalated[0], escalated[1]
@@ -209,7 +213,7 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         reason = f"jev: {current or 'inherit'} → {display_choice} (conf {conf_text})"
     if log_fn:
         entry.update({"choice": display_choice, "confidence": confidence,
-                      "probabilities": sanitize_probabilities(probabilities),
+                      "probabilities": sanitize_probabilities(probabilities, cfg["labels"]),
                       "applied": applied, "reason": reason if applied else f"{reason}; skipped: {why}"})
         if escalated_mass is not None:
             entry["escalated_to"] = applied_model

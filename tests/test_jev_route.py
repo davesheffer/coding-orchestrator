@@ -336,8 +336,32 @@ class DecideTests(unittest.TestCase):
                             ("us.anthropic.claude-opus-4-1-20250805-v1:0", "opus"),
                             ("gpt-5", "gpt-5"), ("opus-like", "opus-like"), (None, None)):
             self.assertEqual(jev.model_tier(model, tiers), tier, model)
+        # verdict resolves against every known tier, not just the configured labels.
+        self.assertEqual(jev.model_tier("claude-3-5-haiku-latest", jev.TIER_RANK), "haiku")
         self.assertEqual(jev.model_tier("claude-3-5-haiku-latest", self.cfg["labels"]),
                          "claude-3-5-haiku-latest")
+
+    def test_verdict_resolves_full_ids_whatever_labels_are_kept(self):
+        cfg = self.load({"labels": {"opus": None}})
+        for current in ("opus", "claude-opus-5-5"):
+            with self.subTest(current=current):
+                self.assertEqual(jev.verdict("sonnet", 0.5, current, cfg),
+                                 ("below confidence threshold", None, None))
+
+    def test_verdict_non_string_current_is_unknown(self):
+        probabilities = {"opus": 0.55, "fable": 0.45}
+        expected = jev.verdict("opus", 0.55, None, self.cfg, probabilities)
+        for current in ({}, [], {"model": "opus"}, ["opus"]):
+            with self.subTest(current=current):
+                self.assertEqual(jev.verdict("opus", 0.55, current, self.cfg, probabilities), expected)
+
+    def test_logged_probabilities_keep_only_configured_labels(self):
+        logs = []
+        huge = "x" * 100000
+        fn = self.probs("opus", 0.82, {"opus": 0.82, "sonnet": "nan", huge: 0.1})
+        self.decide(self.payload, self.cfg, fn, logs.append)
+        self.assertEqual(logs[-1]["probabilities"], {"opus": 0.82, "sonnet": None})
+        self.assertLess(len(json.dumps(logs[-1])), 2000)
 
     def test_full_model_id_of_same_tier_is_not_rewritten(self):
         self.payload["tool_input"]["model"] = "claude-opus-4-1"

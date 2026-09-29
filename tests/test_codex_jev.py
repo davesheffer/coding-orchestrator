@@ -102,6 +102,17 @@ class CodexJevTests(unittest.TestCase):
         answer = {"choice": "luna", "confidence": 0.9, "probabilities": {"luna": 0.9, "sol": "nan"}}
         self.assertEqual(self.route_with(answer), "gpt-6-luna")
 
+    def test_route_never_escalates_to_removed_model(self):
+        cfg = module.settings()
+        cfg |= {"enabled": True, "labels": {k: v for k, v in cfg["labels"].items() if k != "astra"}}
+        payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "fix it"}}
+        answer = {"choice": "sol", "confidence": 0.9, "probabilities": {"sol": 0.5, "astra": 0.5}}
+        with patch.object(module.client, "ask", return_value={"model": answer}), \
+             patch.object(module, "log") as log:
+            out = module.route(payload, cfg)
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+        self.assertNotIn("escalated_to", log.call_args[0][1])
+
     def test_route_respects_send_prompt_false(self):
         cfg = module.settings() | {"enabled": True, "send_prompt": False}
         payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "PRIVATE-TASK-SENTINEL"}}

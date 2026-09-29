@@ -116,7 +116,9 @@ def route(payload, cfg, classify_fn=None):
     else:
         # Without a model the subagent inherits the parent's, so only the weakest
         # model is a likely downgrade; it needs downgrade_min_confidence.
-        escalated = client.stronger_tier(answer.get("probabilities"), RANK, RANK[choice], cfg["escalate_mass"])
+        # Escalate only to models the user kept in jev.labels.
+        ranks = {t: r for t, r in RANK.items() if t in cfg["labels"]}
+        escalated = client.stronger_tier(answer.get("probabilities"), ranks, RANK[choice], cfg["escalate_mass"])
         floor = cfg["downgrade_min_confidence"] if RANK[choice] == 0 else cfg["min_confidence"]
         why = "applied" if escalated or confidence >= float(floor) else "below confidence threshold"
     # Never write a raw non-string/oversized choice; repr() is UTF-8-safe (handles lone surrogates too).
