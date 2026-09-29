@@ -122,10 +122,25 @@ SUPPORTED_INSTRUCTIONS = ("The EVIDENCE (commands run, exit codes, file:line ref
 MATERIAL_GAP_INSTRUCTIONS = ("UNVERIFIED lists something material to whether RESULT is correct "
                               "or safe to rely on.")
 SECTION_NAMES = ("RESULT", "EVIDENCE", "CONFIDENCE", "UNVERIFIED")
-# Case-sensitive UPPERCASE headers with a required colon, so prose like "Result of git
-# diff..." doesn't overmatch; optional leading markdown (#, *, -, >) is still allowed.
+# Case-sensitive UPPERCASE headers followed by a colon or alone on their line, so prose
+# like "Result of git diff..." or "RESULT here is..." doesn't overmatch; optional leading
+# markdown (#, *, -, >) is still allowed.
 SECTION_RE = re.compile(
-    r"(?m)^[ \t]*[#*\-> \t]*\**(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)\**[ \t]*:\**[ \t]*")
+    r"(?m)^[ \t]*[#*\-> \t]*\**(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)\**[ \t]*(?::\**[ \t]*|\r?$)")
+# What the Agent tool returns when the report itself went through SubagentHandback,
+# which the handback check already saw. Full match on the exact stub (plus the optional
+# agentId / <usage> trailer) so a sectionless report can't ride in behind the phrase.
+# Observed: 'This agent's report was delivered to you as a message from "<id>" (its
+# SubagentHandback call). Read it there; it is not repeated here.' then "agentId: <id>
+# (use SendMessage with to: '<id>', summary: '<5-10 word recap>' to continue this agent)"
+# and "<usage>subagent_tokens: N ... duration_ms: N</usage>".
+HANDBACK_STUB_RE = re.compile(
+    r"\s*This agent['\u2019]s report was delivered to you as a message"
+    r"(?: from \"[\w-]{1,100}\")? \(its SubagentHandback call\)\."
+    r"(?: Read it there; it is not repeated here\.)?"
+    r"(?:\s*agentId: [\w-]{1,100}(?: \(use SendMessage with to: '[\w-]{1,100}', "
+    r"summary: '[^'\n]{0,100}' to continue this agent\))?)?"
+    r"(?:\s*<usage>(?:\s*\w+: [\w.]+)*\s*</usage>)?\s*")
 
 
 def _desc_hash(description):
@@ -522,11 +537,16 @@ def _parse_sections(text):
     for i, m in enumerate(matches):
         name = m.group(1).upper()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        sections[name] = text[m.end():end].strip()
+        body = text[m.end():end].strip()
+        # Last non-empty wins: a quoted block or stale verdict earlier in the report yields
+        # to the real one, and an empty bare header (e.g. the format quoted inside
+        # EVIDENCE) can't wipe out a section.
+        if body or name not in sections:
+            sections[name] = body
     return sections
 
 
-def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
+def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_blocks=True):
     """Parse RESULT/EVIDENCE/CONFIDENCE/UNVERIFIED sections and ask Jev whether the
     report is weak. Returns (reasons, reason_codes, supported, material_gap).
 
@@ -534,6 +554,9 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
     applies to the PostToolUse agent-done nudge (a foreground report can be told to
     verify or escalate more), but not to the SubagentHandback deny path (a read-only
     critic can't escalate, so low/medium confidence alone must not block it).
+    `gap_blocks` likewise gates the material-gap verdict: an honest UNVERIFIED list is
+    what the report should contain, and verifying it is the main session's job, so
+    the deny paths log the gap without blocking on it.
 
     Sections are parsed from the FULL text (a long report's RESULT/EVIDENCE/CONFIDENCE/
     UNVERIFIED block may come after `max_report_chars` of findings), so truncation is
@@ -572,7 +595,7 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True):
             material_gap = noul(answers, "material_gap")
             if supported is not None and supported < cfg["report_min_support"]:
                 reasons.append(f"evidence weakly supports result (p={supported:.2f})")
-            if material_gap is not None and material_gap >= cfg["report_max_gap"]:
+            if gap_blocks and material_gap is not None and material_gap >= cfg["report_max_gap"]:
                 reasons.append(f"material unverified claims (p={material_gap:.2f})")
 
     reason_codes = []
@@ -606,7 +629,7 @@ def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
     agent_id = payload.get("agent_id")
     start = time.monotonic()
     reasons, reason_codes, supported, material_gap = _analyze_report(
-        message, cfg, classify_fn, confidence_heuristic=False)
+        message, cfg, classify_fn, confidence_heuristic=False, gap_blocks=False)
 
     def log(decision):
         if not log_fn:
@@ -749,6 +772,11 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
         return None
 
     text = _extract_report_text(completed)
+    if HANDBACK_STUB_RE.fullmatch(text):
+        if log_fn:
+            log_fn({"ts": timestamp(), "feature": "report_check", "event": "agent_done",
+                    "decision": "skipped_handback_stub", "subagent_type": subagent_type})
+        return None
     start = time.monotonic()
     reasons, reason_codes, supported, material_gap = _analyze_report(text, cfg, classify_fn)
 

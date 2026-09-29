@@ -3,6 +3,9 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
+import subprocess
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -104,6 +107,69 @@ class PrStatusTests(unittest.TestCase):
                     pr_status.main(argv)
                 self.assertEqual(error.exception.code, 2)
                 gh.assert_not_called()
+
+
+class GhLaunchTests(unittest.TestCase):
+    def launch(self, platform, wrapper, pathext=".COM;.EXE;.BAT;.CMD", result=None, error=None):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            if error is not None:
+                raise error
+            return result or subprocess.CompletedProcess(command, 0, "[]", "")
+
+        with patch.object(pr_status.sys, "platform", platform), \
+             patch.object(pr_status.os.path, "expanduser", return_value=wrapper), \
+             patch.object(pr_status.os, "access", return_value=True), \
+             patch.dict(pr_status.os.environ, {"PATHEXT": pathext}), \
+             patch.object(pr_status.subprocess, "run", side_effect=run):
+            output = pr_status.gh("pr", "list", "--json", "number")
+        return output, calls
+
+    @unittest.skipUnless(os.name == "nt", "shutil.which applies PATHEXT only on Windows")
+    def test_windows_resolves_the_wrapper_only_for_exe_or_com(self):
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper_dir = Path(temp) / ".hunch"
+            wrapper_dir.mkdir()
+            base = str(wrapper_dir / "agent-gh")
+            with patch.object(pr_status.sys, "platform", "win32"), \
+                 patch.object(pr_status.os.path, "expanduser", return_value=base):
+                self.assertEqual(pr_status.wrapper_command(), "gh")  # nothing present yet
+
+                (wrapper_dir / "agent-gh.cmd").write_bytes(b"")
+                self.assertEqual(pr_status.wrapper_command(), "gh")  # .cmd runs through cmd.exe
+
+                (wrapper_dir / "agent-gh").write_bytes(b"")
+                self.assertEqual(pr_status.wrapper_command(), "gh")  # extensionless: no PATHEXT match
+
+                exe = wrapper_dir / "agent-gh.exe"
+                exe.write_bytes(b"")
+                # shutil.which reconstructs the suffix from PATHEXT casing (.EXE).
+                self.assertEqual(pr_status.wrapper_command().lower(), str(exe).lower())
+
+                exe.unlink()
+                com = wrapper_dir / "agent-gh.com"
+                com.write_bytes(b"")
+                self.assertEqual(pr_status.wrapper_command().lower(), str(com).lower())
+
+    def test_posix_uses_executable_wrapper(self):
+        output, calls = self.launch("linux", "/home/u/.hunch/agent-gh")
+        self.assertEqual(output, "[]")
+        self.assertEqual(calls[0][0], ["/home/u/.hunch/agent-gh", "pr", "list", "--json", "number"])
+        self.assertEqual(calls[0][1]["errors"], "replace")
+
+    def test_launch_errors_exit_with_a_message(self):
+        for error in (OSError(193, "not a valid Win32 application"), subprocess.TimeoutExpired("gh", 60)):
+            with self.subTest(error=error), self.assertRaises(SystemExit) as caught:
+                self.launch("win32", "C:/home/.hunch/agent-gh", error=error)
+            self.assertTrue(str(caught.exception.code).startswith("pr-status: pr list --json could not run gh"))
+
+    def test_failed_command_exits_with_its_stderr(self):
+        failed = subprocess.CompletedProcess([], 1, "", "HTTP 401\n")
+        with self.assertRaises(SystemExit) as caught:
+            self.launch("linux", "/home/u/.hunch/agent-gh", result=failed)
+        self.assertEqual(caught.exception.code, "pr-status: pr list --json failed: HTTP 401")
 
 
 if __name__ == "__main__":

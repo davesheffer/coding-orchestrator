@@ -34,7 +34,10 @@ the mapping applies if that tier is used for a future role.
 The Claude installer sets `claude-opus-5-5` as the main-session default when no
 model is already selected in user settings; existing explicit choices remain
 untouched. Its named scout, runner, and builder roles use Sonnet, and its critic
-uses Fable. [Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
+uses Fable. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
+follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
+Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
+[Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
 is required for Opus 5.5. These are routing defaults, not a promise of access on every plan.
 Check your model picker and adjust the role definitions for your account.
 
@@ -81,9 +84,30 @@ explicit permission modes, narrow tool allowlists, and no MCP tools. Claude Code
 can still apply a stronger parent permission mode, so use `/tasks` and `/status`
 to confirm the effective model and settings when validating a new machine.
 
+Role permissions are weaker than their names suggest:
+
+- Per the [subagent documentation](https://code.claude.com/docs/en/sub-agents),
+  "When the main conversation is in `bypassPermissions`, `acceptEdits`, or auto
+  mode, the subagent runs in that same mode and Claude Code ignores the
+  `permissionMode` you set." In those modes only each role's `tools:` list
+  constrains it.
+- Scout and critic are read-only by instruction. They keep `Bash`, which is not
+  sandboxed; `permissionMode: plan` blocks edit tools but not every shell command.
+  Builder's ban on commit and push is likewise instruction-only.
+- Runner uses `permissionMode: dontAsk`, which auto-denies any Bash command that
+  would otherwise prompt, except read-only commands and those matching your
+  `permissions.allow` rules. The bundle ships no allow rules, so add rules for your
+  own test and build commands to `~/.claude/settings.json` or the project's
+  settings, for example:
+
+  ```json
+  {"permissions": {"allow": ["Bash(python -m unittest:*)", "Bash(npm test:*)"]}}
+  ```
+
 On Windows, use `python claude/install.py --dry-run` followed by
 `python claude/install.py`. Claude's generated hooks still require a POSIX shell
-and a working `python3` command (for example, through Git Bash); native PowerShell
+(for example, Git Bash). They call `python` on Windows and `python3` elsewhere, and
+the installer warns when that command is not on `PATH`; native PowerShell
 installation alone does not verify those hooks. For a custom destination, set
 `CLAUDE_CONFIG_DIR` to the same directory as `CLAUDE_HOME` when launching Claude.
 
@@ -91,7 +115,9 @@ installation alone does not verify those hooks. For a custom destination, set
 
 The relay (`relay/relay.py`) runs as `UserPromptSubmit` and `Stop` hooks. Once a
 session is non-trivial (`task_shift_min_tokens`, default 30k), each prompt gets a
-context gauge:
+context gauge. A fresh session with no usage yet gets nothing; if a compaction or
+the 8 MiB transcript scan limit hides the last usage, the model is told usage is
+unknown and not to infer a zone:
 
 | Zone | Default threshold | What the model is told |
 |---|---|---|
@@ -104,9 +130,17 @@ verified vs unverified, next step, and optionally the user's next prompt) that
 the model pipes to `relay.py handoff --title "<title>"`. The relay saves it as
 `relay/handoffs/<id>.md` and produces a resume prompt such as
 `relay:1a2b3c4d continue "<title>" from the handoff.` Sending that prompt in a
-fresh session injects the handoff so the new session continues the work.
+fresh session injects the handoff so the new session continues the work. Only a
+prompt that starts with `relay:<id>` resumes; mentioning an id elsewhere does
+not. The handoff is injected inside a `<handoff id="...">` fence, and its NEXT
+PROMPT is presented as the previous session's recorded request. The gauge still
+applies on that turn. Handoff files written by this version are private (mode
+0600 in a 0700 folder; on Windows, an owner-only ACL applied to each new file
+and to a newly created handoffs folder — an existing handoffs folder keeps its
+current ACL) and a new handoff never replaces an existing id.
 Handoffs and per-session state older than `handoff_ttl_hours` (72) are removed
-the next time a handoff is written; resuming a handoff refreshes its age.
+when a handoff is written and, at most once an hour, when a prompt is submitted;
+resuming a handoff refreshes its age.
 
 Rollover has two modes:
 
@@ -114,7 +148,9 @@ Rollover has two modes:
   (`bin/rollover-open.py`) to open a new Claude tab. If the bridge is missing or
   fails, it tries the editor's `vscode://anthropic.claude-code/open` URI with the
   prompt pre-filled (Claude Code's VS Code-family extension on macOS or Windows
-  only). If neither launch is confirmed, it falls back to copy behaviour.
+  only). If neither launch is confirmed, it falls back to copy behaviour. On
+  Windows the editor URI launch cannot be confirmed, so the prompt is copied
+  as well.
 - **`copy`**: no tab or editor launch is attempted. The relay only copies the
   resume prompt to the clipboard and prints it. Start a new Claude session (a
   new tab or `/clear`) and paste it. The clipboard is `pbcopy` on macOS, `clip`
@@ -151,22 +187,28 @@ task changes, gate risky commits, check subagent reports, and grade handoffs.
 The scripts are always installed. Only `--jev` registers the hooks and sets
 `jev.enabled` to `true` in the installed `relay/config.json`. Rerunning
 `./install.sh` without `--jev` removes only the hooks this bundle owns and sets
-`jev.enabled` back to `false`. Your own hooks and other `jev` keys stay. A
+`jev.enabled` back to `false`, printing `jev: disabled (was enabled). Re-run with
+--jev to keep it.` when it was on. Include `--jev` on every upgrade to keep the
+features. Your own hooks and other `jev` keys stay. A
 `TYPESAFE_API_KEY` in the environment alone never turns anything on.
 
 | Feature | Runs in | Question for Jev | What happens | Sent to TypeSafe |
 |---|---|---|---|---|
-| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A confident choice that differs from the current model is applied through `updatedInput.model` | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
+| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A choice that differs from the current model is applied through `updatedInput.model` when confident enough: moving to a stronger tier needs less confidence than moving to a weaker one, and a task escalates when stronger tiers together are likely enough | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
 | `shift` | `UserPromptSubmit` → `relay/relay.py prompt` | Does the new prompt continue the recent prompts / handoff goal? | Below `shift_low`: "TASK SHIFT DETECTED — roll over now". Above `shift_high`: the generic task-shift reminder is dropped | Last 5 prompts (500 chars each), handoff GOAL, new prompt (2,000 chars) |
 | `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds | Operation, changed file names, diff (`send_diff`, `max_diff_chars`) |
-| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A weak hand-back report is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections |
+| `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A hand-back report with missing sections or unsupported EVIDENCE is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections |
 | `handoff_grade` | `relay.py handoff` | How actionable is this handoff for a fresh session (0–4)? Is NEXT STEP concrete? Do VERIFIED claims cite commands? | Below `handoff_min_score`: prints the gaps and **exits 3 without saving**. `--accept-weak` saves anyway | The handoff body (12,000 chars) |
 
-Missing sections count as weak without asking Jev: headers must be uppercase
-with a colon (`RESULT:`, `EVIDENCE:`, `CONFIDENCE:`, `UNVERIFIED:`). A
-self-reported low or medium CONFIDENCE does not deny the hand-back by itself;
-it only adds the foreground "verify or escalate" note. Hand-back denial is for
-missing sections or a report Jev judges weak. Report checks apply to
+Missing sections count as weak without asking Jev: headers must be uppercase,
+followed by a colon or alone on their line (`RESULT:`, `EVIDENCE`,
+`CONFIDENCE:`, `UNVERIFIED:`). A self-reported low or medium CONFIDENCE, or a
+material UNVERIFIED item, does not deny the hand-back by itself: listing gaps
+honestly is what the report should do, and verifying them is the orchestrator's
+job. Both only add the foreground "verify or escalate" note. Hand-back denial is
+for missing sections or EVIDENCE that Jev judges not to support RESULT. When a
+report arrives through `SubagentHandback`, the later `Agent` result is only a
+pointer to it and is not checked again. Report checks apply to
 `report_roles`. The risk gate records a critic run from when the critic was
 launched, so edits made while it was still running need a fresh review; any
 critic run counts, and a deleted file always needs review. For
@@ -213,7 +255,9 @@ installed `relay/config.json`:
 | `endpoint`, `jev_model` | TypeSafe endpoint, `"jev-latest"` | Classifier API and model. The endpoint must be `https`, or `http` only to `localhost`, `127.0.0.1`, or `::1` |
 | `timeout_seconds` | `3` | Classifier deadline, capped at 4 s |
 | `log` | `true` | Append one line per decision to `relay/jev-log.jsonl` |
-| `min_confidence` | `0.5` | route: below this, the call is left unchanged |
+| `upgrade_min_confidence`, `downgrade_min_confidence` | `0.35`, `0.8` | route: confidence needed to move to a stronger or weaker tier than the current one. Moving up is easy because under-routing is the costly error |
+| `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
+| `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
 | `respect_explicit_model` | `false` | route: never override a call that already sets `model` |
 | `pinned_agents` | `["critic", "fork"]` | route: subagent types that are never rerouted |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
@@ -256,7 +300,9 @@ TypeSafe's paid third-party API. Turn off a feature under `jev.features`, or use
 `send_prompt: false` and `send_diff: false` to send less. Only while `shift` is
 on, the relay keeps your last five prompts (500 chars each) and the handoff GOAL
 line in its per-session state file `relay/state/<session>.json` (mode 0600),
-which is removed after `handoff_ttl_hours`.
+which is removed after `handoff_ttl_hours`. Independently of Jev, a handoff
+(including any NEXT PROMPT text) is kept in the private `relay/handoffs/<id>.md`
+for the same period.
 
 ### Codex
 
@@ -308,7 +354,9 @@ inspect and relocate that link before installing a regular copy.
 
 `--jev` installs user-level Codex hooks in `~/.codex/hooks.json` and enables
 `~/.codex/jev/config.json`. The hooks preserve unrelated entries and rerunning
-the installer without `--jev` disables only this bundle's Jev hooks. Codex
+the installer without `--jev` disables only this bundle's Jev hooks and sets
+`jev.enabled` to `false`, printing `jev: disabled (was enabled). Re-run with --jev
+to keep it.` when it was on. Codex
 requires you to review and trust these user hooks through `/hooks` before they
 run; a changed hook definition needs review again. The hooks use Python 3.11+
 and TypeSafe's paid Jev API. Set `TYPESAFE_API_KEY`, set `jev.api_key_file` in
@@ -319,7 +367,10 @@ recent prompts, a Git diff, a subagent report, or a handoff to TypeSafe;
 adjust `jev.features` and the shared privacy settings in the Jev section above.
 
 Codex Jev routes only unnamed/default subagents; named scout, runner, builder,
-and critic roles keep their configured models. It checks risky `git commit` or
+and critic roles keep their configured models. Choosing the weakest model
+(luna) needs `downgrade_min_confidence`, other choices need `min_confidence`,
+and `escalate_mass` moves a task to a stronger model when the stronger models
+are likely enough; an unsure answer leaves the parent's model. It checks risky `git commit` or
 `git push` calls, asks weak subagent reports for one more pass, detects clear
 task shifts, and grades Codex handoffs written through `rollover-open.py`.
 The Git check is advisory and can be overridden by retrying the same command.
@@ -476,7 +527,7 @@ runner. No credentials are included.
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
 | `tests/` | Bundle contracts, both installers, and relay behavior |
-| `.github/workflows/ci.yml` | Python 3.11–3.13 Linux CI plus Windows/macOS 3.12, compilation, shell syntax, and tests |
+| `.github/workflows/ci.yml` | Python 3.11–3.13 Linux and Windows CI plus macOS 3.12, compilation, shell syntax, and tests |
 
 ## Update and verify
 

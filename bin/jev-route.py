@@ -3,8 +3,10 @@
 
 Reads a Claude Code PreToolUse payload on stdin. For Agent/Task calls it asks
 TypeSafe's hosted Jev classifier which tier (sonnet/opus/fable) should run the
-task and, when the answer is confident and different, rewrites the tool
-input's `model`. Configuration lives under the "jev" key of
+task and, when the answer is confident enough and different, rewrites the tool
+input's `model`. Moving to a stronger tier needs less confidence than moving to
+a weaker one, and a task escalates when the stronger tiers together are likely
+enough, because under-routing costs more than over-routing. Configuration lives under the "jev" key of
 `<install>/relay/config.json`; the API key comes from TYPESAFE_API_KEY or
 `jev.api_key_file`.
 
@@ -23,13 +25,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
-    AGENT_MODELS, CONFIG_PATH, DEFAULTS, LOG_PATH, MAX_DEADLINE_SECONDS, MAX_LOG_BYTES, ROOT,
+    AGENT_MODELS, CONFIG_PATH, DEFAULTS, LOG_PATH, MAX_DEADLINE_SECONDS, MAX_LOG_BYTES, ROOT, TIER_RANK,
+    coerce_confidence, stronger_tier,
     api_key, ask, call_with_deadline, effective_timeout, elapsed_ms, endpoint_allowed, http_classify,
     load_config, safe_repr, timestamp, write_log)
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 INSTRUCTIONS = ("Which model tier should run this subagent task? "
-                "Pick the cheapest tier that can do it well.")
+                "Pick the least expensive tier that will reliably do it well; "
+                "when torn between two tiers, pick the stronger one.")
 
 
 def frontmatter_model(path):
@@ -84,41 +88,30 @@ def valid_confidence(confidence):
     return isinstance(confidence, float) and math.isfinite(confidence) and 0.0 <= confidence <= 1.0
 
 
-def coerce_confidence(raw):
-    """The confidence as a float in [0, 1], or None if raw isn't a usable number.
-
-    Rejects bool and str. float() can raise OverflowError on a huge int (e.g. a
-    JSON number with hundreds of digits), which this treats as invalid instead
-    of letting decide()/route() raise.
-    """
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None
-    try:
-        value = float(raw)
-    except (OverflowError, ValueError, TypeError):
-        return None
-    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
-
-
 def sanitize_probabilities(probabilities):
-    """The probabilities dict for logging: dict only, non-finite float values become None."""
+    """The probabilities dict for logging: dict only, values that aren't a probability become None."""
     if not isinstance(probabilities, dict):
         return None
-    return {k: (v if isinstance(v, (int, float)) and math.isfinite(v) else None)
-            for k, v in probabilities.items()}
+    return {k: coerce_confidence(v) for k, v in probabilities.items()}
 
 
-def verdict(choice, confidence, current, cfg):
-    """Why an answer is skipped, or "applied" (shared with bin/eval-jev-routing.py)."""
+def verdict(choice, confidence, current, cfg, probabilities=None):
+    """(why, model, escalated_mass): why an answer is skipped, or "applied" with the
+    model to run (shared with bin/eval-jev-routing.py). escalated_mass is set when
+    the classifier kept the current tier but stronger tiers together are likely enough."""
     if not isinstance(choice, str) or choice not in cfg["labels"]:
-        return "invalid label"
+        return "invalid label", None, None
     if not valid_confidence(confidence):
-        return "invalid confidence"
-    if confidence < float(cfg["min_confidence"]):
-        return "below min_confidence"
-    if choice == model_tier(current, cfg["labels"]):
-        return "same model"
-    return "applied"
+        return "invalid confidence", None, None
+    tier = model_tier(current, cfg["labels"])
+    escalated = escalation(tier, choice, probabilities, cfg)
+    if escalated:
+        return "applied", escalated[0], escalated[1]
+    if choice == tier:
+        return "same model", None, None
+    if confidence < threshold(tier, choice, cfg):
+        return "below confidence threshold", None, None
+    return "applied", choice, None
 
 
 def pinned(tool_input, cfg):
@@ -141,6 +134,25 @@ def build_state(tool_input, cfg):
     if cfg.get("send_prompt", True):
         state["prompt"] = str(tool_input.get("prompt") or "")[:int(cfg["max_prompt_chars"])]
     return state
+
+
+def escalation(current, choice, probabilities, cfg):
+    """(tier, mass) when the classifier keeps the current tier but stronger tiers
+    together carry at least escalate_mass probability; else None."""
+    if current not in TIER_RANK or choice != current:
+        return None
+    ranks = {t: r for t, r in TIER_RANK.items() if t in cfg["labels"]}
+    return stronger_tier(probabilities, ranks, TIER_RANK[current], cfg["escalate_mass"])
+
+
+def threshold(current, choice, cfg):
+    """Upgrades need little confidence, downgrades a lot; unknown direction uses min_confidence."""
+    if current in TIER_RANK and choice in TIER_RANK:
+        if TIER_RANK[choice] > TIER_RANK[current]:
+            return float(cfg["upgrade_min_confidence"])
+        if TIER_RANK[choice] < TIER_RANK[current]:
+            return float(cfg["downgrade_min_confidence"])
+    return float(cfg["min_confidence"])
 
 
 def build_questions(cfg):
@@ -186,16 +198,21 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
             log_fn({**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
     confidence = coerce_confidence(answer.get("confidence"))
-    why = verdict(choice, confidence, current, cfg)
+    why, applied_model, escalated_mass = verdict(choice, confidence, current, cfg, probabilities)
     applied = why == "applied"
     conf_text = f"{confidence:.2f}" if valid_confidence(confidence) else "invalid"
-    # Never write a raw non-string/oversized choice; repr() is ASCII-safe (handles lone surrogates too).
+    # Never write a raw non-string/oversized choice; repr() is UTF-8-safe (handles lone surrogates too).
     display_choice = safe_repr(choice) if why == "invalid label" else choice
-    reason = f"jev: {current or 'inherit'} → {display_choice} (conf {conf_text})"
+    if escalated_mass is not None:
+        reason = f"jev: {current} → {applied_model} (escalated, P(stronger) {escalated_mass:.2f})"
+    else:
+        reason = f"jev: {current or 'inherit'} → {display_choice} (conf {conf_text})"
     if log_fn:
         entry.update({"choice": display_choice, "confidence": confidence,
                       "probabilities": sanitize_probabilities(probabilities),
                       "applied": applied, "reason": reason if applied else f"{reason}; skipped: {why}"})
+        if escalated_mass is not None:
+            entry["escalated_to"] = applied_model
         log_fn(entry)
     if not applied:
         return None
@@ -203,7 +220,7 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
         "permissionDecisionReason": reason,
-        "updatedInput": {**tool_input, "model": choice},
+        "updatedInput": {**tool_input, "model": applied_model},
     }}
 
 

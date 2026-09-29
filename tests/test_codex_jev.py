@@ -78,6 +78,30 @@ class CodexJevTests(unittest.TestCase):
             out = module.route(payload, cfg)
         self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-luna")
 
+    def route_with(self, answer):
+        cfg = module.settings() | {"enabled": True}
+        payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "fix it"}}
+        with patch.object(module.client, "ask", return_value={"model": answer}), \
+             patch.object(module, "log") as log:
+            out = module.route(payload, cfg)
+        self.logged = log.call_args and log.call_args[0][1]
+        return out and out["hookSpecificOutput"]["updatedInput"]["model"]
+
+    def test_route_weakest_model_needs_high_confidence(self):
+        self.assertIsNone(self.route_with({"choice": "luna", "confidence": 0.7}))
+        self.assertEqual(self.route_with({"choice": "sol", "confidence": 0.6}), "gpt-6-sol")
+
+    def test_route_escalates_when_stronger_models_are_likely(self):
+        answer = {"choice": "luna", "confidence": 0.55,
+                  "probabilities": {"luna": 0.55, "sol": 0.35, "astra": 0.1}}
+        self.assertEqual(self.route_with(answer), "gpt-6-sol")
+        self.assertEqual((self.logged["choice"], self.logged["escalated_to"], self.logged["escalated_mass"]),
+                         ("luna", "sol", 0.45))
+        answer = {"choice": "sol", "confidence": 0.8, "probabilities": {"sol": 0.8, "astra": 0.2}}
+        self.assertEqual(self.route_with(answer), "gpt-6-sol")
+        answer = {"choice": "luna", "confidence": 0.9, "probabilities": {"luna": 0.9, "sol": "nan"}}
+        self.assertEqual(self.route_with(answer), "gpt-6-luna")
+
     def test_route_respects_send_prompt_false(self):
         cfg = module.settings() | {"enabled": True, "send_prompt": False}
         payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "PRIVATE-TASK-SENTINEL"}}
@@ -100,12 +124,18 @@ class CodexJevTests(unittest.TestCase):
             return module.route(payload, cfg, classify), logs
 
     def test_route_rejects_invalid_confidence(self):
-        for value in (float("nan"), float("inf"), -1, 2, None):
+        for value in (float("nan"), float("inf"), -1, 2, None, 10 ** 400, True, "0.9"):
             with self.subTest(value=value):
                 out, logs = self.route_default({"model": {"choice": "luna", "confidence": value}})
                 self.assertIsNone(out)
                 self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "invalid confidence"))
                 json.dumps(logs[0], allow_nan=False)
+
+    def test_route_ignores_huge_probabilities(self):
+        answer = {"model": {"choice": "luna", "confidence": 0.9, "probabilities": {"luna": 0.9, "sol": 10 ** 400}}}
+        out, logs = self.route_default(answer)
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-luna")
+        json.dumps(logs[0], allow_nan=False)
 
     def test_route_logs_every_decision_like_jev_route(self):
         out, logs = self.route_default({"model": {"choice": "sol", "confidence": 0.9}})
@@ -117,7 +147,7 @@ class CodexJevTests(unittest.TestCase):
         self.assertNotIn("read a file", json.dumps(entry))
         out, logs = self.route_default({"model": {"choice": "sol", "confidence": 0.2}})
         self.assertIsNone(out)
-        self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "below min_confidence"))
+        self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "below confidence threshold"))
 
     def test_route_rejects_non_string_choice_without_raising(self):
         out, logs = self.route_default({"model": {"choice": ["luna"], "confidence": 0.9}})
@@ -195,6 +225,16 @@ class CodexJevTests(unittest.TestCase):
             self.assertEqual(first["decision"], "block")
             payload["stop_hook_active"] = True
             self.assertIsNone(module.subagent_stop(payload, cfg))
+
+    def test_report_check_does_not_block_on_material_gap(self):
+        cfg = module.settings() | {"enabled": True}
+        payload = {"agent_type": "scout", "session_id": "session", "agent_id": "agent",
+                   "last_assistant_message": "RESULT: done\nEVIDENCE: ran tests, exit 0\n"
+                                             "CONFIDENCE: high\nUNVERIFIED: prod config untested"}
+        response = {"answers": {"supported": {"type": "noul", "noul": 0.95},
+                                "material_gap": {"type": "noul", "noul": 0.95}}}
+        with patch.object(module, "STATE", Path(self.temp.name) / "state"), patch.object(module, "log"):
+            self.assertIsNone(module.subagent_stop(payload, cfg, classify_fn=lambda b, k: response))
 
     def test_shift_context_preserves_latest_user_instruction(self):
         cfg = module.settings() | {"enabled": True}

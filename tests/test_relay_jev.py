@@ -32,6 +32,7 @@ def score_response(score, confidence=0.8, next_step=0.9, verified=0.9):
 class RelayJevTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR"))
+        self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name) / "claude"
         self.root = self.home / "relay"
         self.handoffs = self.root / "handoffs"

@@ -1,7 +1,10 @@
 """Offline regression tests for the local agent launcher; no model/network calls."""
+import contextlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import tomllib
@@ -75,9 +78,68 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(complete)
         self.assertTrue(agent.retryable_model_error(events, 1))
 
+    def test_blank_event_lines_do_not_mark_the_stream_incomplete(self):
+        events, complete = agent.parse_events('{"type":"thread.started"}\n\n  \n{"type":"turn.completed"}\n')
+        self.assertTrue(complete)
+        self.assertEqual([e['type'] for e in events], ['thread.started', 'turn.completed'])
+
+    def test_malformed_mcp_server_config_is_refused(self):
+        for text in ('mcp_servers = "str"\n', '[mcp_servers]\nx = "str"\n', '[mcp_servers]\nx = [1]\n'):
+            with self.subTest(text=text), patch.object(agent, 'config_paths', return_value=[Path('C:/fixture.toml')]), \
+                 patch.object(Path, 'exists', return_value=True), patch.object(Path, 'read_text', return_value=text):
+                with self.assertRaisesRegex(RuntimeError, 'Invalid mcp_servers'):
+                    agent.settings_for(Path('C:/project'), False, False, 'elevated', 'p', 'brief')
+
+    def test_effective_tool_check_refuses_non_object_servers(self):
+        for servers in (['docs'], [None], [[]]):
+            output = subprocess.CompletedProcess([], 0, json.dumps(servers), '')
+            with self.subTest(servers=servers), patch.object(agent.subprocess, 'run', return_value=output):
+                with self.assertRaisesRegex(RuntimeError, 'remains enabled'):
+                    agent.verify_tools('codex', Path.cwd(), {})
+
+    def test_temp_dir_is_resolved_before_overlap_check(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp).resolve()
+            # Only lands inside cwd after .resolve(); a raw string compare would miss it.
+            unresolved = str(cwd / 'nested' / '..' / 'inside')
+            with patch.object(agent.tempfile, 'gettempdir', return_value=unresolved), \
+                 patch.object(agent.subprocess, 'run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'overlaps'):
+                    agent.probe('codex', cwd, {}, 'test-policy', False)
+            run.assert_not_called()
+
+    def test_temp_inside_workspace_is_refused_before_probing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp)
+            with patch.object(agent.tempfile, 'gettempdir', return_value=str(cwd / 'tmp')), \
+                 patch.object(agent.subprocess, 'run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'overlaps'):
+                    agent.probe('codex', cwd, {}, 'test-policy', False)
+            run.assert_not_called()
+            self.assertEqual(list(cwd.iterdir()), [])
+
+    def test_actual_model_reads_newest_state_schema_and_releases_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, model in (('state_5.sqlite', 'old'), ('state_12.sqlite', 'new'), ('state_x.sqlite', 'odd')):
+                with contextlib.closing(sqlite3.connect(root / name)) as db:
+                    db.execute('create table threads (id text, model text, reasoning_effort text)')
+                    db.execute('insert into threads values (?,?,?)', ('t', model, 'low'))
+                    db.commit()
+            os.utime(root / 'state_x.sqlite', (2**31, 2**31))
+            with patch.object(agent, 'ROOT', root):
+                self.assertEqual(agent.actual_model('t'), {'model': 'new', 'effort': 'low'})
+                (root / 'state_12.sqlite').unlink()  # fails on Windows if the connection leaked
+                self.assertEqual(agent.actual_model('t'), {'model': 'old', 'effort': 'low'})
+                self.assertIsNone(agent.actual_model('missing'))
+
+    def test_actual_model_without_state_database_is_unknown(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(agent, 'ROOT', Path(temp)):
+            self.assertIsNone(agent.actual_model('t'))
+
     def test_probe_timeout_becomes_failed_startup_evidence(self):
         with patch.object(Path, 'write_text'), patch.object(Path, 'is_file', return_value=False), \
-             patch.object(agent.tempfile, 'gettempdir', return_value='C:/fake-temp'), \
+             patch.object(agent.tempfile, 'gettempdir', return_value=os.path.abspath(os.sep + 'fake-temp')), \
              patch.object(agent.subprocess, 'run', side_effect=subprocess.TimeoutExpired('codex', 45)):
             evidence = agent.probe('codex', Path.cwd(), {}, 'test-policy', False)
         self.assertEqual(evidence['exit'], 124)
@@ -96,6 +158,13 @@ class RoutingTests(unittest.TestCase):
 
     def test_effective_tool_check_refuses_enabled_mcp(self):
         output = subprocess.CompletedProcess([], 0, json.dumps([{'name': 'extra', 'enabled': True}]), '')
+        with patch.object(agent.subprocess, 'run', return_value=output):
+            with self.assertRaisesRegex(RuntimeError, 'remains enabled'):
+                agent.verify_tools('codex', Path.cwd(), {})
+
+    def test_effective_tool_check_refuses_null_enabled(self):
+        # A missing or null 'enabled' must count as enabled, not silently pass.
+        output = subprocess.CompletedProcess([], 0, json.dumps([{'name': 'extra', 'enabled': None}]), '')
         with patch.object(agent.subprocess, 'run', return_value=output):
             with self.assertRaisesRegex(RuntimeError, 'remains enabled'):
                 agent.verify_tools('codex', Path.cwd(), {})
@@ -220,7 +289,7 @@ class JevAllowlistTests(unittest.TestCase):
         def run(command, **kwargs):
             seen.append(command)
             return subprocess.CompletedProcess(command, 1, '', 'stop')
-        with patch.object(Path, 'write_text'), patch.object(Path, 'is_file', return_value=False),              patch.object(agent.tempfile, 'gettempdir', return_value='C:/fake-temp'),              patch.object(agent.subprocess, 'run', side_effect=run):
+        with patch.object(Path, 'write_text'), patch.object(Path, 'is_file', return_value=False),              patch.object(agent.tempfile, 'gettempdir', return_value=os.path.abspath(os.sep + 'fake-temp')),              patch.object(agent.subprocess, 'run', side_effect=run):
             agent.probe('codex', Path.cwd(), {}, 'test-policy', False, 'api.typesafe.ai')
         command = seen[0]
         python = command.index(agent.sys.executable, command.index('--'))

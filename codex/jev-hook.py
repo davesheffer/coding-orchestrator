@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import math
 import os
 import sys
 import time
@@ -20,6 +19,9 @@ CONFIG = HOME / "jev" / "config.json"
 STATE = HOME / "jev" / "state"
 LOG = HOME / "jev" / "jev-log.jsonl"
 MODELS = {"luna": "gpt-6-luna", "sol": "gpt-6-sol", "astra": "gpt-6-astra"}
+RANK = {"luna": 0, "sol": 1, "astra": 2}
+INSTRUCTIONS = ("Choose the least expensive Codex model that will reliably complete this task well; "
+                "when torn between two models, choose the stronger one.")
 PINNED = {"scout", "runner", "builder", "critic"}
 LABELS = {
     "luna": "Bounded searches, summaries and exact offline checks.",
@@ -68,21 +70,6 @@ def desc_hash(description):
     return hashlib.sha256(description.encode("utf-8", errors="replace")).hexdigest()[:12]
 
 
-def coerce_confidence(raw):
-    """The confidence as a float in [0, 1], or None if raw isn't a usable number.
-
-    Same rule as bin/jev-route.py: rejects bool and str, and treats a huge int
-    (float() raises OverflowError) as invalid instead of letting route() raise.
-    """
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None
-    try:
-        value = float(raw)
-    except (OverflowError, ValueError, TypeError):
-        return None
-    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
-
-
 def route(payload, cfg, classify_fn=None):
     if payload.get("tool_name") not in ("Agent", "Task", "spawn_agent"):
         return None
@@ -101,7 +88,7 @@ def route(payload, cfg, classify_fn=None):
     start = time.monotonic()
     errors = []
     answers = client.ask(cfg, "route", state,
-                         {"model": {"type": "choice", "instructions": "Choose the cheapest Codex model that can complete this task well.",
+                         {"model": {"type": "choice", "instructions": INSTRUCTIONS,
                                     "criteria": cfg["labels"]}}, classify_fn, errors=errors)
     # Same shape as bin/jev-route.py entries so jev-report buckets them by agent.
     entry = {"ts": client.timestamp(), "feature": "route", "subagent_type": role or "default",
@@ -120,22 +107,28 @@ def route(payload, cfg, classify_fn=None):
         # Malformed shape (e.g. answers["model"] is a string), same as client.ask()'s own check.
         log(cfg, {**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
-    confidence = coerce_confidence(answer.get("confidence"))
+    confidence = client.coerce_confidence(answer.get("confidence"))
+    escalated = None
     if not isinstance(choice, str) or choice not in MODELS or choice not in cfg["labels"]:
         why = "invalid label"
     elif confidence is None:
         why = "invalid confidence"
-    elif confidence < float(cfg["min_confidence"]):
-        why = "below min_confidence"
     else:
-        why = "applied"
-    # Never write a raw non-string/oversized choice; repr() is ASCII-safe (handles lone surrogates too).
+        # Without a model the subagent inherits the parent's, so only the weakest
+        # model is a likely downgrade; it needs downgrade_min_confidence.
+        escalated = client.stronger_tier(answer.get("probabilities"), RANK, RANK[choice], cfg["escalate_mass"])
+        floor = cfg["downgrade_min_confidence"] if RANK[choice] == 0 else cfg["min_confidence"]
+        why = "applied" if escalated or confidence >= float(floor) else "below confidence threshold"
+    # Never write a raw non-string/oversized choice; repr() is UTF-8-safe (handles lone surrogates too).
     display_choice = client.safe_repr(choice) if why == "invalid label" else choice
-    log(cfg, {**entry, "choice": display_choice, "confidence": confidence, "applied": why == "applied",
-              "reason": why})
+    record = {**entry, "choice": display_choice, "confidence": confidence, "applied": why == "applied",
+              "reason": why}
+    if escalated:
+        record.update(escalated_to=escalated[0], escalated_mass=round(escalated[1], 4))
+    log(cfg, record)
     if why != "applied":
         return None
-    updated = {**args, "model": MODELS[choice]}
+    updated = {**args, "model": MODELS[escalated[0] if escalated else choice]}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                     "updatedInput": updated}}
 
@@ -180,7 +173,8 @@ def subagent_stop(payload, cfg, classify_fn=None):
             guard.update_state(guard.session_state_path(sid, STATE), complete)
     if not client.feature_enabled(cfg, "report_check") or role not in cfg.get("report_roles", []):
         return None
-    reasons, codes, supported, gap = guard._analyze_report(message, cfg, classify_fn, confidence_heuristic=False)
+    reasons, codes, supported, gap = guard._analyze_report(message, cfg, classify_fn, confidence_heuristic=False,
+                                                            gap_blocks=False)
     log(cfg, {"ts": client.timestamp(), "feature": "report_check", "role": role,
               "weak": bool(reasons), "reasons": codes, "supported": supported, "material_gap": gap})
     if reasons and not payload.get("stop_hook_active"):

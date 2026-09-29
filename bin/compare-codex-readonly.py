@@ -57,10 +57,15 @@ def main(argv=None):
     work = [(task, model) for task in tasks for model in args.models]
     records = []
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = [pool.submit(run_one, args.repo.resolve(), task, model)
-                   for task, model in work]
+        futures = {pool.submit(run_one, args.repo.resolve(), task, model): (task, model)
+                   for task, model in work}
         for future in as_completed(futures):
-            record = future.result()
+            try:
+                record = future.result()
+            except Exception as exc:  # one failed run must not discard the completed ones
+                task, model = futures[future]
+                record = {'task': task.get('id'), 'model': model, 'exit': 1,
+                          'error': f'{type(exc).__name__}: {exc}'}
             records.append(record)
             print(f"{record['task']} {record['model']}: exit={record['exit']} "
                   f"status={record.get('status')} hits={sum(record.get('required_hits', {}).values())}",

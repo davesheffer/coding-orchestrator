@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 __RELAY__ prompt 2>/dev/null || true",
+            "command": "__PYTHON__ __RELAY__ prompt 2>/dev/null || true",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 __RELAY__ stop 2>/dev/null || true",
+            "command": "__PYTHON__ __RELAY__ stop 2>/dev/null || true",
             "timeout": 10
           }
         ]

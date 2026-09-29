@@ -125,6 +125,11 @@ class ReportTests(unittest.TestCase):
             "sonnet": {"total": 1, "weak": 1, "weak_rate": 1.0},
         })
 
+    def test_report_check_tier_join_uses_escalated_tier(self):
+        escalated = {**route("task", "sonnet", 0.6), "escalated_to": "fable"}
+        summary = report.summarize([escalated, check("task", True)])["report_check"]
+        self.assertEqual(list(summary["per_tier"]), ["fable"])
+
     def test_report_check_tier_join_legacy_description(self):
         entries = [
             route("legacy-task", "sonnet", 0.9, legacy=True),
@@ -204,6 +209,26 @@ class EvalTests(unittest.TestCase):
         self.assertEqual((result["applied"], result["applied_correct"], result["applied_accuracy"]), (1, 3, 0.6))
         self.assertEqual([r["effective"] for r in result["results"]], ["opus", "inherit", "sonnet", "fable", "inherit"])
         self.assertIn("applied accuracy: 60.0% (3/5, 1 applied)", evaluator.render(result))
+
+    def test_applied_accuracy_counts_escalation_and_drops_non_dict_probabilities(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / "agents").mkdir()
+            (home / "agents" / "builder.md").write_text("---\nmodel: sonnet\n---\n", encoding="utf-8")
+            tasks = [
+                {"id": "e1", "subagent_type": "builder", "description": "d1", "prompt": "p", "expected": "opus"},
+                {"id": "e2", "subagent_type": "builder", "description": "d2", "prompt": "p", "expected": "sonnet"},
+            ]
+            replies = {
+                "d1": {"model": {"choice": "sonnet", "confidence": 0.55,
+                                 "probabilities": {"sonnet": 0.55, "opus": 0.3, "fable": 0.15}}},
+                "d2": {"model": {"choice": "sonnet", "confidence": 0.9, "probabilities": [float("nan")]}},
+            }
+            result = evaluator.evaluate(tasks, self.cfg, lambda state, q: replies[state["description"]], home=home)
+        self.assertEqual([r["effective"] for r in result["results"]], ["opus", "sonnet"])
+        self.assertEqual([r["applied"] for r in result["results"]], [True, False])
+        self.assertIsNone(result["results"][1]["probabilities"])
+        json.dumps(result, sort_keys=True, allow_nan=False)
 
     def test_nan_confidence_is_dropped_and_json_output_is_strict(self):
         tasks = [{"id": "n1", "subagent_type": "general-purpose", "description": "d1", "prompt": "p",

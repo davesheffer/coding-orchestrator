@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import stat
@@ -435,6 +436,26 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.home.joinpath("AGENTS.md").exists())
         self.assertFalse(self.home.joinpath("hooks.json").exists())
+
+    def test_install_without_jev_disables_it_and_says_so(self):
+        message = "jev: disabled (was enabled). Re-run with --jev to keep it."
+        config = self.home / "jev" / "config.json"
+        on = self.run_install("--jev")
+        self.assertEqual(on.returncode, 0, on.stderr)
+        self.assertNotIn(message, on.stdout)
+        self.assertIs(json.loads(config.read_text(encoding="utf-8"))["jev"]["enabled"], True)
+        dry = self.run_install("--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(message, dry.stdout)
+        self.assertIs(json.loads(config.read_text(encoding="utf-8"))["jev"]["enabled"], True)
+        off = self.run_install()
+        self.assertEqual(off.returncode, 0, off.stderr)
+        self.assertIn(message, off.stdout)
+        self.assertIs(json.loads(config.read_text(encoding="utf-8"))["jev"]["enabled"], False)
+        self.assertEqual(json.loads(self.home.joinpath("hooks.json").read_text(encoding="utf-8"))["hooks"], {})
+        again = self.run_install()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn(message, again.stdout)
 
 
 if __name__ == "__main__":

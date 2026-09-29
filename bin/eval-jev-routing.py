@@ -18,7 +18,6 @@ Exit codes: 0 ok, 1 invalid benchmark or labels, 2 no API key.
 import argparse
 import importlib.util
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -111,20 +110,17 @@ def evaluate(tasks, cfg, classify_fn=None, router=None, home=None):
             if answer.get("choice") in cfg["labels"]:
                 choice = answer["choice"]
                 confidence = router.coerce_confidence(answer.get("confidence"))
-                probabilities = answer.get("probabilities")
-                if isinstance(probabilities, dict):
-                    probabilities = {k: (v if isinstance(v, (int, float)) and math.isfinite(v) else None)
-                                     for k, v in probabilities.items()}
-                else:
-                    probabilities = None  # a non-dict (e.g. a NaN-bearing list) isn't strict-JSON safe
+                # Dict only, probabilities or None: a NaN-bearing list isn't strict-JSON safe.
+                probabilities = router.sanitize_probabilities(answer.get("probabilities"))
         except Exception:
             choice, confidence, probabilities = ERROR, None, None
         predicted = choice if choice in columns else ERROR
         confusion[task["expected"]][predicted] += 1
         # Pinned agents are still classified for raw accuracy, but production never
         # routes them, so they keep their own model.
-        why = "pinned" if router.pinned(task, cfg) else router.verdict(choice, confidence, current, cfg)
-        effective = choice if why in ("applied", "same model") else (
+        why, model, _ = (("pinned", None, None) if router.pinned(task, cfg)
+                         else router.verdict(choice, confidence, current, cfg, probabilities))
+        effective = model if why == "applied" else choice if why == "same model" else (
             router.model_tier(current, cfg["labels"]) or "inherit")
         result = {"id": task["id"], "expected": task["expected"], "got": predicted,
                   "confidence": confidence, "probabilities": probabilities,
