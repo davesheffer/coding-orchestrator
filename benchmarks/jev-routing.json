@@ -102,8 +102,8 @@
     {
       "id": "tricky-scout-debug",
       "subagent_type": "scout",
-      "description": "Why is log empty",
-      "prompt": "Users report relay/jev-log.jsonl stays empty even though routing clearly changes models. Trace the log path from jev-route.py through write_log and the installer's copy step, reproduce with a temp install, and propose the fix with a patch.",
+      "description": "Fix empty jev log",
+      "prompt": "relay/jev-log.jsonl stays empty because write_log resolves its path from the script directory, and the installer copies jev-route.py somewhere else. Make write_log and the installer's copy step agree on the relay/ log location, and add a test that runs a temp install and checks a routed call lands in the log.",
       "expected": "opus"
     },
     {
