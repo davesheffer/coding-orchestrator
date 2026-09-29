@@ -46,15 +46,72 @@ async function waitForNewCodexTab(previous, timeoutMs = 8000) {
   throw new Error('new Codex tab was not observed');
 }
 
+const REQUEST_FILE = /^([0-9a-f]{32})\.json$/;
+const DEAD_REQUEST_MS = 10 * 60 * 1000;  // well past the 300s expiry; safe for any window to delete
+
+// A request from a session inside a VS Code extension host lists that session's ancestor
+// PIDs in `hosts`. Only the bridge running in that same extension host opens it, so the tab
+// lands in the session's own window, not whichever window was active last. The URI still
+// wakes the last active window, which ignores requests aimed elsewhere.
+function targetsThisWindow(request) {
+  return Array.isArray(request.hosts) && request.hosts.includes(process.pid);
+}
+
+function targetsOtherWindow(request) {
+  return Array.isArray(request.hosts) && request.hosts.length > 0 && !targetsThisWindow(request);
+}
+
+function readRequest(root, id) {
+  try { return JSON.parse(fs.readFileSync(path.join(root, 'launches', `${id}.json`), 'utf8')); }
+  catch { return null; }
+}
+
 async function handleUri(uri) {
   if (uri.path !== '/open') return;
   const id = new URLSearchParams(uri.query).get('id');
   if (!/^[0-9a-f]{32}$/.test(id || '')) return;
   const root = handoffHome();
+  await openRequest(root, id, true);
+}
+
+async function scanPending() {
+  const root = handoffHome();
+  const folder = path.join(root, 'launches');
+  let files;
+  try { files = fs.readdirSync(folder); } catch { return; }
+  for (const file of files) {
+    const id = REQUEST_FILE.exec(file)?.[1];
+    if (!id) continue;
+    try {
+      if (Date.now() - fs.statSync(path.join(folder, file)).mtimeMs > DEAD_REQUEST_MS) {
+        // Dead only if the request's own timestamp agrees; a stale mtime alone (clock skew,
+        // restored file) must not drop a live request.
+        const created = Number(readRequest(root, id)?.created_at);
+        if (!Number.isFinite(created) || Date.now() / 1000 - created > DEAD_REQUEST_MS / 1000) {
+          fs.unlinkSync(path.join(folder, file));
+          continue;
+        }
+      }
+    } catch { continue; }
+    const request = readRequest(root, id);
+    if (request && targetsThisWindow(request)) await openRequest(root, id, false);
+  }
+}
+
+async function openRequest(root, id, viaUri) {
+  const launch = path.join(root, 'launches', `${id}.json`);
+  let request;
   try {
-    const launch = path.join(root, 'launches', `${id}.json`);
-    const request = JSON.parse(fs.readFileSync(launch, 'utf8'));
+    request = JSON.parse(fs.readFileSync(launch, 'utf8'));
+    if (viaUri && request && targetsOtherWindow(request)) return;  // checked before claiming
     fs.unlinkSync(launch);  // consume the request so its URI cannot be replayed
+  } catch (error) {
+    // Already claimed through this window's other path, or withdrawn by the helper.
+    if (error.code === 'ENOENT') return;
+    writeAck(root, id, { status: 'error', error: String(error.message || error) });
+    return;
+  }
+  try {
     const isCodex = request.client === 'codex';
     const resolvedHandoff = isCodex && typeof request.handoff === 'string'
       ? realHandoffPath(root, request.handoff) : request.handoff;
@@ -93,8 +150,18 @@ async function handleUri(uri) {
 
 function activate(context) {
   context.subscriptions.push(vscode.window.registerUriHandler({ handleUri }));
+  let scanning = false;
+  const poll = async () => {
+    if (scanning) return;
+    scanning = true;
+    try { await scanPending(); } catch { /* the next tick retries */ } finally { scanning = false; }
+  };
+  const timer = setInterval(poll, 500);
+  timer.unref?.();
+  context.subscriptions.push({ dispose: () => clearInterval(timer) });
+  void poll();
 }
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, handleUri };
+module.exports = { activate, deactivate, handleUri, scanPending };

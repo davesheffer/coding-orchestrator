@@ -12,6 +12,8 @@ import subprocess
 import sys
 import time
 
+CLAIMED_GRACE = 3.0  # extra seconds for an ack once the bridge has claimed the request
+
 
 def home() -> Path:
     return Path(os.environ.get("ORCHESTRATOR_HANDOFF_HOME") or
@@ -49,6 +51,68 @@ def open_uri(uri: str) -> None:
         subprocess.run(command, check=True, capture_output=True)
 
 
+def parent_map() -> dict[int, int]:
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class Entry(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(Entry)]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if snapshot in (None, wintypes.HANDLE(-1).value):
+            raise OSError("process snapshot failed")
+        parents = {}
+        try:
+            entry = Entry()
+            entry.dwSize = ctypes.sizeof(Entry)
+            found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while found:
+                parents[entry.th32ProcessID] = entry.th32ParentProcessID
+                found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return parents
+    output = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="], check=True,
+                            capture_output=True, text=True, timeout=5).stdout
+    return {int(pid): int(ppid) for pid, ppid in (line.split() for line in output.splitlines() if line.strip())}
+
+
+def editor_hosts(limit: int = 32) -> list[int]:
+    """Ancestor PIDs when this runs under a VS Code extension host, so only the bridge in
+    that window (whose process.pid is among them) opens the tab. Empty otherwise, e.g. in
+    a plain terminal, where the last active window handles the request as before. The walk
+    stops at VSCODE_PID (this window's main process) so ancestors above it, which may be
+    shared with other windows, are not listed."""
+    if os.environ.get("VSCODE_CRASH_REPORTER_PROCESS_TYPE") != "extensionHost":
+        return []
+    try:
+        parents = parent_map()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    try:
+        stop = int(os.environ.get("VSCODE_PID", ""))
+    except ValueError:
+        stop = None
+    hosts, pid = [], os.getpid()
+    while pid in parents and pid not in hosts and len(hosts) < limit:
+        hosts.append(pid)
+        if pid == stop:
+            break
+        pid = parents[pid]
+    return [pid for pid in hosts[1:] if pid > 0]
+
+
 def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 12.0) -> str:
     handoff = handoff.expanduser().resolve(strict=True)
     if not handoff.is_file():
@@ -59,31 +123,84 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
         raise ValueError("Claude handoffs require a relay:<id> resume token")
     request_id = secrets.token_hex(16)
     prompt = (f"{resume_token} continue from the saved handoff." if client == "claude"
-              else f"Continue from the attached handoff file {handoff}. Verify the listed state before acting.")
+              else codex_prompt(handoff))
     root = home()
-    write_json(root / "launches" / f"{request_id}.json", {
+    request = root / "launches" / f"{request_id}.json"
+    write_json(request, {
         "client": client, "handoff": str(handoff), "prompt": prompt,
-        "created_at": time.time(),
+        "created_at": time.time(), "hosts": editor_hosts(),
     })
     uri = f"vscode://coding-orchestrator.handoff-bridge/open?id={request_id}"
+    ack = root / "acks" / f"{request_id}.json"
+    launched = True
     try:
         open_uri(uri)
     except (OSError, subprocess.CalledProcessError) as exc:
-        return f"Editor launch failed ({exc}). Open a new {client} tab and send: {prompt}"
-    ack = root / "acks" / f"{request_id}.json"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+        if withdraw(request, CLAIMED_GRACE) is not False:
+            return f"Editor launch failed ({exc}). Open a new {client} tab and send: {prompt}"
+        launched = False  # a bridge scan already claimed it despite the failed launch
+    result = wait_for_ack(ack, timeout if launched else CLAIMED_GRACE)
+    if result is None and launched:
+        # The bridge claims a request by deleting it, so withdrawing it settles the race:
+        # an unclaimed request can no longer open a late second tab beside the fallback.
+        withdrawn = withdraw(request, CLAIMED_GRACE)
+        if withdrawn is None:
+            result = wait_for_ack(ack, 0)
+            if result is None:
+                return (f"Editor launch was not confirmed and the request could not be withdrawn "
+                        f"({request} is locked), so a {client} tab may still open late. "
+                        f"If none appears, open a new {client} tab and send: {prompt}")
+        elif withdrawn:
+            return (f"The VS Code handoff bridge did not pick up the request within {timeout:g}s "
+                    f"(VS Code still starting, or the extension is missing, disabled, or from another "
+                    f"version; if this repeats, reinstall it from vscode/handoff-bridge). "
+                    f"Open a new {client} tab and send: {prompt}")
+        else:
+            result = wait_for_ack(ack, CLAIMED_GRACE)
+    if result is None:
+        return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
+    if result.get("status") == "opened":
+        if client == "codex":
+            return "Codex tab launch acknowledged; handoff and continuation prompt copied. Paste and send it."
+        return "Claude tab launch acknowledged with the continuation prompt pre-filled. Press Enter there."
+    return f"Editor could not open the {client} tab: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
+
+
+def wait_for_ack(path: Path, seconds: float):
+    deadline = time.monotonic() + seconds
+    while True:
         try:
-            result = json.loads(ack.read_text(encoding="utf-8"))
+            result = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            if time.monotonic() >= deadline:
+                return None
             time.sleep(0.1)
             continue
-        if result.get("status") == "opened":
-            if client == "codex":
-                return "Codex tab launch acknowledged; handoff and continuation prompt copied. Paste and send it."
-            return "Claude tab launch acknowledged with the continuation prompt pre-filled. Press Enter there."
-        return f"Editor could not open the {client} tab: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
-    return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return result
+
+
+def withdraw(request: Path, seconds: float):
+    """True if the request was deleted unclaimed, False if the bridge claimed it first,
+    None if it stayed locked (a Windows sharing violation, e.g. a scanner) for `seconds`."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            request.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.1)
+
+
+def codex_prompt(handoff) -> str:
+    return f"Continue from the attached handoff file {handoff}. Verify the listed state before acting."
 
 
 def save_codex(title: str, body: str) -> Path:
@@ -135,7 +252,9 @@ def main(argv=None) -> int:
             check_jev_handoff(body, args.accept_weak)
             path = save_codex(args.title, body)
             print(f"handoff saved: {path}")
-            if not args.no_open:
+            if args.no_open:
+                print(f"Open a new Codex session and send: {codex_prompt(path)}")
+            else:
                 message = launch("codex", path)
                 print(message)
                 return 0 if "tab launch acknowledged" in message else 2

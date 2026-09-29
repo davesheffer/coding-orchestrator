@@ -18,6 +18,9 @@ CONFIG = HOME / "jev" / "config.json"
 STATE = HOME / "jev" / "state"
 LOG = HOME / "jev" / "jev-log.jsonl"
 MODELS = {"luna": "gpt-6-luna", "sol": "gpt-6-sol", "astra": "gpt-6-astra"}
+RANK = {"luna": 0, "sol": 1, "astra": 2}
+INSTRUCTIONS = ("Choose the least expensive Codex model that will reliably complete this task well; "
+                "when torn between two models, choose the stronger one.")
 PINNED = {"scout", "runner", "builder", "critic"}
 
 
@@ -61,7 +64,7 @@ def route(payload, cfg, classify_fn=None):
         description = str(args.get("message") or args.get("prompt") or "")
         state["task"] = description[:cfg["max_prompt_chars"]]
     answers = client.ask(cfg, "route", state,
-                         {"model": {"type": "choice", "instructions": "Choose the cheapest Codex model that can complete this task well.",
+                         {"model": {"type": "choice", "instructions": INSTRUCTIONS,
                                     "criteria": cfg["labels"]}}, classify_fn)
     try:
         answer = answers["model"]
@@ -69,11 +72,21 @@ def route(payload, cfg, classify_fn=None):
         confidence = float(answer["confidence"])
     except (TypeError, KeyError, ValueError):
         return None
-    if choice not in MODELS or confidence < cfg["min_confidence"]:
+    if choice not in MODELS:
         return None
-    updated = {**args, "model": MODELS[choice]}
-    log(cfg, {"ts": client.timestamp(), "feature": "route", "role": role or "default",
-              "choice": choice, "confidence": confidence, "applied": True})
+    # Without a model the subagent inherits the parent's, so only the weakest
+    # model is a likely downgrade; it needs downgrade_min_confidence.
+    escalated = client.stronger_tier(answer.get("probabilities"), RANK, RANK[choice], cfg["escalate_mass"])
+    if not escalated and confidence < (cfg["downgrade_min_confidence"] if RANK[choice] == 0
+                                       else cfg["min_confidence"]):
+        return None
+    applied_model = escalated[0] if escalated else choice
+    updated = {**args, "model": MODELS[applied_model]}
+    entry = {"ts": client.timestamp(), "feature": "route", "role": role or "default",
+             "choice": choice, "confidence": confidence, "applied": True}
+    if escalated:
+        entry.update(escalated_to=applied_model, escalated_mass=round(escalated[1], 4))
+    log(cfg, entry)
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                     "updatedInput": updated}}
 
@@ -118,7 +131,8 @@ def subagent_stop(payload, cfg, classify_fn=None):
             guard.update_state(guard.session_state_path(sid, STATE), complete)
     if not client.feature_enabled(cfg, "report_check") or role not in cfg.get("report_roles", []):
         return None
-    reasons, codes, supported, gap = guard._analyze_report(message, cfg, classify_fn, confidence_heuristic=False)
+    reasons, codes, supported, gap = guard._analyze_report(message, cfg, classify_fn, confidence_heuristic=False,
+                                                            gap_blocks=False)
     log(cfg, {"ts": client.timestamp(), "feature": "report_check", "role": role,
               "weak": bool(reasons), "reasons": codes, "supported": supported, "material_gap": gap})
     if reasons and not payload.get("stop_hook_active"):

@@ -31,8 +31,11 @@ Module._load = originalLoad;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-orchestrator-bridge-test-'));
   process.env.ORCHESTRATOR_HANDOFF_HOME = root;
   try {
-    bridge.activate({ subscriptions: [] });
+    const context = { subscriptions: [] };
+    bridge.activate(context);
     assert.equal(calls[0][0], 'registered');
+    // Stop the background scan; the tests drive scanPending directly.
+    for (const subscription of context.subscriptions) subscription.dispose?.();
     fs.mkdirSync(path.join(root, 'handoffs'));
     const handoff = path.join(root, 'handoffs', 'handoff.md');
     fs.writeFileSync(handoff, 'GOAL: continue\n');
@@ -49,9 +52,10 @@ Module._load = originalLoad;
     assert.equal(fs.existsSync(path.join(root, 'launches', `${id}.json`)), false);
     assert.deepEqual(fs.readdirSync(path.join(root, 'acks')), [`${id}.json`]);
     calls.length = 0;
+    // A replayed or already-claimed request is a no-op and must not overwrite the real ack.
     await bridge.handleUri({ path: '/open', query: `id=${id}` });
     assert.equal(calls.length, 0);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${id}.json`))).status, 'error');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${id}.json`))).status, 'opened');
     const outside = path.join(root, 'outside.md');
     fs.writeFileSync(outside, 'SECRET\n');
     for (const [index, target] of [outside, path.join(root, 'handoffs', '..', 'outside.md'),
@@ -119,6 +123,85 @@ Module._load = originalLoad;
     assert.equal(calls[0][0], 'claude-vscode.primaryEditor.open');
     assert.equal(calls[0][2], 'relay:1234abcd continue');
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${claudeId}.json`))).status, 'opened');
+
+    // A request from a session in another window's extension host is left for that window.
+    const otherPid = process.pid === 1 ? 2 : process.pid - 1;
+    const elsewhereId = 'e'.repeat(32);
+    const elsewhere = path.join(root, 'launches', `${elsewhereId}.json`);
+    fs.writeFileSync(elsewhere, JSON.stringify({
+      client: 'claude', handoff: outside, prompt: 'relay:elsewhere continue',
+      created_at: Date.now() / 1000, hosts: [otherPid],
+    }));
+    calls.length = 0;
+    await bridge.handleUri({ path: '/open', query: `id=${elsewhereId}` });
+    await bridge.scanPending();
+    assert.equal(calls.length, 0);
+    assert.equal(fs.existsSync(elsewhere), true);
+    assert.equal(fs.existsSync(path.join(root, 'acks', `${elsewhereId}.json`)), false);
+    fs.unlinkSync(elsewhere);
+
+    // An untargeted request is opened only through the URL, never by the scan.
+    const untargetedId = 'f'.repeat(32);
+    const untargeted = path.join(root, 'launches', `${untargetedId}.json`);
+    fs.writeFileSync(untargeted, JSON.stringify({
+      client: 'claude', handoff: outside, prompt: 'relay:untargeted continue',
+      created_at: Date.now() / 1000, hosts: [],
+    }));
+    await bridge.scanPending();
+    assert.equal(calls.length, 0);
+    assert.equal(fs.existsSync(untargeted), true);
+    fs.unlinkSync(untargeted);
+
+    // The scan opens a request whose ancestors include this extension host.
+    const hereId = 'd'.repeat(32);
+    fs.writeFileSync(path.join(root, 'launches', `${hereId}.json`), JSON.stringify({
+      client: 'claude', handoff: outside, prompt: 'relay:here continue',
+      created_at: Date.now() / 1000, hosts: [otherPid, process.pid],
+    }));
+    await bridge.scanPending();
+    assert.deepEqual(calls.map(call => [call[0], call[2]]),
+                     [['claude-vscode.primaryEditor.open', 'relay:here continue']]);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${hereId}.json`))).status, 'opened');
+    assert.equal(fs.existsSync(path.join(root, 'launches', `${hereId}.json`)), false);
+
+    // Dead requests are swept without being opened.
+    const deadId = '0'.repeat(32);
+    const dead = path.join(root, 'launches', `${deadId}.json`);
+    fs.writeFileSync(dead, JSON.stringify({
+      client: 'claude', handoff: outside, prompt: 'relay:dead continue',
+      created_at: Date.now() / 1000 - 11 * 60, hosts: [process.pid],
+    }));
+    const old = new Date(Date.now() - 11 * 60 * 1000);
+    fs.utimesSync(dead, old, old);
+    calls.length = 0;
+    await bridge.scanPending();
+    assert.equal(calls.length, 0);
+    assert.equal(fs.existsSync(dead), false);
+
+    // An old mtime with a fresh created_at is not dead and is not swept.
+    const staleId = '9'.repeat(32);
+    const stale = path.join(root, 'launches', `${staleId}.json`);
+    fs.writeFileSync(stale, JSON.stringify({
+      client: 'claude', handoff: outside, prompt: 'relay:stale continue',
+      created_at: Date.now() / 1000, hosts: [otherPid],
+    }));
+    fs.utimesSync(stale, old, old);
+    await bridge.scanPending();
+    assert.equal(calls.length, 0);
+    assert.equal(fs.existsSync(stale), true);
+    fs.unlinkSync(stale);
+
+    // The URL handler opens a request whose ancestors include this extension host.
+    const viaId = '8'.repeat(32);
+    fs.writeFileSync(path.join(root, 'launches', `${viaId}.json`), JSON.stringify({
+      client: 'claude', handoff: outside, prompt: 'relay:via continue',
+      created_at: Date.now() / 1000, hosts: [process.pid],
+    }));
+    await bridge.handleUri({ path: '/open', query: `id=${viaId}` });
+    assert.deepEqual(calls.map(call => [call[0], call[2]]),
+                     [['claude-vscode.primaryEditor.open', 'relay:via continue']]);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${viaId}.json`))).status, 'opened');
+    assert.equal(fs.existsSync(path.join(root, 'launches', `${viaId}.json`)), false);
     console.log('handoff bridge tests passed');
   } finally {
     if (path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep) &&
