@@ -104,22 +104,27 @@ def route(payload, cfg, classify_fn=None):
         answer = answers["model"]
         choice = answer["choice"]
     except (TypeError, KeyError):
-        # Malformed shape (e.g. answers["model"] is a string), same as client.ask()'s own check.
+        choice = None
+    if not isinstance(choice, str):
+        # Malformed shape (answers["model"] not a dict, no string choice), same as client.ask()'s
+        # own check and bin/jev-route.py; an unknown string label is "invalid label" below.
         log(cfg, {**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
     confidence = client.coerce_confidence(answer.get("confidence"))
     escalated = None
-    if not isinstance(choice, str) or choice not in MODELS or choice not in cfg["labels"]:
+    if choice not in MODELS or choice not in cfg["labels"]:
         why = "invalid label"
     elif confidence is None:
         why = "invalid confidence"
     else:
         # Without a model the subagent inherits the parent's, so only the weakest
         # model is a likely downgrade; it needs downgrade_min_confidence.
-        # Escalate only to models the user kept in jev.labels.
+        # Escalate only to models the user kept in jev.labels, and take the weakest from them too
+        # (with a single kept model nothing is a downgrade).
         ranks = {t: r for t, r in RANK.items() if t in cfg["labels"]}
         escalated = client.stronger_tier(answer.get("probabilities"), ranks, RANK[choice], cfg["escalate_mass"])
-        floor = cfg["downgrade_min_confidence"] if RANK[choice] == 0 else cfg["min_confidence"]
+        weakest = len(ranks) > 1 and RANK[choice] == min(ranks.values())
+        floor = cfg["downgrade_min_confidence"] if weakest else cfg["min_confidence"]
         why = "applied" if escalated or confidence >= float(floor) else "below confidence threshold"
     # Never write a raw non-string/oversized choice; repr() is UTF-8-safe (handles lone surrogates too).
     display_choice = client.safe_repr(choice) if why == "invalid label" else choice

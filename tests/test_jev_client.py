@@ -40,6 +40,38 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(cfg["shift_low"], 0.1)
         self.assertFalse(jev_client.feature_enabled(self.config({"enabled": False}), "route"))
 
+    def test_bad_thresholds_fall_back_to_defaults(self):
+        keys = ("min_confidence", "upgrade_min_confidence", "downgrade_min_confidence", "escalate_mass",
+                "shift_low", "shift_high", "risk_min_probability", "report_min_support", "report_max_gap")
+        self.assertEqual(set(keys), set(jev_client.THRESHOLDS))
+        path = self.dir / "config.json"
+        for bad in ("high", True, False, None, [0.5], {"v": 0.5}, 10 ** 400, -0.1, 1.5, "nan", "inf"):
+            with self.subTest(bad=repr(bad)[:20]):
+                cfg = self.config({key: bad for key in keys})
+                for key in keys:
+                    self.assertEqual(cfg[key], jev_client.DEFAULTS[key], key)
+                    self.assertIsInstance(cfg[key], float)
+        for literal in ("NaN", "Infinity", "-Infinity"):  # JSON extensions json.loads accepts
+            path.write_text('{"jev": {"min_confidence": %s, "risk_min_probability": %s}}' % (literal, literal),
+                            encoding="utf-8")
+            cfg = jev_client.load_config(path)
+            self.assertEqual((cfg["min_confidence"], cfg["risk_min_probability"]), (0.5, 0.6))
+        cfg = self.config({"min_confidence": 0, "risk_min_probability": 1, "shift_low": "0.1"})
+        self.assertEqual((cfg["min_confidence"], cfg["risk_min_probability"], cfg["shift_low"]), (0.0, 1.0, 0.1))
+
+    def test_bad_handoff_min_score_and_max_prompt_chars_fall_back_to_defaults(self):
+        for bad in ("high", True, None, [2], 9, -1, 10 ** 400, "nan"):
+            with self.subTest(bad=repr(bad)[:20]):
+                self.assertEqual(self.config({"handoff_min_score": bad})["handoff_min_score"], 2)
+        for good, expected in ((3, 3), ("3", 3), (2.5, 2.5), (0, 0), (4, 4)):
+            self.assertEqual(self.config({"handoff_min_score": good})["handoff_min_score"], expected)
+        for bad in ("6000x", True, None, -1, 12.5, [6000], 10 ** 400, "inf"):
+            with self.subTest(bad=repr(bad)[:20]):
+                self.assertEqual(self.config({"max_prompt_chars": bad})["max_prompt_chars"], 6000)
+        for good, expected in ((100, 100), (100.0, 100), ("250", 250), (0, 0)):
+            value = self.config({"max_prompt_chars": good})["max_prompt_chars"]
+            self.assertEqual((value, type(value)), (expected, int))
+
     def test_ask_sends_body_and_returns_answers(self):
         calls = []
 

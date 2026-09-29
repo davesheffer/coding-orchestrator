@@ -160,12 +160,51 @@ class CodexJevTests(unittest.TestCase):
         self.assertIsNone(out)
         self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "below confidence threshold"))
 
-    def test_route_rejects_non_string_choice_without_raising(self):
-        out, logs = self.route_default({"model": {"choice": ["luna"], "confidence": 0.9}})
+    def test_route_missing_or_non_string_choice_is_malformed_like_jev_route(self):
+        for answer in ({"confidence": 0.9}, {"choice": ["luna"], "confidence": 0.9},
+                       {"choice": None, "confidence": 0.9}):
+            with self.subTest(answer=answer):
+                out, logs = self.route_default({"model": answer})
+                self.assertIsNone(out)
+                self.assertEqual((logs[0]["applied"], logs[0]["reason"], logs[0]["error"]),
+                                 (False, "unavailable", "MalformedResponse"))
+                self.assertNotIn("choice", logs[0])
+                json.dumps(logs[0])
+        # An unknown string label stays "invalid label".
+        out, logs = self.route_default({"model": {"choice": "gpt", "confidence": 0.9}})
         self.assertIsNone(out)
-        self.assertEqual((logs[0]["applied"], logs[0]["reason"]), (False, "invalid label"))
-        self.assertEqual(logs[0]["choice"], repr(["luna"]))
-        json.dumps(logs[0])
+        self.assertEqual((logs[0]["applied"], logs[0]["reason"], logs[0]["choice"]),
+                         (False, "invalid label", repr("gpt")))
+
+    def test_route_weakest_configured_model_needs_high_confidence(self):
+        cfg = module.settings()
+        cfg |= {"enabled": True, "min_confidence": 0.5, "downgrade_min_confidence": 0.8,
+                "labels": {k: v for k, v in cfg["labels"].items() if k != "luna"}}
+        payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "fix it"}}
+        for confidence, expected in ((0.6, None), (0.85, "gpt-6-sol")):
+            with self.subTest(confidence=confidence), \
+                 patch.object(module.client, "ask", return_value={"model": {"choice": "sol", "confidence": confidence}}), \
+                 patch.object(module, "log"):
+                out = module.route(payload, cfg)
+            self.assertEqual(out and out["hookSpecificOutput"]["updatedInput"]["model"], expected)
+        # With a single kept model nothing is a downgrade: min_confidence applies.
+        cfg["labels"] = {"sol": cfg["labels"]["sol"]}
+        with patch.object(module.client, "ask", return_value={"model": {"choice": "sol", "confidence": 0.6}}), \
+             patch.object(module, "log"):
+            out = module.route(payload, cfg)
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+
+    def test_junk_max_prompt_chars_still_routes(self):
+        config = Path(self.temp.name) / "config.json"
+        config.write_text(json.dumps({"jev": {"enabled": True, "max_prompt_chars": "6000x"}}), encoding="utf-8")
+        with patch.object(module, "CONFIG", config):
+            cfg = module.settings()
+        self.assertEqual(cfg["max_prompt_chars"], 6000)
+        payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "fix it"}}
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"}), patch.object(module, "log"):
+            out = module.route(payload, cfg, lambda body, key: {"answers": {"model": {"choice": "sol",
+                                                                                      "confidence": 0.9}}})
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
 
     def test_route_rejects_bool_or_string_confidence(self):
         for value in (True, "0.9"):

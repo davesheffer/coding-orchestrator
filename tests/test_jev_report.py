@@ -104,6 +104,24 @@ class ReportTests(unittest.TestCase):
         self.assertIn("route: 3 total", text)
         self.assertIn("handoff_grade: 2 total", text)
 
+    def test_missing_choice_buckets_the_same_from_both_hooks(self):
+        router = load("jev_route_for_report", ROOT / "bin" / "jev-route.py")
+        codex = load("codex_jev_hook_for_report", ROOT / "codex" / "jev-hook.py")
+        logs = []
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"}):
+            cfg = {**router.load_config(self.dir / "missing.json"), "enabled": True}
+            payload = {"tool_name": "Agent", "tool_input": {"subagent_type": "builder", "prompt": "x"}}
+            router.decide(payload, cfg, lambda body, key: {"answers": {"model": {"confidence": 0.9}}},
+                          logs.append, home=self.dir)
+            payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "x"}}
+            with mock.patch.object(codex, "log", lambda cfg, entry: logs.append(entry)), \
+                 mock.patch.object(codex.client, "ask", return_value={"model": {"confidence": 0.9}}):
+                codex.route(payload, {**cfg, "labels": codex.LABELS})
+        self.assertEqual([(e["reason"], e["error"]) for e in logs], [("unavailable", "MalformedResponse")] * 2)
+        summary = report.summarize_route(logs)
+        self.assertEqual(summary["choices"], {"builder": {"unknown": 1}, "default": {"unknown": 1}})
+        self.assertEqual(summary["applied"], 0)
+
     def test_report_check_tier_join(self):
         entries = [
             check("early", True),                           # before any route -> unknown

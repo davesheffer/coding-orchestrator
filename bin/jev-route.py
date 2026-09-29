@@ -27,10 +27,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
     AGENT_MODELS, CONFIG_PATH, DEFAULTS, LOG_PATH, MAX_DEADLINE_SECONDS, MAX_LOG_BYTES, ROOT, TIER_RANK,
     coerce_confidence, stronger_tier,
-    api_key, ask, call_with_deadline, effective_timeout, elapsed_ms, endpoint_allowed, http_classify,
-    load_config, safe_repr, timestamp, write_log)
+    api_key, ask, call_with_deadline, effective_timeout, elapsed_ms, endpoint_allowed, feature_enabled,
+    http_classify, load_config, safe_repr, timestamp, write_log)
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# Claude Code model aliases that run a known tier (opusplan plans with opus).
+MODEL_ALIASES = {"opusplan": "opus"}
 INSTRUCTIONS = ("Which model tier should run this subagent task? "
                 "Pick the least expensive tier that will reliably do it well; "
                 "when torn between two tiers, pick the stronger one.")
@@ -53,8 +55,9 @@ def frontmatter_model(path):
 
 def current_model(payload, tool_input, home=ROOT):
     """Explicit tool_input model, else the named agent's frontmatter model (project, then user)."""
-    if tool_input.get("model"):
-        return tool_input["model"]
+    model = tool_input.get("model")
+    if isinstance(model, str) and model.strip():
+        return model  # an empty/blank string counts as unset
     name = tool_input.get("subagent_type")
     if not isinstance(name, str) or not AGENT_NAME_RE.match(name) or ".." in name:
         return None
@@ -70,11 +73,13 @@ def current_model(payload, tool_input, home=ROOT):
 
 
 def model_tier(model, tiers):
-    """The tier alias for a model: the alias itself, or the tier from `tiers` named inside
-    a full Claude id (claude-opus-4-1 is opus when "opus" is in tiers); else the model."""
+    """The tier alias for a model: the alias itself (or its MODEL_ALIASES tier), or the tier
+    from `tiers` named inside a full Claude id (claude-opus-4-1 is opus when "opus" is in
+    tiers); else the model."""
     if not isinstance(model, str):
         return model
     lowered = model.strip().lower()
+    lowered = MODEL_ALIASES.get(lowered, lowered)
     if lowered in tiers:
         return lowered
     if "claude" in lowered:
@@ -82,6 +87,21 @@ def model_tier(model, tiers):
             if re.search(rf"(?<![a-z0-9]){re.escape(tier)}(?![a-z0-9])", lowered):
                 return tier
     return model
+
+
+def invalid_model(model):
+    """True for a tool_input model that is set but not a string (list, dict, number, bool)."""
+    return model is not None and not isinstance(model, str)
+
+
+def bounded(value):
+    """value for the log, reason text or classifier state: a short string as is, else safe_repr."""
+    return value if isinstance(value, str) and len(value) <= 80 else safe_repr(value)
+
+
+def display_model(model):
+    """model for the log and reason text, "inherit" when unknown."""
+    return "inherit" if model is None else bounded(model)
 
 
 def valid_confidence(confidence):
@@ -133,7 +153,7 @@ def desc_hash(description):
 
 
 def build_state(tool_input, cfg):
-    state = {"subagent_type": tool_input.get("subagent_type") or "general-purpose",
+    state = {"subagent_type": bounded(tool_input.get("subagent_type") or "general-purpose"),
              "description": tool_input.get("description") or ""}
     if cfg.get("send_prompt", True):
         state["prompt"] = str(tool_input.get("prompt") or "")[:int(cfg["max_prompt_chars"])]
@@ -176,14 +196,22 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         return None
     if pinned(tool_input, cfg):
         return None
-    current = current_model(payload, tool_input, home)
     state = build_state(tool_input, cfg)
+    if invalid_model(tool_input.get("model")):
+        # A malformed explicit model is never rewritten (nor classified); log it bounded.
+        if log_fn and feature_enabled(cfg, "route"):
+            log_fn({"ts": timestamp(), "feature": "route", "subagent_type": state["subagent_type"],
+                    "current": safe_repr(tool_input["model"]), "applied": False,
+                    "reason": "skipped: invalid model"})
+        return None
+    current = current_model(payload, tool_input, home)
+    shown = display_model(current)
     start = time.monotonic()
     errors = []
     answers = ask(cfg, "route", state, build_questions(cfg), classify_fn, errors=errors)
     latency = elapsed_ms(start)
     entry = {"ts": timestamp(), "feature": "route", "subagent_type": state["subagent_type"],
-             "current": current or "inherit", "latency_ms": latency}
+             "current": shown, "latency_ms": latency}
     hashed = desc_hash(state["description"])
     if hashed:
         entry["desc_hash"] = hashed
@@ -194,10 +222,13 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         return None
     try:
         answer = answers["model"]
-        choice = answer.get("choice")
+        choice = answer["choice"]
         probabilities = answer.get("probabilities")
     except Exception:
-        # Malformed shape (e.g. answers["model"] is a string), same as ask()'s own check.
+        choice = None
+    if not isinstance(choice, str):
+        # Malformed shape (answers["model"] not a dict, no string choice), same as ask()'s own
+        # check and codex/jev-hook.py; an unknown string label is "invalid label" below.
         if log_fn:
             log_fn({**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
@@ -208,9 +239,9 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
     # Never write a raw non-string/oversized choice; repr() is UTF-8-safe (handles lone surrogates too).
     display_choice = safe_repr(choice) if why == "invalid label" else choice
     if escalated_mass is not None:
-        reason = f"jev: {current} → {applied_model} (escalated, P(stronger) {escalated_mass:.2f})"
+        reason = f"jev: {shown} → {applied_model} (escalated, P(stronger) {escalated_mass:.2f})"
     else:
-        reason = f"jev: {current or 'inherit'} → {display_choice} (conf {conf_text})"
+        reason = f"jev: {shown} → {display_choice} (conf {conf_text})"
     if log_fn:
         entry.update({"choice": display_choice, "confidence": confidence,
                       "probabilities": sanitize_probabilities(probabilities, cfg["labels"]),
