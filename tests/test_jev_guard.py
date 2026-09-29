@@ -564,7 +564,7 @@ class GateTests(unittest.TestCase):
         targets = jev._scan_targets("git commit -m x;" * 5000 + "git -C other push", "/repo")
         self.assertLess(time.monotonic() - start, 2.0)
         # Every match is resolved: the last push keeps its own directory.
-        self.assertIn(("push", os.path.join("/repo", "other"), False), targets)
+        self.assertIn(("push", os.path.join("/repo", "other"), False, None), targets)
         # Repeated quoted global options once backtracked exponentially (25 s at 26).
         for n in (30, 60):
             for command in ("git " + '-C "a" ' * n + "status; git push --force",
@@ -603,7 +603,7 @@ class GateTests(unittest.TestCase):
         # quoted value must not move the later push to that directory.
         for opt in ('--git-dir "', '--work-tree="', '-c "'):
             command = "git " + opt + '\ncd sub\n" status; git push'
-            self.assertEqual(jev._scan_targets(command, "/repo"), [("push", "/repo", False)], command)
+            self.assertEqual(jev._scan_targets(command, "/repo"), [("push", "/repo", False, None)], command)
 
     def test_arithmetic_shift_is_not_a_heredoc(self):
         command = "echo $((1<<3))\ngit push --force\n3\n"
@@ -645,6 +645,84 @@ class GateTests(unittest.TestCase):
                         "echo $(( ( 1 ))\ncat <<EOF\ndon't\nEOF\ngit push -f 'x'\n"):
             self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")][-1:],
                              ["commit" if "commit" in command else "push"], command)
+
+    def _ops(self, command):
+        return [t[0] for t in jev._scan_targets(command, "/repo")]
+
+    def test_issue_39_detections(self):
+        for command, op in (
+                # A heredoc inside a `$( )` nested in `$(( ))` is still a heredoc.
+                ("x=$(( $(cat <<EOF | wc -c\ndon't\nEOF\n) ))\ngit push -f 'x'\n", "push"),
+                # A case pattern inside that `$( )` doesn't close it early.
+                ("echo $(( $(case x in a) echo 1;; esac) <<3 ))\ngit push\n3\n", "push"),
+                # `((1) …)` is nested subshells: the no-arithmetic reading catches it.
+                ("((1) ; cat <<EOF\n\"\nEOF\ngit push \"x\")\n", "push"),
+                # A backslash-newline splitting an operator.
+                ("cat <\\\n<EOF\n\"\nEOF\ngit push \"x\"\n", "push"),
+                ("cat <<\\\nEOF\n\"\nEOF\ngit push \"x\"\n", "push"),
+                ("cat <\\\n<\\\nEOF\n\"\nEOF\ngit push \"x\"\n", "push"),
+                ("echo $\\\n(( $(cat <<EOF | wc -c\ndon't\nEOF\n) ))\ngit push -f 'x'\n", "push"),
+                ("(\\\n(1<<3))\ngit push\n3\n", "push"),
+                # Quoting and option parsing.
+                ('git -C "a\\" b" push', "push"),
+                ("git --git-dir -x push", "push"),
+                ("GIT.EXE commit -m x", "commit"),
+                ("Git push", "push"),
+                ("/opt/{x}/git push", "push"),
+                ('"/opt/git(1)/bin/git" push', "push"),
+                ("'git' push", "push"),
+                ('"C:\\Program Files\\Git\\cmd\\git.exe" commit -m x', "commit"),
+                ("X=a\\ b git push", "push"),
+                ('git -c "x; git push" commit -m y', "commit")):
+            self.assertEqual(self._ops(command), [op], command)
+        # `X=/usr/bin/git push` runs `push`, not git.
+        for command in ("X=/usr/bin/git push", 'echo "git" push'):
+            self.assertEqual(self._ops(command), [], command)
+
+    def test_issue_39_cwd(self):
+        j = os.path.join
+        for command, cwd in (
+                ('cd -- "dir" && git push', j("/repo", "dir")),
+                ('cd -P "dir" && git push', j("/repo", "dir")),
+                ("(cd build && make) && git push", "/repo"),
+                ("x=$(cd sub && pwd); git push", "/repo"),
+                ("X=`cd sub`; git push", "/repo"),
+                ("(cd sub && git push)", j("/repo", "sub")),
+                ('git -C "\ncd sub\n" status; git push', "/repo"),
+                ('git --foo-C "\ncd sub\n" status; git push', "/repo"),
+                ('git -c x=' + "a" * 600 + ' --foo-c "\ncd sub\n" status; git push', "/repo"),
+                ('git -c x=' + "a" * 600 + ' --foo-C "\ncd sub\n" status; git push', "/repo"),
+                ("git -C $JEV_UNSET_39 push", "/repo"),
+                ('cd "$JEV_UNSET_39" && git push', "/repo"),
+                ("git -C a -C b push", j("/repo", "a", "b"))):
+            targets = jev._scan_targets(command, "/repo")
+            self.assertEqual([t[1] for t in targets], [cwd], command)
+
+    def test_issue_39_git_dir_and_work_tree(self):
+        j = os.path.join
+        for command, target in (
+                ('git --git-dir="other/.git" push', ("push", "/repo", False, j("/repo", "other/.git"))),
+                ("git --git-dir other/.git --work-tree 'o t' push",
+                 ("push", j("/repo", "o t"), False, j("/repo", "other/.git"))),
+                ("git -C sub --git-dir=/opt/x.git commit -m y", ("commit", j("/repo", "sub"), False, "/opt/x.git")),
+                ("git --work-tree w commit -m y", ("commit", "/repo", False, None))):
+            self.assertEqual(jev._scan_targets(command, "/repo"), [target], command)
+        # The diff is taken from the named repository, not the payload cwd's.
+        repo = self.repo.as_posix()
+        self.assert_detected(f'git --git-dir="{repo}/.git" --work-tree="{repo}" commit -m x',
+                             cwd=tempfile.gettempdir())
+
+    def test_issue_39_constructs_scan_fast(self):
+        for command in ("case x in a) " * 5000 + "git push", "esac " * 20000,
+                        "`" * 20001 + "git push", "(" * 10000 + ")" * 10000,
+                        "$(( " + "(" * 10000 + "<<3\n", "<" + "\\\n" * 20000 + "x",
+                        "<<" + "\\\n" * 20000 + "E", 'git -C "' + '\\"' * 20000 + '" push',
+                        "git" + " --git-dir -x" * 5000 + " push", '"git" ;' * 20000,
+                        "x=" + "\\ " * 20000 + " git push", '"' + "'\\\"'" * 5000 + ";cd a" * 2000,
+                        "cd -- " * 5000 + '"d"' * 5000):
+            start = time.monotonic()
+            jev._scan_targets(command, "/repo")
+            self.assertLess(time.monotonic() - start, 2.0, command[:30])
 
     # ---- command forms, multiple ops, push base, redaction ----
 
