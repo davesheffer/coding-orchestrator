@@ -322,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         pr_status = "python " + pr_status
     source_claude = source_claude.replace(
         b"__RELAY__", shlex.quote(str(dest / "relay/relay.py")).encode()
-    ).replace(b"__PR_STATUS__", pr_status.encode())
+    ).replace(b"__PR_STATUS__", pr_status.encode()).replace(b"__PYTHON__", hook_python().encode())
     managed_block(source_claude, root / "CLAUDE.md")
     hook_template = parse_json(root / "hooks.json", (root / "hooks.json").read_bytes())
 
