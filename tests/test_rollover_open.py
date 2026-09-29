@@ -46,15 +46,55 @@ class RolloverOpenTests(unittest.TestCase):
             self.assertIn("acknowledged", result)
             self.assertIn("Paste and send", result)
 
-    def test_no_ack_never_claims_tab_opened(self):
+    def test_unclaimed_request_is_withdrawn_and_blames_the_bridge(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
                 patch.object(rollover, "open_uri"):
             handoff = Path(temp) / "handoff.md"
             handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
             result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertIn("did not pick up the request", result)
+            self.assertIn("vscode/handoff-bridge", result)
+            self.assertIn("relay:1234abcd", result)
+            self.assertNotIn("acknowledged", result)
+            self.assertEqual(list((Path(temp) / "launches").iterdir()), [])
+
+    def test_claimed_request_without_ack_never_claims_tab_opened(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "CLAIMED_GRACE", 0):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+
+            def claim(uri):
+                request_id = uri.split("id=", 1)[1]
+                (Path(temp) / "launches" / f"{request_id}.json").unlink()
+
+            with patch.object(rollover, "open_uri", side_effect=claim):
+                result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
             self.assertIn("not confirmed", result)
             self.assertIn("relay:1234abcd", result)
+
+    def test_ack_after_claim_within_grace_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+            request_ids = []
+
+            def claim(uri):
+                request_ids.append(uri.split("id=", 1)[1])
+                (Path(temp) / "launches" / f"{request_ids[0]}.json").unlink()
+
+            def late_ack(path, seconds):
+                if seconds == rollover.CLAIMED_GRACE:
+                    return {"status": "opened"}
+                return None
+
+            with patch.object(rollover, "open_uri", side_effect=claim), \
+                    patch.object(rollover, "wait_for_ack", side_effect=late_ack):
+                result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertIn("acknowledged", result)
 
     def test_codex_handoff_saves_body(self):
         with tempfile.TemporaryDirectory() as temp, \
