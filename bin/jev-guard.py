@@ -88,9 +88,9 @@ _LONG_VALUE_OPTS = r"(?:--git-dir|--work-tree|--namespace|--super-prefix|--confi
 # space-separated value may not start with `-`, so each token has exactly one way to
 # match; overlapping branches here backtrack exponentially on repeated options.
 GIT_GLOBAL_OPTS = (r"(?:\s+(?:-C\s+" + _OPT_ARG + r"|-c\s+" + _OPT_ARG + r"|"
-                    + _LONG_VALUE_OPTS + r"(?:=\S+|\s+(?!-)" + _OPT_ARG + r")|"
+                    + _LONG_VALUE_OPTS + r"(?:=(?:" + _OPT_ARG + r")?|\s+(?!-)" + _OPT_ARG + r")|"
                     r"--(?!(?:git-dir|work-tree|namespace|super-prefix|config-env)(?![\w-]))"
-                    r"[\w-]+(?:=\S+)?))*")
+                    r"[\w-]+(?:=\S*)?))*")
 # What may start a command: the start, a ; & | ( operator, a newline, a `{` group or
 # a backtick substitution, or a `)` (so `X=$(date) git push`, whose value the env
 # prefix below can't span, is still seen). Only blanks follow it (_LEAD): a newline is a separator in
@@ -139,18 +139,26 @@ PREFIX_WINDOW_CHARS = 256
 # Quoted strings are stripped so words inside them (e.g. `echo "git commit"`) can't be
 # mistaken for a real command, EXCEPT a quoted -C/-c argument (e.g. -C "dir with
 # space") or a `cd "dir"` target, which fix 2 needs intact to resolve the gate's cwd.
-# A quoted string is preserved only when it is the value of a literal `-C`/`-c` that
+# A quoted string is preserved only when it is the value of a literal `-C`/`-c` (or
+# of a value-taking long option such as `--git-dir "x"`, whose dropped value would
+# otherwise let the option swallow the subcommand) that
 # sits in a git global-options segment (i.e. `git`, zero or more already-matched global
 # options, then `-C `/`-c `, right before the quote) — not an arbitrary `-c "..."` in
 # unrelated text (e.g. `echo -c "x; git commit -m y"`).
 _GIT_DASH_C_PREFIX_RE = re.compile(
-    _SEP + _LEAD + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS + r"\s+-[Cc]\s+$")
+    _SEP + _LEAD + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS
+    + r"\s+(?:-[Cc]\s+|" + _LONG_VALUE_OPTS + r"(?:=|\s+))$")
 _CD_PREFIX_RE = re.compile(_SEP + _LEAD + r"cd\s+$")
+# A kept quoted value whose contents are never read back (only -C and cd targets are):
+# it is emitted as `""`, so e.g. a newline-and-`cd` inside `--git-dir "..."` can't be
+# taken for a real cd that moves the gate's cwd.
+_OPAQUE_VALUE_RE = re.compile(r"(?:(?<![\w-])-c\s+|" + _LONG_VALUE_OPTS + r"(?:=|\s+))$")
 # Once the window has been trimmed, the start of a long git segment (e.g. `git -c
 # x=<500 chars> -C "dir" push`) may have fallen out of it; a quote after any `-C `,
 # `-c ` or `cd ` is then kept, since dropping it would turn `-C "dir" push` into
 # `-C  push` and hide the push (a spurious check is the safe side).
-_LOOSE_KEEP_RE = re.compile(r"(?:-[Cc]|(?<![\w-])cd)\s+$")
+_LOOSE_KEEP_RE = re.compile(
+    r"(?:(?:-[Cc]|(?<![\w-])cd)\s+|" + _LONG_VALUE_OPTS + r"(?:=|\s+))$")
 # What separates the segments _cd_dirs looks for `cd <dir>` in.
 _CD_SPLIT_RE = re.compile(r"&&|\|\||;|\n|\(|\{|`")
 # A line that could end a heredoc (`WORD`, or indented for the `<<-` form).
@@ -346,7 +354,7 @@ def _quote_end(text, start):
     return None
 
 
-def _strip_heredocs_and_quotes(command):
+def _strip_heredocs_and_quotes(command, legacy_arith=False):
     """Remove heredoc bodies, comments and quoted strings so text inside them (e.g.
     `echo "git commit"` or a `cat <<EOF ... git commit ... EOF` body) can't be mistaken
     for a real command. `git commit -m "msg"` still matches: only the quoted message is
@@ -361,10 +369,20 @@ def _strip_heredocs_and_quotes(command):
     tail = ""  # last (roughly) PREFIX_WINDOW_CHARS of "".join(out); see its definition
     pending = []  # (word, dash_form) heredoc terminators whose bodies start at the next newline
     trimmed = False
-    # Depth of unclosed `((`/`$((` arithmetic, counted in the scanned command text
-    # itself (not the bounded tail, which a long run of blanks inside `$((` can push
-    # the opener out of).
-    arith = 0
+    # Open bracket frames, tracked in the scanned command text itself (not the bounded
+    # tail, which a long run of blanks inside `$((` can push the opener out of): "A" a
+    # `((`/`$((` arithmetic, "B" a `$[` arithmetic, "K" a `[` subscript inside `$[`,
+    # "P" any other `(` (grouping, subshell, `$(`/`<(` substitution). `<<` is a shift,
+    # not a heredoc, while any arithmetic frame is open (arith_depth); taking a shift
+    # for a heredoc would hide the lines up to a numeric "terminator". Frames close
+    # conservatively: an A frame takes only a `))` with nothing open inside it (never a
+    # lone `)`, e.g. a `case` pattern inside `$( )`), a B frame only a `]` with no
+    # subscript open. Neither reading is safe on its own: taking a heredoc for a shift
+    # scans its body, where a stray quote can pair with a quote on a later line and
+    # hide the command between them. So legacy_arith selects the older reading instead
+    # (only `((`/`))` counted, closed by any `))`), and _scan_targets scans both.
+    frames = []
+    arith_depth = 0
     # word -> ([starts], [ends]) of every terminator-shaped line, and the same for
     # unindented lines only; built on the first heredoc so each body end is a bisect
     # rather than a regex search to the end of the input (quadratic on many
@@ -415,7 +433,7 @@ def _strip_heredocs_and_quotes(command):
                 break
             if (_GIT_DASH_C_PREFIX_RE.search(tail) or _CD_PREFIX_RE.search(tail)
                     or (trimmed and _LOOSE_KEEP_RE.search(tail))):
-                emit(command[i:end])
+                emit('""' if _OPAQUE_VALUE_RE.search(tail) else command[i:end])
             i = end
             continue
         if ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
@@ -426,20 +444,38 @@ def _strip_heredocs_and_quotes(command):
             emit("<<<")  # a here-string, not a heredoc
             i += 3
             continue
-        if command.startswith("((", i):
-            arith += 1
-            emit("((")
+        if command.startswith("((", i) or (not legacy_arith and command.startswith("$[", i)):
+            if not legacy_arith:
+                frames.append("A" if ch == "(" else "B")
+            arith_depth += 1
+            emit(command[i:i + 2])
             i += 2
             continue
-        if arith and command.startswith("))", i):
-            arith -= 1
-            emit("))")
-            i += 2
-            continue
-        # `<<` inside an unclosed `((`/`$((` is a shift (`$((1<<3))`), not a heredoc;
-        # taking it for one would hide the lines up to a numeric "terminator". A stray
-        # unclosed `((` only makes a real heredoc body get scanned (a spurious check).
-        if command.startswith("<<", i) and not arith:
+        top = frames[-1] if frames else ""
+        if legacy_arith:
+            if arith_depth and command.startswith("))", i):
+                arith_depth -= 1
+                emit("))")
+                i += 2
+                continue
+        elif ch == "(":
+            frames.append("P")
+        elif ch == ")":
+            if top == "P":
+                frames.pop()
+            elif top == "A" and command.startswith("))", i):
+                frames.pop()
+                arith_depth -= 1
+                emit("))")
+                i += 2
+                continue
+        elif ch == "[" and top in ("B", "K"):
+            frames.append("K")
+        elif ch == "]" and top in ("B", "K"):
+            frames.pop()
+            if top == "B":
+                arith_depth -= 1
+        if command.startswith("<<", i) and not arith_depth:
             m = HEREDOC_RE.match(command, i)
             if m:
                 word = m.group(2) or m.group(3) or m.group(4)
@@ -658,15 +694,22 @@ def _scan_targets(raw_command, base_cwd):
     """The distinct (op, cwd, all_flag) targets of every git commit/push in the command.
     The cd index and first `git add` are computed once, so a command with thousands of
     git invocations still resolves each one in (near) constant time."""
-    command = _strip_heredocs_and_quotes(raw_command)
-    add = GIT_ADD_RE.search(command)
-    add_end = add.end() if add else None
-    cd_index = _cd_dirs(command)
+    # With arithmetic in the command, a `<<` may be a shift or a heredoc, and a wrong
+    # guess either way can hide a later command; scan both readings and keep the union.
+    # The readings differ only in how they take a `<<`, so without one a single scan
+    # does (and a long quoted command's scan time doesn't double).
+    readings = ((False, True) if "<<" in raw_command
+                and ("((" in raw_command or "$[" in raw_command) else (False,))
     targets = []
-    for match in GIT_COMMAND_RE.finditer(command):
-        target = _git_target(command, match, base_cwd, add_end, cd_index)
-        if target not in targets:
-            targets.append(target)
+    for legacy_arith in readings:
+        command = _strip_heredocs_and_quotes(raw_command, legacy_arith)
+        add = GIT_ADD_RE.search(command)
+        add_end = add.end() if add else None
+        cd_index = _cd_dirs(command)
+        for match in GIT_COMMAND_RE.finditer(command):
+            target = _git_target(command, match, base_cwd, add_end, cd_index)
+            if target not in targets:
+                targets.append(target)
     return targets
 
 

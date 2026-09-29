@@ -587,6 +587,24 @@ class GateTests(unittest.TestCase):
                         'FOO=' + "a" * 600 + ' git -C "sub" push'):
             self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
 
+    def test_quoted_long_option_value_keeps_subcommand(self):
+        # A dropped quoted value let `--git-dir` take the subcommand as its value.
+        for command, op in (('git --git-dir "x" push', "push"),
+                            ('git --git-dir="x" push', "push"),
+                            ("git --work-tree 'w' commit -m x", "commit"),
+                            ('git -c x=' + "a" * 600 + ' --git-dir "d" push', "push"),
+                            ('git --git-dir="C:/My Repos/x/.git" push', "push"),
+                            ("git --work-tree='a b' commit -m x", "commit"),
+                            ('git --exec-path="a b" push', "push")):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], [op], command)
+
+    def test_option_value_with_cd_line_keeps_cwd(self):
+        # Only -C and cd values are read back; a newline-and-cd inside another option's
+        # quoted value must not move the later push to that directory.
+        for opt in ('--git-dir "', '--work-tree="', '-c "'):
+            command = "git " + opt + '\ncd sub\n" status; git push'
+            self.assertEqual(jev._scan_targets(command, "/repo"), [("push", "/repo", False)], command)
+
     def test_arithmetic_shift_is_not_a_heredoc(self):
         command = "echo $((1<<3))\ngit push --force\n3\n"
         self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
@@ -598,9 +616,35 @@ class GateTests(unittest.TestCase):
         # Nested parens inside the arithmetic keep it open until its own `))`.
         command = "echo $(( (1+2) <<3 ))\ngit push\n3\n"
         self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"])
+        # The closers of nested `$(`/`(` inside the arithmetic don't end it early, a
+        # heredoc inside a `$( )` nested in it is still one, and `$[ ]` is arithmetic.
+        for command in ("echo $(( $(echo $(echo 1))<<3 ))\ngit push --force\n3\n",
+                        "echo $(( $( (echo 1))<<3 ))\ngit push --force\n3\n",
+                        "x=$(( $(cat <<EOF | wc -c\n))\nEOF\n) << 3 )); echo x=$x\ngit push\n3\n",
+                        "echo $[1<<3]\ngit push\n3\n"):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"],
+                             command)
+        # A lone `)` (a `case` pattern), a `$$(`/`\$(` and a subscript `]` inside the
+        # arithmetic don't end it early either.
+        for command in ("(( $( case 1 in 1) echo 1;; esac ) <<3 ))\ngit push\n3\n",
+                        "echo $(( $$(1<<3) ))\ngit push\n3\n",
+                        "echo $(( \\$(1<<3) ))\ngit push\n3\n",
+                        "a=(1 2); echo $[ a[1]<<3 ]\ngit push\n3\n"):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"],
+                             command)
         # A real heredoc after a closed arithmetic still hides its body.
         command = "echo $((1<<3)); cat <<EOF\ngit push\nEOF\n"
         self.assertEqual(jev._scan_targets(command, "/repo"), [])
+        # A stray quote in a heredoc body taken for a shift would pair with a quote on
+        # a later line and hide the command between them; the other reading catches it.
+        for command in ("echo $((1<<3)); cat <<EOF\ndon't\nEOF\ngit push -f 'x'\n",
+                        "x=$((1<<3)); cat <<'EOF' > n\nDon't\nEOF\ngit commit -m 'u n'\n",
+                        "n=$((1<<3)); cat <<EOF\nsay \"hi\nEOF\ngit push origin \"main\"\n",
+                        "echo $[1<<3]; cat <<EOF\ndon't\nEOF\ngit push -f 'x'\n",
+                        "((x=1)); cat <<EOF\nit's\nEOF\ngit push -f 'y'\n",
+                        "echo $(( ( 1 ))\ncat <<EOF\ndon't\nEOF\ngit push -f 'x'\n"):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")][-1:],
+                             ["commit" if "commit" in command else "push"], command)
 
     # ---- command forms, multiple ops, push base, redaction ----
 
