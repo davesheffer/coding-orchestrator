@@ -114,10 +114,11 @@ _ENV_PREFIX = (r"(?:(?:then|do|else|time|exec|command|env|nice|sudo)[ \t]+"
 # in any case (`GIT.EXE`). The leading path segment excludes blanks, shell
 # separators/quotes/backtick (rather than `\S*`) so it can never backtrack across a
 # command boundary looking for "git" — the other half of the scanner's quadratic
-# behaviour fixed in _strip_heredocs_and_quotes below — and `=`, so `X=/usr/bin/git
-# push` (which runs `push`) is not taken for git. A quoted path (`"/opt/git(1)/bin/git"`)
-# is reduced to a bare `git` by the stripper instead (see _GIT_WORD_RE).
-_GIT = r"""(?:[^\s;&|(){`'"=]*[/\\])?(?i:git(?:\.exe)?)"""
+# behaviour fixed in _strip_heredocs_and_quotes below. It may hold `=` (`/opt/a=b/git`)
+# but not start with a `NAME=`, so `X=/usr/bin/git push` (which runs `push`) is not
+# taken for git. A quoted path (`"/opt/git(1)/bin/git"`) is reduced to a bare `git` by
+# the stripper instead (see _GIT_WORD_RE).
+_GIT = r"""(?:(?![A-Za-z_]\w*=)[^\s;&|(){`'"]*[/\\])?(?i:git(?:\.exe)?)"""
 GIT_COMMAND_RE = re.compile(
     _SEP + _LEAD + _ENV_PREFIX + _GIT + r"(" + GIT_GLOBAL_OPTS + r")\s+(commit|push)\b")
 GIT_ADD_RE = re.compile(_SEP + _LEAD + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS + r"\s+add\b")
@@ -184,7 +185,12 @@ _GIT_WORD_RE = re.compile(r"(?i)(?:.*[/\\])?git(?:\.exe)?")
 # char. Linear: the alternatives start with different chars, and once a quote fails to
 # close, no later quote of that kind can (the scan pairs escapes the same way from
 # there), so at most one `"` and one `'` rescan to the end.
-_CD_SPLIT_RE = re.compile(r"""\\[\s\S]|"(?:[^"\\]|\\[\s\S])*"|'[^']*'|(&&|\|\||;|\n|\(|\)|\{|`)""")
+# Group 2 is a candidate `case`/`esac` keyword (see _case_step), which splits nothing.
+_CD_SPLIT_RE = re.compile(
+    r"""\\[\s\S]|"(?:[^"\\]|\\[\s\S])*"|'[^']*'|(&&|\|\||;|\n|\(|\)|\{|`)|(case|esac)""")
+# Longest directory _cd_dirs accumulates (`cd a; ` * N would otherwise grow it, and the
+# time and memory to build it, quadratically); see _cd_segment_dir.
+MAX_CD_PATH_CHARS = 4096
 # A backslash-newline inside an operator (`<\` newline `<EOF`, `$\` newline `(`) is
 # removed by bash before the operator is read, so _scan_targets also scans the
 # command with it joined; a `<<`
@@ -399,14 +405,63 @@ def _strip_heredocs_and_quotes(command, legacy_arith=False):
 # Frame kinds (see _strip) inside which a `<<` is a shift, not a heredoc.
 _ARITH_FRAMES = ("A", "B", "K", "G")
 # What may follow an `esac` that closes a case statement.
-_ESAC_END = ("", " ", "\t", "\n", ";", "&", "|", ")")
+_ESAC_END = ("", " ", "\t", "\n", ";", "&", "|", ")", "<", ">")
+# `case WORD in`: a `case` not followed by a word and `in` (`$(echo case x)`) opens no
+# case statement. The word may be quoted, or missing (_strip dropped its quotes), so
+# _strip on the raw command and _cd_dirs on its stripped text agree; it may hold a
+# `$( )` (one nested `( )`), `${ }` or backtick substitution with blanks inside
+# (`case $(uname -s) in`). Linear: the word's alternatives start with different chars
+# (a `$` not opening one of those is its own), it ends at the first blank outside them,
+# and a substitution's scan stops at the next bracket or backtick, so the scans that
+# different `case`s start don't overlap (`case ${` * N).
+# A `$(( ))` arithmetic (one nested `( )`) is its own alternative, and the `$( )` one
+# excludes it, so the two never match the same text (which would backtrack
+# exponentially over a run of them).
+_CASE_RE = re.compile(
+    r"""case[ \t]+(?:(?:[^\s;&|<>'"\\$`]|\$(?![({])|\$\(\((?:[^()]|\([^()]*\))*\)\)"""
+    r"""|\$\((?!\()(?:[^()]|\([^()]*\))*\)|\$\{[^{}]*\}"""
+    r"""|`[^`]*`|\\[\s\S]|"(?:[^"\\]|\\[\s\S])*"|'[^']*')+\s+)?in(?=[\s;]|$)""")
+
+
+def _is_word(text, start, end):
+    """Whether text[start:end] is a whole word (as `\\b…\\b` would match it)."""
+    return ((start == 0 or not (text[start - 1].isalnum() or text[start - 1] == "_"))
+            and (end == len(text) or not (text[end].isalnum() or text[end] == "_")))
+
+
+# Any `case` word, for _scan_targets.
+_CASE_WORD_RE = re.compile(r"\bcase\b")
+# Where a git command's own arguments end (for its -a/--all flag, in _git_target).
+_SEGMENT_END_RE = re.compile(r"[;&|\n]")
+
+
+def _may_keep(tail):
+    """False when none of _GIT_DASH_C_PREFIX_RE, _CD_PREFIX_RE and _LOOSE_KEEP_RE can
+    match `tail`: each needs its last blank-separated word to hold a `-` (`-C`, `-c`,
+    `x--foo-C`, `--git-dir=`, a cd option) or to end in `cd`. A `$`-anchored search
+    tries every start in the tail, which made them most of a quoted argument's cost."""
+    words = tail.rsplit(None, 1)
+    return bool(words) and ("-" in words[-1] or words[-1].endswith("cd"))
+
+
+def _case_step(text, i, open_cases):
+    """+1 when a `case … in` starts at text[i], -1 when an `esac` there closes one of
+    the `open_cases` case statements, else 0. Shared by _strip and _cd_dirs, so both
+    agree on which lone `)` is a case pattern's rather than a subshell's."""
+    if text.startswith("case", i):
+        if (i == 0 or text[i - 1] in " \t\n;&|(){") and _CASE_RE.match(text, i):
+            return 1
+    elif (open_cases and text.startswith("esac", i) and text[i + 4:i + 5] in _ESAC_END
+          and (i == 0 or text[i - 1] in " \t\n;&)")):
+        return -1
+    return 0
 
 
 def _strip(command, mode="default"):
-    """(text, arith_open) for _strip_heredocs_and_quotes: `mode` is "default" (the
+    """(text, frame_open) for _strip_heredocs_and_quotes: `mode` is "default" (the
     frame model below), "legacy" (the older `((`/`))` count) or "none" (a `<<` is never
-    a shift); arith_open says an arithmetic frame of the default reading was still open
-    at the end.
+    a shift); frame_open says a frame of the default reading was still open at the end
+    (an unclosed arithmetic, or a `(` whose `)` was taken for a case pattern's).
 
     A small left-to-right scanner rather than regexes, so a backslash escape outside
     quotes (`don\\'t`) can't open a phantom quote, a `<<` inside quotes or a comment
@@ -487,7 +542,8 @@ def _strip(command, mode="default"):
                 # hiding a later git command.
                 emit(command[i:])
                 break
-            if (_GIT_DASH_C_PREFIX_RE.search(tail) or _CD_PREFIX_RE.search(tail)
+            if _may_keep(tail) and (
+                    _GIT_DASH_C_PREFIX_RE.search(tail) or _CD_PREFIX_RE.search(tail)
                     or (trimmed and _LOOSE_KEEP_RE.search(tail))):
                 emit('""' if _OPAQUE_VALUE_RE.search(tail) else command[i:end])
             elif (_GIT_WORD_RE.fullmatch(command, i + 1, end - 1)
@@ -543,13 +599,8 @@ def _strip(command, mode="default"):
                 width = 2
             elif ch == "(":
                 opened = "S"
-            elif (command.startswith("case", i) and command[i + 4:i + 5] in (" ", "\t")
-                  and (i == 0 or command[i - 1] in " \t\n;&|(){")):
-                cases[-1] += 1
-            elif (cases[-1] and command.startswith("esac", i)
-                  and command[i + 4:i + 5] in _ESAC_END
-                  and (i == 0 or command[i - 1] in " \t\n;")):
-                cases[-1] -= 1
+            elif ch in "ce":
+                cases[-1] += _case_step(command, i, cases[-1])
             if ch == "`" and top != "Q":
                 opened = "Q"
             if opened:
@@ -595,7 +646,7 @@ def _strip(command, mode="default"):
             continue
         emit(ch)
         i += 1
-    return "".join(out), "A" in frames or "B" in frames
+    return "".join(out), bool(frames)
 
 
 def _native_path(path):
@@ -637,13 +688,13 @@ def _scrub(text):
     return SECRET_RE.sub("[redacted]", text)
 
 
-def _run_git(args, cwd, deadline=None, git_dir=None):
+def _run_git(args, cwd, deadline=None, git_opts=None):
     """Run a git subprocess with a per-call timeout bounded by the shared `deadline`
     (a time.monotonic() budget end for the whole gate() invocation); if the budget is
     already exhausted, fail open (return None) rather than block past the hook timeout.
-    `git_dir` is the command's own `--git-dir`, if it gave one."""
-    if git_dir:
-        args = ["--git-dir", git_dir, *args]
+    `git_opts` are the command's own `--git-dir`/`--work-tree` options, if it gave any."""
+    if git_opts:
+        args = [*git_opts, *args]
     timeout = 2.0
     if deadline is not None:
         remaining = deadline - time.monotonic()
@@ -661,50 +712,50 @@ def _run_git(args, cwd, deadline=None, git_dir=None):
     return result.stdout.decode("utf-8", "surrogateescape")
 
 
-def _push_base(cwd, deadline=None, git_dir=None):
+def _push_base(cwd, deadline=None, git_opts=None):
     """The ref a push is compared against: the upstream, else the push remote's
     (remote.pushDefault, or origin) default branch from `refs/remotes/<remote>/HEAD`,
     else origin/main, else origin/master; None when none resolves."""
-    if _run_git(["rev-parse", "--verify", "--quiet", "@{u}"], cwd, deadline, git_dir) is not None:
+    if _run_git(["rev-parse", "--verify", "--quiet", "@{u}"], cwd, deadline, git_opts) is not None:
         return "@{u}"
-    remote = (_run_git(["config", "--get", "remote.pushDefault"], cwd, deadline, git_dir)
+    remote = (_run_git(["config", "--get", "remote.pushDefault"], cwd, deadline, git_opts)
               or "").strip()
     if not remote or remote.startswith("-"):
         remote = "origin"
     head = _run_git(["symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"],
-                    cwd, deadline, git_dir)
+                    cwd, deadline, git_opts)
     if head and head.strip():
         return head.strip()
     for ref in ("origin/main", "origin/master"):
-        if _run_git(["rev-parse", "--verify", "--quiet", ref], cwd, deadline, git_dir) is not None:
+        if _run_git(["rev-parse", "--verify", "--quiet", ref], cwd, deadline, git_opts) is not None:
             return ref
     return None
 
 
-def _diff_range(op, all_flag, cwd, deadline=None, base=None, git_dir=None):
+def _diff_range(op, all_flag, cwd, deadline=None, base=None, git_opts=None):
     if op == "commit":
         args = ["diff", *DIFF_FORMAT_ARGS] + (["HEAD"] if all_flag else ["--cached"])
-        return _run_git(args, cwd, deadline, git_dir)
+        return _run_git(args, cwd, deadline, git_opts)
     if base is None:
         return None
-    return _run_git(["diff", *DIFF_FORMAT_ARGS, f"{base}...HEAD"], cwd, deadline, git_dir)
+    return _run_git(["diff", *DIFF_FORMAT_ARGS, f"{base}...HEAD"], cwd, deadline, git_opts)
 
 
-def _diff_names(op, all_flag, cwd, deadline=None, base=None, git_dir=None):
+def _diff_names(op, all_flag, cwd, deadline=None, base=None, git_opts=None):
     if op == "commit":
         args = (["diff", *DIFF_FORMAT_ARGS, "HEAD", "--name-only", "-z"] if all_flag
                 else ["diff", *DIFF_FORMAT_ARGS, "--cached", "--name-only", "-z"])
-        out = _run_git(args, cwd, deadline, git_dir)
+        out = _run_git(args, cwd, deadline, git_opts)
         return out
     if base is None:
         return None
     return _run_git(["diff", *DIFF_FORMAT_ARGS, f"{base}...HEAD", "--name-only", "-z"], cwd,
-                    deadline, git_dir)
+                    deadline, git_opts)
 
 
-def _untracked_files(cwd, deadline=None, git_dir=None):
+def _untracked_files(cwd, deadline=None, git_opts=None):
     out = _run_git(["ls-files", "--others", "--exclude-standard", "--full-name", "-z"],
-                   cwd, deadline, git_dir)
+                   cwd, deadline, git_opts)
     return [n for n in (out or "").split("\0") if n]
 
 
@@ -725,10 +776,13 @@ def _global_opts(opts_segment):
     (`-C a -C b` is a/b; an absolute one resets). shlex-aware so `-C "dir with space"`
     works; falls back to splitting on blanks on shlex errors (e.g. unbalanced quotes)."""
     try:
-        tokens = shlex.split(opts_segment)
+        # Without quotes or escapes shlex splits on its blanks (` \t\r\n`) too, only far
+        # slower.
+        tokens = (shlex.split(opts_segment) if any(q in opts_segment for q in "'\"\\")
+                  else [t for t in re.split(r"[ \t\r\n]+", opts_segment) if t])
     except ValueError:
         tokens = opts_segment.split()
-    dash_c, values = None, {}
+    dash_c, capped, values = None, False, {}
     i = 0
     while i < len(tokens):
         name, eq, value = tokens[i].partition("=")
@@ -740,7 +794,9 @@ def _global_opts(opts_segment):
         i += 1
         path = _usable_path(value) if name in ("-C", "--git-dir", "--work-tree") else None
         if path and name == "-C":
-            dash_c = os.path.join(dash_c, path) if dash_c else path
+            # Capped like cd (see _join_capped): past it the -Cs are dropped (git runs
+            # in the cwd the cds led to) until an absolute one.
+            dash_c, capped = _join_capped(dash_c, path, capped)
         elif path:
             values[name] = path
     return dash_c, values.get("--git-dir"), values.get("--work-tree")
@@ -752,27 +808,58 @@ def _dash_c_dir(opts_segment):
     return _global_opts(opts_segment)[0]
 
 
-def _cd_dirs(command):
+def _cd_dirs(command, restore=True, case_cds=True):
     """([segment ends], [cd directory in effect after each]) for the command's
     &&/||/;/newline/`(`/`)`/`{`/backtick segments (successive cds accumulate; relative
     results stay relative to the payload cwd; None before any cd). A `(` subshell or a
     backtick substitution gets its own cwd: its closing `)`/backtick restores the one in
-    effect at the opener. Built once per command so resolving each git match is a
+    effect at the opener. A case pattern's `)` splits nothing, so a `pattern) cd dir`
+    segment moves nothing (which branch runs is unknown). The readings _scan_targets
+    adds when there is a `case`: restore=False, where no `)` restores the cwd and every
+    `)` splits (a case pattern's `)` taken for a subshell's, or a branch's cd), and
+    case_cds=False, where a cd inside a case statement (or after any `case` word, up to
+    its `esac`) is ignored. Built once per command so resolving each git match is a
     bisect, not a rescan of its prefix."""
     ends, dirs = [], []
-    result, pos = None, 0
-    saved = []  # (opener, cd result at it) for each open `(` / backtick
+    result, capped, pos = None, False, 0
+    saved = []  # (opener, cd result and capped at it) for each open `(` / backtick
+    # Open `case` statements per frame (cases[0]: no frame), as in _strip: while the
+    # innermost frame has one, a lone `)` ends a pattern, not the subshell.
+    cases = [0]
+    open_cases = 0  # sum(cases)
+    # With case_cds=False, also any `case` word (even one whose word _CASE_RE doesn't
+    # take, `case $(a $(b $(c))) in`, which opens no frame above) up to its `esac` word:
+    # the len(saved) at each, so a lone `)` at that depth is its pattern's (the `)`s of
+    # frames opened after it, like the word's own `$( )`s, still close those frames).
+    loose = []
     for sep in _CD_SPLIT_RE.finditer(command):
         op = sep.group(1)
+        if sep.group(2):
+            step = _case_step(command, sep.start(), cases[-1])
+            cases[-1] += step
+            open_cases += step
+            if not case_cds and _is_word(command, sep.start(), sep.end()):
+                if sep.group(2) == "case":
+                    loose.append(len(saved))
+                elif loose:
+                    loose.pop()
+            continue
         if op is None:
             continue  # an escape or a whole quoted string: not a separator
-        result = _cd_segment_dir(command[pos:sep.start()], result)
-        if op == "(" or (op == "`" and not (saved and saved[-1][0] == "`")):
-            saved.append((op, result))
+        if op == ")" and ((cases[-1] and restore) or (loose and loose[-1] == len(saved))):
+            continue  # a case pattern's `)`
+        if case_cds or not (open_cases or loose):
+            result, capped = _cd_segment_dir(command[pos:sep.start()], result, capped)
+        if (op == "(" and restore) or (op == "`" and not (saved and saved[-1][0] == "`")):
+            saved.append((op, result, capped))
+            cases.append(0)
         elif op in (")", "`") and saved and saved[-1][0] == ("(" if op == ")" else "`"):
             # Restored before it is recorded: a git match starting at this `)` (e.g.
             # `X=$(cd sub) git push`) runs outside the subshell.
-            result = saved.pop()[1]
+            result, capped = saved.pop()[1:]
+            open_cases -= cases.pop()
+            while loose and loose[-1] > len(saved):
+                loose.pop()  # a `case` left open inside the closed frame
         ends.append(sep.start())
         dirs.append(result)
         pos = sep.end()
@@ -789,11 +876,13 @@ def _cd_prefix_dir(command, git_start, cd_index=None):
     return dirs[k] if k >= 0 else None
 
 
-def _cd_segment_dir(segment, result):
-    """`result` joined with the directory of a `cd <dir>` segment, else unchanged."""
+def _cd_segment_dir(segment, result, capped=False):
+    """(dir, capped): `result` joined with the directory of a `cd <dir>` segment, else
+    unchanged; past MAX_CD_PATH_CHARS the cds are dropped (the payload cwd) until an
+    absolute one (see _join_capped)."""
     m = CD_RE.match(segment)
     if not m:
-        return result
+        return result, capped
     try:
         tokens = shlex.split(m.group(1))
     except ValueError:
@@ -801,15 +890,29 @@ def _cd_segment_dir(segment, result):
     # Drop options (-P, --) and redirections (2>/dev/null) around the directory.
     tokens = [t for t in tokens if not t.startswith("-") and not re.match(r"^\d*[<>]", t)]
     if len(tokens) != 1:
-        return result
+        return result, capped
     target = _usable_path(tokens[0])
     if target is None:
-        return result
-    return os.path.join(result, target) if result else target
+        return result, capped
+    return _join_capped(result, target, capped)
+
+
+def _join_capped(result, target, capped):
+    """(dir, capped) for `result` (None: none yet) joined with `target`, shared by cd
+    and -C accumulation. A join longer than MAX_CD_PATH_CHARS makes the directory None
+    (a path that long is unlikely to exist, and git failing there would skip the
+    review), and `capped` then ignores every later relative target too (they would
+    extend the dropped path) until an absolute one starts over."""
+    if capped and not (os.path.isabs(target) or target.startswith(("/", "\\"))):
+        return result, capped
+    joined = os.path.join(result, target) if result else target
+    if len(joined) > MAX_CD_PATH_CHARS:
+        return None, True
+    return joined, False
 
 
 def _git_target(command, match, cwd, add_end=-1, cd_index=None):
-    """(op, cwd, all_flag, git_dir) for one GIT_COMMAND_RE match in the stripped command.
+    """(op, cwd, all_flag, git_opts) for one GIT_COMMAND_RE match in the stripped command.
     `add_end` is where the command's first `git add` match ends (None: there is none;
     -1: search the prefix here); `cd_index` is _cd_dirs(command), if already built."""
     opts_segment, op = match.group(1), match.group(2)
@@ -820,27 +923,34 @@ def _git_target(command, match, cwd, add_end=-1, cd_index=None):
     dash_c_dir, git_dir, work_tree = _global_opts(opts_segment)
     if dash_c_dir:
         cwd = os.path.join(cwd, dash_c_dir)
-    # --git-dir/--work-tree resolve against the cwd git ends up in. The diff runs with
-    # the same --git-dir from the work tree, which git takes as the work tree's top. A
-    # --work-tree alone leaves the repository to discovery from the cwd, so the cwd is
-    # kept (moving it to the work tree could find another repository, or none).
+    # --git-dir/--work-tree resolve against the cwd git ends up in, and the diff runs
+    # with the same options (git_opts). A --work-tree alone leaves the repository to
+    # discovery from the cwd, so the cwd is kept (moving it to the work tree could find
+    # another repository, or none); with a --git-dir too, the diff runs from the work tree.
+    git_opts = ()
     if git_dir:
-        git_dir = os.path.join(cwd, git_dir)
-        if work_tree:
-            cwd = os.path.join(cwd, work_tree)
+        git_opts += ("--git-dir", os.path.join(cwd, git_dir))
+    if work_tree:
+        work_tree = os.path.join(cwd, work_tree)
+        git_opts += ("--work-tree", work_tree)
+        if git_dir:
+            cwd = work_tree
     # `git add … && git commit` stages nothing until it runs, so compare the work tree
     # with HEAD instead of the (still empty) index; likewise for commit -a/--all.
-    segment = re.split(r"[;&|\n]", command[match.end():], maxsplit=1)[0]
+    # Searched from the match rather than split off a copy of the rest of the command,
+    # which was quadratic on many git invocations.
+    seg_end = _SEGMENT_END_RE.search(command, match.end())
+    segment = command[match.end():seg_end.start() if seg_end else len(command)]
     if add_end == -1:
         add = GIT_ADD_RE.search(command[:match.start() + 1])
         add_end = add.end() if add else None
     all_flag = op == "commit" and (bool(ALL_FLAG_RE.search(segment))
                                    or (add_end is not None and add_end <= match.start() + 1))
-    return op, cwd, all_flag, git_dir
+    return op, cwd, all_flag, git_opts or None
 
 
 def _scan_targets(raw_command, base_cwd):
-    """The distinct (op, cwd, all_flag, git_dir) targets of every git commit/push in the
+    """The distinct (op, cwd, all_flag, git_opts) targets of every git commit/push in the
     command. The cd index and first `git add` are computed once, so a command with
     thousands of git invocations still resolves each one in (near) constant time."""
     # The joins are right outside comments, quotes and quoted heredoc bodies only (a
@@ -850,29 +960,38 @@ def _scan_targets(raw_command, base_cwd):
                                    _SPLIT_OPERATOR_RE.sub("", raw_command))
     # With arithmetic in the command, a `<<` may be a shift or a heredoc, and a wrong
     # guess either way can hide a later command; scan both readings and keep the union,
-    # plus the no-shift reading when the default one ends inside arithmetic (see _strip).
+    # plus the no-shift reading when the default one ends inside a frame (see _strip).
     # The readings differ only in how they take a `<<`, so without one a single scan
     # does (and a long quoted command's scan time doesn't double).
     commands = []
     for raw_command in (joined,) if joined == raw_command else (joined, raw_command):
-        command, arith_open = _strip(raw_command)
+        command, frame_open = _strip(raw_command)
         commands.append(command)
         if "<<" in raw_command:
             if "((" in raw_command or "$[" in raw_command:
                 commands.append(_strip(raw_command, "legacy")[0])
-            if arith_open:
+            if frame_open:
                 commands.append(_strip(raw_command, "none")[0])
-    targets = []
+    targets, seen = [], set()
     for k, command in enumerate(commands):
         if command in commands[:k]:
             continue
         add = GIT_ADD_RE.search(command)
         add_end = add.end() if add else None
-        cd_index = _cd_dirs(command)
+        cd_indexes = [_cd_dirs(command)]
+        # A case word _CASE_RE doesn't take (`case $(f $(g $(h))) in`) leaves its
+        # pattern `)` taken for a subshell's, restoring the cwd too early, and a cd in a
+        # case branch may or may not run; so with a `case` in the command, also resolve
+        # each git with no `)` restoring the cwd, and with no cd inside a case counted.
+        if _CASE_WORD_RE.search(command):
+            cd_indexes.append(_cd_dirs(command, restore=False))
+            cd_indexes.append(_cd_dirs(command, case_cds=False))
         for match in GIT_COMMAND_RE.finditer(command):
-            target = _git_target(command, match, base_cwd, add_end, cd_index)
-            if target not in targets:
-                targets.append(target)
+            for cd_index in cd_indexes:
+                target = _git_target(command, match, base_cwd, add_end, cd_index)
+                if target not in seen:
+                    seen.add(target)
+                    targets.append(target)
     return targets
 
 
@@ -912,15 +1031,15 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     names_failed = False
     untracked_overflow = False
     untracked_identity = []
-    for target_op, cwd, all_flag, git_dir in targets:
-        base = _push_base(cwd, deadline, git_dir) if target_op == "push" else None
-        part = _diff_range(target_op, all_flag, cwd, deadline, base, git_dir)
+    for target_op, cwd, all_flag, git_opts in targets:
+        base = _push_base(cwd, deadline, git_opts) if target_op == "push" else None
+        part = _diff_range(target_op, all_flag, cwd, deadline, base, git_opts)
         if part is None:
             continue
-        names_out = _diff_names(target_op, all_flag, cwd, deadline, base, git_dir)
+        names_out = _diff_names(target_op, all_flag, cwd, deadline, base, git_opts)
         names_failed = names_failed or names_out is None
         part_names = [n for n in (names_out or "").split("\0") if n]
-        toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline, git_dir)
+        toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline, git_opts)
         toplevel = toplevel.strip() if toplevel else None
         diff += part
         for name in part_names:
@@ -932,7 +1051,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         if not all_flag:
             continue
         seen = set(part_names)
-        untracked = _untracked_files(cwd, deadline, git_dir)
+        untracked = _untracked_files(cwd, deadline, git_opts)
         untracked_overflow = untracked_overflow or len(untracked) > MAX_UNTRACKED
         for name in untracked[:MAX_UNTRACKED]:
             if name in seen:
