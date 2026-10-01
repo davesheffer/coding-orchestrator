@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const Module = require('node:module');
 const os = require('node:os');
@@ -91,6 +92,134 @@ Module._load = originalLoad;
     } finally {
       fs.rmSync(linkPath, { recursive: true, force: true });
       fs.rmSync(escapeOutsideDir, { recursive: true, force: true });
+    }
+    // realpath cannot see a hard link inside handoffs to a file outside, so a handoff file
+    // with more than one link is refused; the helper always creates a new file.
+    const hardLink = path.join(root, 'handoffs', 'hard-link.md');
+    let linked = false;
+    try { fs.linkSync(outside, hardLink); linked = true; } catch { /* no hard links here */ }
+    if (linked) {
+      try {
+        const hardId = '4'.repeat(32);
+        fs.writeFileSync(path.join(root, 'launches', `${hardId}.json`), JSON.stringify({
+          client: 'codex', handoff: hardLink, prompt: 'Continue', created_at: Date.now() / 1000,
+        }));
+        calls.length = 0;
+        await bridge.handleUri({ path: '/open', query: `id=${hardId}` });
+        assert.equal(calls.length, 0);
+        const hardAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${hardId}.json`)));
+        assert.equal(hardAck.status, 'error');
+        assert.match(hardAck.error, /invalid or expired/);
+      } finally {
+        fs.rmSync(hardLink, { force: true });
+      }
+    }
+    // A file swapped in between validation and open is refused: the handle must be the
+    // same device and inode that the validated path names.
+    const originalOpen = fs.openSync;
+    fs.openSync = (file, ...rest) =>
+      originalOpen(path.basename(String(file)) === 'handoff.md' ? outside : file, ...rest);
+    try {
+      const swapId = '5'.repeat(32);
+      fs.writeFileSync(path.join(root, 'launches', `${swapId}.json`), JSON.stringify({
+        client: 'codex', handoff, prompt: 'Continue', created_at: Date.now() / 1000,
+      }));
+      calls.length = 0;
+      await bridge.handleUri({ path: '/open', query: `id=${swapId}` });
+      assert.equal(calls.length, 0);
+      const swapAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${swapId}.json`)));
+      assert.equal(swapAck.status, 'error');
+      assert.match(swapAck.error, /invalid or expired/);
+    } finally {
+      fs.openSync = originalOpen;
+    }
+    // A final-component symlink inside handoffs to a file outside is refused.
+    const fileLink = path.join(root, 'handoffs', 'file-link.md');
+    let symlinked = false;
+    try { fs.symlinkSync(outside, fileLink, 'file'); symlinked = true; } catch (error) {
+      if (!['EPERM', 'EACCES'].includes(error.code)) throw error;  // no symlink privilege
+    }
+    if (symlinked) {
+      try {
+        const fileLinkId = 'ab'.repeat(16);
+        fs.writeFileSync(path.join(root, 'launches', `${fileLinkId}.json`), JSON.stringify({
+          client: 'codex', handoff: fileLink, prompt: 'Continue', created_at: Date.now() / 1000,
+        }));
+        calls.length = 0;
+        await bridge.handleUri({ path: '/open', query: `id=${fileLinkId}` });
+        assert.equal(calls.length, 0);
+        const fileLinkAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${fileLinkId}.json`)));
+        assert.equal(fileLinkAck.status, 'error');
+        assert.match(fileLinkAck.error, /invalid or expired/);
+      } finally {
+        fs.unlinkSync(fileLink);
+      }
+    }
+    // The handoffs folder swapped for a link between validation and open is refused while
+    // the swap is still in place: the path now resolves outside the validated folder.
+    const handoffsDir = path.join(root, 'handoffs');
+    const movedDir = path.join(root, 'handoffs-moved');
+    const decoyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-orchestrator-bridge-outside-'));
+    fs.writeFileSync(path.join(decoyDir, 'handoff.md'), 'SECRET\n');
+    let swapped = false;
+    fs.openSync = (file, ...rest) => {
+      if (!swapped && path.basename(String(file)) === 'handoff.md') {
+        fs.renameSync(handoffsDir, movedDir);
+        swapped = true;
+        fs.symlinkSync(decoyDir, handoffsDir, process.platform === 'win32' ? 'junction' : 'dir');
+      }
+      return originalOpen(file, ...rest);
+    };
+    try {
+      const dirSwapId = 'cd'.repeat(16);
+      fs.writeFileSync(path.join(root, 'launches', `${dirSwapId}.json`), JSON.stringify({
+        client: 'codex', handoff, prompt: 'Continue', created_at: Date.now() / 1000,
+      }));
+      calls.length = 0;
+      await bridge.handleUri({ path: '/open', query: `id=${dirSwapId}` });
+      assert.equal(swapped, true);
+      assert.equal(calls.length, 0);
+      const dirSwapAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${dirSwapId}.json`)));
+      assert.equal(dirSwapAck.status, 'error');
+      assert.match(dirSwapAck.error, /invalid or expired/);
+    } finally {
+      fs.openSync = originalOpen;
+      if (swapped) {
+        try { fs.unlinkSync(handoffsDir); } catch { /* the link was never created */ }
+        fs.renameSync(movedDir, handoffsDir);
+      }
+      fs.rmSync(decoyDir, { recursive: true, force: true });
+    }
+    if (process.platform === 'win32') {
+      // A home given by its 8.3 short name (C:\Users\DAVIDS~1) must accept both the long
+      // handoff path the helper saves (Python's resolve() expands it) and the short one.
+      let shortRoot = root;
+      try {
+        shortRoot = execFileSync('cmd.exe', ['/d', '/s', '/c', `"for %I in ("${root}") do @echo %~sI"`],
+                                 { windowsVerbatimArguments: true, encoding: 'utf8' }).trim();
+      } catch { /* treated as no short name */ }
+      if (!shortRoot || shortRoot.toLowerCase() === root.toLowerCase()) {
+        console.log(`skipped 8.3 short-name test: no short name for ${root}`);
+      } else {
+        const savedEnv = process.env.ORCHESTRATOR_HANDOFF_HOME;
+        process.env.ORCHESTRATOR_HANDOFF_HOME = shortRoot;
+        try {
+          for (const [shortId, target] of [['6'.repeat(32), handoff],
+                                           ['7'.repeat(32), path.join(shortRoot, 'handoffs', 'handoff.md')]]) {
+            fs.writeFileSync(path.join(root, 'launches', `${shortId}.json`), JSON.stringify({
+              client: 'codex', handoff: target, prompt: 'Continue via short home', created_at: Date.now() / 1000,
+            }));
+            calls.length = 0;
+            await bridge.handleUri({ path: '/open', query: `id=${shortId}` });
+            assert.deepEqual(calls.map(call => call[0]), ['chatgpt.newCodexPanel', 'clipboard']);
+            assert.match(calls[1][1], /GOAL: continue/);
+            const shortAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${shortId}.json`)));
+            assert.equal(shortAck.status, 'opened');
+          }
+        } finally {
+          process.env.ORCHESTRATOR_HANDOFF_HOME = savedEnv;
+        }
+      }
     }
     if (process.platform === 'win32' && /^[a-zA-Z]:/.test(root)) {
       // A junction/symlink escape must be blocked, but a legit launch whose
