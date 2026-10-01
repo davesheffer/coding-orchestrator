@@ -173,6 +173,38 @@ class ClientTests(unittest.TestCase):
         self.assertEqual([jev_client.probability(v) for v in (0, 1, 0.25)], [0.0, 1.0, 0.25])
         self.assertIs(jev_client.coerce_confidence, jev_client.probability)
 
+    def test_ask_past_deadline_skips_classifier(self):
+        cfg = self.config({})
+        calls, errors = [], []
+
+        def fn(body, key):
+            calls.append(body)
+            return {"answers": {}}
+        self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, fn, errors=errors,
+                                         deadline=time.monotonic() - 0.01))
+        self.assertEqual((calls, errors), ([], ["TimeoutError"]))
+
+    def test_ask_timeout_is_capped_by_deadline(self):
+        cfg = self.config({"timeout_seconds": 3})
+        ok = lambda body, key: {"answers": {}}  # noqa: E731
+        with mock.patch.object(jev_client, "call_with_deadline", return_value={"answers": {}}) as call, \
+                mock.patch.object(jev_client.time, "monotonic", return_value=100.0):
+            self.assertEqual(jev_client.ask(cfg, "shift", {}, {}, ok, deadline=101.5), {})
+            self.assertEqual(jev_client.ask(cfg, "shift", {}, {}, ok, deadline=110.0), {})
+            self.assertEqual(jev_client.ask(cfg, "shift", {}, {}, ok), {})
+        self.assertEqual([c.args[2] for c in call.call_args_list], [1.5, 3.0, 3.0])
+
+    def test_ask_http_timeout_follows_deadline(self):
+        cfg = self.config({"timeout_seconds": 3})
+        seen = []
+
+        def fake_http(body, run_cfg, key):
+            seen.append(jev_client.effective_timeout(run_cfg))
+            return {"answers": {}}
+        with mock.patch.object(jev_client, "http_classify", fake_http):
+            self.assertEqual(jev_client.ask(cfg, "shift", {}, {}, deadline=time.monotonic() + 1.0), {})
+        self.assertTrue(0.0 < seen[0] <= 1.0, seen)
+
     def test_http_classify_disables_redirects(self):
         cfg = self.config({})
         response = mock.MagicMock()

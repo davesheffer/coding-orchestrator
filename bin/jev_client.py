@@ -250,7 +250,7 @@ def http_classify(body, cfg, key):
         return json.loads(response.read().decode("utf-8"))
 
 
-def ask(cfg, feature, state, questions, classify_fn=None, errors=None):
+def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=None):
     """Return the Jev `answers` dict, or None (disabled, no key, error, timeout).
 
     classify_fn(body, key) returns the parsed response; it defaults to the HTTP
@@ -258,6 +258,10 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None):
     failed call appends a short reason (the exception class name, "NoApiKey" or
     "MalformedResponse") so callers can log it; never the body or the key.
     Disabled features and disallowed endpoints append nothing.
+
+    `deadline` (a time.monotonic() value) is the caller's overall budget: the call
+    gets min(effective_timeout(cfg), what remains), and none at all once it has
+    passed (records "TimeoutError" without calling the classifier).
     """
     if not feature_enabled(cfg, feature) or not endpoint_allowed(cfg.get("endpoint")):
         return None
@@ -266,10 +270,21 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None):
         if errors is not None:
             errors.append("NoApiKey")
         return None
-    fn = classify_fn or (lambda body, k: http_classify(body, cfg, k))
+    timeout = effective_timeout(cfg)
+    run_cfg = cfg
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if errors is not None:
+                errors.append("TimeoutError")
+            return None
+        timeout = min(timeout, remaining)
+        # http_classify reads its socket timeout from the config.
+        run_cfg = dict(cfg, timeout_seconds=timeout)
+    fn = classify_fn or (lambda body, k: http_classify(body, run_cfg, k))
     body = {"state": state, "model": cfg["jev_model"], "questions": questions}
     try:
-        answers = call_with_deadline(fn, (body, key), effective_timeout(cfg))["answers"]
+        answers = call_with_deadline(fn, (body, key), timeout)["answers"]
     except Exception as exc:
         if errors is not None:
             errors.append(type(exc).__name__)

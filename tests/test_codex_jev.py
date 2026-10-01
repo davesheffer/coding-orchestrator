@@ -294,6 +294,31 @@ class CodexJevTests(unittest.TestCase):
             out = module.shift({"session_id": "s", "prompt": "plan a holiday"}, cfg)
         self.assertIn("user's latest instruction", out["hookSpecificOutput"]["additionalContext"])
 
+    def test_busy_state_lock_does_not_skip_later_work(self):
+        # A state lock still held at the hook's deadline must not skip the report
+        # check (critic stop) or drop the new-task context (shift).
+        guard = module.guard_module()
+        calls = []
+
+        def busy(path, mutate_fn, deadline=None):
+            calls.append(deadline)
+            raise BlockingIOError(11, "lock busy")
+
+        guard.update_state = busy
+        cfg = module.settings() | {"enabled": True, "report_roles": ["critic"]}
+        payload = {"agent_type": "critic", "session_id": "session", "agent_id": "agent",
+                   "last_assistant_message": "RESULT: done"}
+        with patch.object(module, "guard_module", return_value=guard), \
+             patch.object(module, "STATE", Path(self.temp.name) / "state"), patch.object(module, "log"), \
+             patch.object(module.client, "ask", return_value={"continues": {"noul": 0.1}}):
+            self.assertEqual(module.subagent_stop(payload, cfg)["decision"], "block")
+            module.shift({"session_id": "s", "prompt": "build a widget"}, cfg)
+            guard.load_session_state = lambda sid, state: {"recent_prompts": ["build a widget"]}
+            out = module.shift({"session_id": "s", "prompt": "plan a holiday"}, cfg)
+        self.assertIn("user's latest instruction", out["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(isinstance(d, float) for d in calls), calls)
+
     def test_handoff_grade_is_optional_and_blocks_weak_handoff(self):
         cfg = module.settings() | {"enabled": True}
         with patch.object(module.client, "ask", return_value={"actionable": {"score": 1}}), \

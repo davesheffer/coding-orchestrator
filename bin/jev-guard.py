@@ -32,14 +32,19 @@ hook invocations don't clobber each other's keys.
 
 Fail-open: any missing key, disabled config, error or timeout leaves the
 call unchanged. All Jev calls run under a hard wall-clock deadline of
-min(timeout_seconds, 4) seconds. All git subprocesses in one `gate()` call
-share a single wall-clock budget (GIT_SUBPROCESS_BUDGET_SECONDS); once it is
-spent, remaining git calls fail open, so the script always finishes inside
-the gate hook's 10 s timeout even in the worst case (4 s of git plus a 4 s
-classify_fn call).
+min(timeout_seconds, 4) seconds. Each hook invocation also shares one
+monotonic deadline (GATE_BUDGET_SECONDS for `gate`, SHORT_HOOK_BUDGET_SECONDS
+for `handback`/`agent-done`) across its git subprocesses, classifier call and
+state-lock wait: all git subprocesses in one `gate()` call share at most
+GIT_SUBPROCESS_BUDGET_SECONDS of it, the classifier gets only what remains,
+and `update_state` stops waiting for the lock at the deadline. Git or
+classifier work still pending when it passes fails open, and a lock wait that
+runs out only skips that state update, so the script finishes inside the hook
+timeouts in claude/install.py (10 s for gate, 5 s for the others).
 Nothing here logs diff text, file names, commands, or report text.
 """
 import bisect
+import errno
 import fnmatch
 import hashlib
 import json
@@ -60,16 +65,26 @@ try:
     import msvcrt
 except ImportError:
     msvcrt = None
+# Each hook invocation's shared monotonic deadline (git, classifier and state-lock
+# wait together). Below the 10 s (gate) and 5 s (handback, agent-done) hook timeouts
+# in claude/install.py, leaving margin for interpreter start-up.
+GATE_BUDGET_SECONDS = 8.0
+SHORT_HOOK_BUDGET_SECONDS = 4.0
 # How long update_state waits for the Windows lock before giving up (the hook fails
-# open), and how often a Windows tmp.replace is retried while another process has the
-# state file open.
+# open; never past the hook's deadline), and how often a Windows tmp.replace is
+# retried while another process has the state file open.
 MSVCRT_LOCK_SECONDS = 2.0
+# The errnos a non-blocking lock attempt raises when another process holds the lock;
+# any other OSError is re-raised at once instead of being retried until the deadline.
+FLOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES}
+MSVCRT_BUSY_ERRNOS = {errno.EACCES, getattr(errno, "EDEADLOCK", errno.EACCES)}
 REPLACE_ATTEMPTS = 5
 REPLACE_RETRY_SECONDS = 0.05
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
-    ROOT, ask, elapsed_ms, feature_enabled, load_config, noul, timestamp, write_log)
+    ROOT, ask, coerce_confidence, elapsed_ms, feature_enabled, load_config, noul, timestamp,
+    write_log)
 
 STATE_DIR = ROOT / "relay" / "state"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -273,22 +288,42 @@ def _replace(tmp, path):
             time.sleep(REPLACE_RETRY_SECONDS)
 
 
-def _msvcrt_lock(lock_file):
-    """Lock the first byte of `lock_file` (Windows), retrying for MSVCRT_LOCK_SECONDS;
-    raises OSError if another process still holds it."""
+def _msvcrt_lock(lock_file, deadline=None):
+    """Lock the first byte of `lock_file` (Windows), retrying for MSVCRT_LOCK_SECONDS
+    or until `deadline` (a time.monotonic() value), whichever comes first, after at
+    least one attempt; raises OSError if another process still holds it."""
     lock_file.seek(0)
-    deadline = time.monotonic() + MSVCRT_LOCK_SECONDS
+    wait_until = time.monotonic() + MSVCRT_LOCK_SECONDS
+    if deadline is not None:
+        wait_until = min(wait_until, deadline)
     while True:
         try:
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
             return
-        except OSError:
-            if time.monotonic() >= deadline:
+        except OSError as exc:
+            if exc.errno not in MSVCRT_BUSY_ERRNOS or time.monotonic() >= wait_until:
                 raise
             time.sleep(0.01)
 
 
-def update_state(path, mutate_fn):
+def _flock_until(lock_file, deadline):
+    """fcntl.flock `lock_file` exclusively, retrying non-blocking attempts for
+    MSVCRT_LOCK_SECONDS or until `deadline` (a time.monotonic() value), whichever
+    comes first, after at least one attempt, so a held lock leaves later work in the
+    hook the same budget as on Windows; raises OSError (BlockingIOError) if another
+    process still holds it."""
+    wait_until = min(time.monotonic() + MSVCRT_LOCK_SECONDS, deadline)
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in FLOCK_BUSY_ERRNOS or time.monotonic() >= wait_until:
+                raise
+            time.sleep(0.01)
+
+
+def update_state(path, mutate_fn, deadline=None):
     """Read-modify-write `path`'s JSON state under an exclusive lock on `<path>.lock`.
 
     `mutate_fn(state)` mutates a freshly reloaded on-disk state dict in place (or
@@ -296,6 +331,10 @@ def update_state(path, mutate_fn):
     if this invocation's load was stale. The lock is `fcntl.flock`, or `msvcrt.locking`
     on Windows. If neither is available, the update runs without a lock: still
     correct for a single process, best-effort under real concurrency.
+
+    With a `deadline` (the hook's time.monotonic() deadline) the lock wait stops
+    there and raises OSError; without one, flock blocks and msvcrt waits
+    MSVCRT_LOCK_SECONDS.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,11 +344,14 @@ def update_state(path, mutate_fn):
     try:
         if fcntl is not None:
             lock_file = open(lock_path, "a+")
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            else:
+                _flock_until(lock_file, deadline)
             locked = True
         elif msvcrt is not None:
             lock_file = open(lock_path, "a+")
-            _msvcrt_lock(lock_file)
+            _msvcrt_lock(lock_file, deadline)
             locked = True
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
@@ -713,18 +755,25 @@ def _scan_targets(raw_command, base_cwd):
     return targets
 
 
-def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR):
+def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR,
+         deadline=None):
     """Return the PreToolUse hook output dict, or None to leave the command unchanged.
 
     Every git commit/push in the command is gated together: with a push anywhere the
     operation is a push, and the diff sent is each commit's pending diff followed by
     each push's unpushed range.
 
-    All git subprocess calls in one invocation share a wall-clock budget
-    (GIT_SUBPROCESS_BUDGET_SECONDS) instead of each getting its own 2 s, so a worst
-    case of several calls plus the classify_fn deadline can't exceed the hook timeout;
-    once the budget is spent, remaining git calls fail open (return None/allow).
+    The whole invocation runs under one monotonic `deadline` (by default
+    GATE_BUDGET_SECONDS from entry). All git subprocess calls share at most
+    GIT_SUBPROCESS_BUDGET_SECONDS of it instead of each getting its own 2 s; once that
+    is spent, remaining git calls fail open (return None/allow). The classifier gets
+    only what remains, and the denied-hash update stops waiting for its lock at the
+    deadline (the command is still denied), so the invocation stays inside the hook
+    timeout (each stage is bounded; it can overshoot the deadline only slightly).
     """
+    entered = time.monotonic()
+    if deadline is None:
+        deadline = entered + GATE_BUDGET_SECONDS
     if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
         return None
     if not feature_enabled(cfg, "risk_gate"):
@@ -741,7 +790,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     # Commits run before the push that follows them, so their diffs come first.
     targets.sort(key=lambda t: t[0] == "push")
 
-    deadline = time.monotonic() + GIT_SUBPROCESS_BUDGET_SECONDS
+    git_deadline = min(entered + GIT_SUBPROCESS_BUDGET_SECONDS, deadline)
     max_diff_chars = int(cfg.get("max_diff_chars") or 0)
     diff = ""
     names = []
@@ -750,14 +799,14 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     untracked_overflow = False
     untracked_identity = []
     for target_op, cwd, all_flag in targets:
-        base = _push_base(cwd, deadline) if target_op == "push" else None
-        part = _diff_range(target_op, all_flag, cwd, deadline, base)
+        base = _push_base(cwd, git_deadline) if target_op == "push" else None
+        part = _diff_range(target_op, all_flag, cwd, git_deadline, base)
         if part is None:
             continue
-        names_out = _diff_names(target_op, all_flag, cwd, deadline, base)
+        names_out = _diff_names(target_op, all_flag, cwd, git_deadline, base)
         names_failed = names_failed or names_out is None
         part_names = [n for n in (names_out or "").split("\0") if n]
-        toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline)
+        toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, git_deadline)
         toplevel = toplevel.strip() if toplevel else None
         diff += part
         for name in part_names:
@@ -769,7 +818,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         if not all_flag:
             continue
         seen = set(part_names)
-        untracked = _untracked_files(cwd, deadline)
+        untracked = _untracked_files(cwd, git_deadline)
         untracked_overflow = untracked_overflow or len(untracked) > MAX_UNTRACKED
         for name in untracked[:MAX_UNTRACKED]:
             if name in seen:
@@ -848,7 +897,8 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         "needs_review": {"type": "noul", "instructions": NEEDS_REVIEW_INSTRUCTIONS},
     }
     errs = []
-    answers = ask(cfg, "risk_gate", ask_state, questions, classify_fn, errors=errs)
+    answers = ask(cfg, "risk_gate", ask_state, questions, classify_fn, errors=errs,
+                  deadline=deadline)
     if answers is None:
         if errs:
             log("allow", reason="unavailable", error=errs[0])
@@ -862,13 +912,10 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     if not isinstance(choice, str):
         log("allow")
         return None
-    # Confidence is only logged, so a missing, null or non-finite one doesn't skip the gate.
-    try:
-        confidence = float(answers["risk"].get("confidence"))
-    except Exception:
-        confidence = None
-    if confidence is not None and not 0.0 <= confidence <= 1.0:
-        confidence = None
+    # Confidence is only logged, so an invalid one (missing, null, str, bool, out of
+    # range) is logged as None, as in jev-route, and doesn't skip the gate.
+    risk = answers["risk"]
+    confidence = coerce_confidence(risk.get("confidence") if isinstance(risk, dict) else None)
     needs_review_p = noul(answers, "needs_review")
 
     risky = (choice != "none" and needs_review_p is not None
@@ -882,7 +929,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
 
     extra = {}
     try:
-        update_state(session_state_path(session_id, state_dir), add_denied)
+        update_state(session_state_path(session_id, state_dir), add_denied, deadline)
     except Exception as exc:
         # Still deny: without the saved hash, the identical retry is simply checked again.
         extra["state_error"] = type(exc).__name__
@@ -938,7 +985,7 @@ def _parse_sections(text):
 
 
 def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_blocks=True,
-                    errors=None):
+                    errors=None, deadline=None):
     """Parse RESULT/EVIDENCE/CONFIDENCE/UNVERIFIED sections and ask Jev whether the
     report is weak. Returns (reasons, reason_codes, supported, material_gap).
 
@@ -953,7 +1000,8 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_
     Sections are parsed from the FULL text (a long report's RESULT/EVIDENCE/CONFIDENCE/
     UNVERIFIED block may come after `max_report_chars` of findings), so truncation is
     only applied to what's actually sent to the classifier below, after common token
-    shapes are scrubbed. `errors` is passed to `ask` (a failed call appends its reason)."""
+    shapes are scrubbed. `errors` is passed to `ask` (a failed call appends its reason),
+    and so is `deadline`, the hook's shared time.monotonic() deadline."""
     max_chars = cfg["max_report_chars"]
 
     sections = _parse_sections(text)
@@ -982,7 +1030,8 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_
             "supported": {"type": "noul", "instructions": SUPPORTED_INSTRUCTIONS},
             "material_gap": {"type": "noul", "instructions": MATERIAL_GAP_INSTRUCTIONS},
         }
-        answers = ask(cfg, "report_check", ask_state, questions, classify_fn, errors=errors)
+        answers = ask(cfg, "report_check", ask_state, questions, classify_fn, errors=errors,
+                      deadline=deadline)
         if answers is not None:
             supported = noul(answers, "supported")
             material_gap = noul(answers, "material_gap")
@@ -1004,8 +1053,13 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_
     return reasons, reason_codes, supported, material_gap
 
 
-def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
-    """Return the PreToolUse hook output dict for a SubagentHandback call, or None."""
+def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR, deadline=None):
+    """Return the PreToolUse hook output dict for a SubagentHandback call, or None.
+
+    The classifier call and state-lock wait share one monotonic `deadline` (by default
+    SHORT_HOOK_BUDGET_SECONDS from entry)."""
+    if deadline is None:
+        deadline = time.monotonic() + SHORT_HOOK_BUDGET_SECONDS
     if not isinstance(payload, dict):
         return None
     if not feature_enabled(cfg, "report_check"):
@@ -1023,7 +1077,8 @@ def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
     start = time.monotonic()
     errs = []
     reasons, reason_codes, supported, material_gap = _analyze_report(
-        message, cfg, classify_fn, confidence_heuristic=False, gap_blocks=False, errors=errs)
+        message, cfg, classify_fn, confidence_heuristic=False, gap_blocks=False, errors=errs,
+        deadline=deadline)
 
     def log(decision):
         if not log_fn:
@@ -1051,7 +1106,7 @@ def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
         s["handback_denied"] = ((s.get("handback_denied") or []) + [key])[-50:]
 
     try:
-        update_state(session_state_path(session_id, state_dir), add_handback_denied)
+        update_state(session_state_path(session_id, state_dir), add_handback_denied, deadline)
     except Exception:
         pass  # still deny; without the saved key the identical resend is checked again
     log("deny")
@@ -1074,7 +1129,8 @@ def _prune_critic_started(started, now_value):
             if isinstance(ts, (int, float)) and now_value - ts < 86400}
 
 
-def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR):
+def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR,
+               deadline=None):
     """Return the PostToolUse hook output dict, or None.
 
     critic_ts is stamped from when the critic *started* (its Agent/Task launch), not
@@ -1082,7 +1138,12 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     seen by it, so they must still need a fresh review once it comes back. `critic_started` (a per-agent-id map of launch
     timestamps under session state) bridges the async-launch PostToolUse event to the
     later SubagentHandback or completed-foreground-result event.
+
+    State-lock waits and the classifier call share one monotonic `deadline` (by default
+    SHORT_HOOK_BUDGET_SECONDS from entry).
     """
+    if deadline is None:
+        deadline = time.monotonic() + SHORT_HOOK_BUDGET_SECONDS
     if not isinstance(payload, dict):
         return None
     tool_name = payload.get("tool_name")
@@ -1109,7 +1170,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                 s["critic_started"] = started
 
             try:
-                update_state(session_state_path(session_id, state_dir), set_critic_ts)
+                update_state(session_state_path(session_id, state_dir), set_critic_ts, deadline)
             except Exception:
                 pass  # persisting critic timestamps is best effort
         return None
@@ -1136,7 +1197,8 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                     s["critic_started"] = started
 
                 try:
-                    update_state(session_state_path(session_id, state_dir), add_critic_started)
+                    update_state(session_state_path(session_id, state_dir), add_critic_started,
+                                 deadline)
                 except Exception:
                     pass  # persisting critic timestamps is best effort
             return None
@@ -1171,7 +1233,8 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
             s["critic_started"] = started
 
         try:
-            update_state(session_state_path(session_id, state_dir), set_critic_ts_completed)
+            update_state(session_state_path(session_id, state_dir), set_critic_ts_completed,
+                         deadline)
         except Exception:
             pass  # persisting critic timestamps is best effort
 
@@ -1189,7 +1252,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     start = time.monotonic()
     errs = []
     reasons, reason_codes, supported, material_gap = _analyze_report(
-        text, cfg, classify_fn, errors=errs)
+        text, cfg, classify_fn, errors=errs, deadline=deadline)
 
     if log_fn:
         entry = {"ts": timestamp(), "feature": "report_check", "event": "agent_done",
