@@ -30,6 +30,9 @@ LOG_PATH = ROOT / "relay" / "jev-log.jsonl"
 AGENT_MODELS = ("sonnet", "opus", "haiku", "fable")
 TIER_RANK = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3}
 ROUTE_NUMBERS = ("min_confidence", "upgrade_min_confidence", "downgrade_min_confidence", "escalate_mass")
+# Every probability/confidence threshold in DEFAULTS: each must be a number in [0, 1].
+THRESHOLDS = ROUTE_NUMBERS + ("shift_low", "shift_high", "risk_min_probability",
+                              "report_min_support", "report_max_gap")
 FEATURES = ("route", "shift", "risk_gate", "report_check", "handoff_grade")
 MAX_DEADLINE_SECONDS = 4.0
 MAX_LOG_BYTES = 1 << 20
@@ -109,15 +112,32 @@ def load_config(path=CONFIG_PATH):
     cfg["features"] = features
     if not isinstance(cfg.get("pinned_agents"), list):
         cfg["pinned_agents"] = []
-    for key in ROUTE_NUMBERS:
-        try:
-            cfg[key] = float(cfg[key])
-        except (TypeError, ValueError):
-            cfg[key] = DEFAULTS[key]
-        if isinstance(user.get(key), bool) or not math.isfinite(cfg[key]):
-            cfg[key] = DEFAULTS[key]
-        cfg[key] = min(1.0, max(0.0, cfg[key]))
+    # A bad number falls back to its default, so it can't make every hook raise (and fail open
+    # silently) later.
+    for key in THRESHOLDS:
+        value = config_number(cfg[key], 0.0, 1.0)
+        cfg[key] = float(DEFAULTS[key]) if value is None else value
+    score = config_number(cfg["handoff_min_score"], 0.0, 4.0)
+    cfg["handoff_min_score"] = (DEFAULTS["handoff_min_score"] if score is None
+                                else int(score) if score.is_integer() else score)
+    chars = config_number(cfg["max_prompt_chars"], 0.0, math.inf)
+    cfg["max_prompt_chars"] = (int(chars) if chars is not None and chars.is_integer()
+                               else DEFAULTS["max_prompt_chars"])
     return cfg
+
+
+def config_number(value, low, high):
+    """value as a finite float in [low, high] (numeric strings too), else None.
+
+    Rejects bool, NaN/inf and a huge int (float() raises OverflowError).
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and low <= number <= high else None
 
 
 def probability(value):
