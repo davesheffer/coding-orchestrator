@@ -1739,6 +1739,10 @@ def _cd_target(segment):
     m = CD_RE.match(segment)
     if not m:
         return None
+    argument = m.group(1).strip()
+    # Plain path tokens have no shell quoting, options or redirections to parse.
+    if re.fullmatch(r"[A-Za-z0-9_./~:][A-Za-z0-9_./~:-]*", argument):
+        return _usable_path(argument)
     try:
         tokens = shlex.split(m.group(1))
     except ValueError:

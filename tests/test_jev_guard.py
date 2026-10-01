@@ -1321,6 +1321,19 @@ class GateTests(unittest.TestCase):
                                 + "git push", "case with many ||")):
             self._assert_fast(lambda: jev._scan_targets(command, "/repo"), label)
 
+    def test_plain_cd_targets_skip_shell_tokenization(self):
+        for path in ("q", "sub", "../repo-name", "/tmp/repo", "C:/repo", "~/repo"):
+            with self.subTest(path=path), mock.patch.object(jev.shlex, "split") as split:
+                self.assertEqual(jev._cd_target("cd " + path), jev._usable_path(path))
+                split.assert_not_called()
+        for argument in ('"repo name"', "'repo'", "-- repo", "-P repo", "repo 2>/dev/null",
+                         "repo\\ name", "$HOME/repo", "repo#suffix", "-", ""):
+            with self.subTest(argument=argument), mock.patch.object(
+                    jev.shlex, "split", wraps=jev.shlex.split) as split:
+                jev._cd_target("cd " + argument)
+                if argument:
+                    split.assert_called_once()
+
     # ---- command forms, multiple ops, push base, redaction ----
 
     def test_command_forms_detected(self):
