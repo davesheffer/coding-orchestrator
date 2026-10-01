@@ -242,15 +242,32 @@ KEY_END_RE = re.compile(r"-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
 # A line (after an optional diff prefix and indentation) that looks like key body; an
 # unpaired marker next to one redacts to its hunk's end/start, otherwise only itself.
 KEY_LINE_RE = re.compile(r"[+\- ]?[ \t]*[A-Za-z0-9+/=]{16,}[ \t\r\n]*$")
+# An encrypted PEM header line (`Proc-Type: 4,ENCRYPTED`, `DEK-Info: <cipher>,<IV>`) or other
+# `Name: value` line, which a BEGIN marker's block may hold before its first key line.
+KEY_HEADER_LINE_RE = re.compile(r"[+\- ]?[ \t]*[A-Za-z][A-Za-z0-9-]*:")
+# Base64 and escape text written backwards from an END marker that follows a literal `\n`
+# (a one-line key fragment such as JSON `"...body\ntail\n-----END ... KEY-----\n"`).
+ESCAPED_KEY_TEXT_RE = re.compile(r"[A-Za-z0-9+/=\\]*")
 # Where _scrub splits text into hunks, so an unpaired marker redacts only its own hunk.
 HUNK_SPLIT_RE = re.compile(r"(?m)^(?=@@|diff --git )")
 # Any long base64 run (key body, even mid-line or indented), scrubbed anywhere; a diff
 # line's leading `+`/`-` is kept. Runs with base64url `-`/`_` (JWK, tokens) are redacted
 # only if they mix upper, lower and digits or hold a standard run, sparing identifiers.
-BASE64_RUN_RE = re.compile(r"(?m)(^[+-]|(?<![\w+/=-]))[\w+/=-]{40,}(?![\w+/=-])", re.ASCII)
+# The `n` of a literal `\n` escape is kept before a run, like the diff `+`/`-`.
+BASE64_RUN_RE = re.compile(
+    r"(?m)(^[+-]|(?<=\\)n|(?<![\w+/=-]))[\w+/=-]{40,}(?![\w+/=-])", re.ASCII)
 STD_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{40}")
-# A short base64-only line (a key's last body line), scrubbed in hunks that held key material.
-KEY_TAIL_LINE_RE = re.compile(r"(?m)^([+\- ]?[ \t]*)[A-Za-z0-9+/]{8,}={0,2}(?=[ \t]*\r?$)")
+# A base64-only line of any length (a key's last body line), scrubbed in hunks with a key
+# marker; a lone `+` (an added blank line) is kept. Hunks with only a long base64 run (a
+# key body, but also e.g. a commit SHA) lose base64-only lines of 8+ chars, so ordinary
+# one-word code lines survive there.
+KEY_TAIL_LINE_RE = re.compile(
+    r"(?m)^([+\- ]?[ \t]*)(?!\+[ \t]*\r?$)[A-Za-z0-9+/]+={0,2}(?=[ \t]*\r?$)")
+LONG_TAIL_LINE_RE = re.compile(r"(?m)^([+\- ]?[ \t]*)[A-Za-z0-9+/]{8,}={0,2}(?=[ \t]*\r?$)")
+# ... and a base64-only line of any length right after a redacted key-body line.
+AFTER_RUN_TAIL_LINE_RE = re.compile(
+    r"(?m)^([+\- ]?[ \t]*\[redacted\][ \t]*\r?\n[+\- ]?[ \t]*)(?!\+[ \t]*\r?$)"
+    r"[A-Za-z0-9+/]+={0,2}(?=[ \t]*\r?$)")
 # A hunk header; git appends the nearest preceding "function" line to it, which can be a
 # key body line, so everything after the closing `@@` is dropped.
 HUNK_HEADER_RE = re.compile(r"^(@@+ (?:[-+]\d+(?:,\d+)? )+@@+)[^\r\n]*")
@@ -772,10 +789,25 @@ def _diff_prefix(diff, limit):
 def _scrub_key_markers(lines):
     """Redact the private key markers left unpaired in one hunk's lines: an END just after
     a key body line redacts from the hunk's start (keeping its `@@` line), a BEGIN just
-    before one to the hunk's end, and any other marker (e.g. a prose mention) only itself.
-    Returns the lines and whether any marker was found."""
+    before one (past any `Name: value` header lines, which alone also count when they run to
+    the hunk's end, as in a cut encrypted block) to the hunk's end, an END just after a
+    literal backslash-n the base64 and escape text before it on its line, and any other
+    marker (e.g. a prose mention) only itself. Returns the lines and whether any marker was
+    found."""
     def blank(line):
         return not line.strip(" \t\r\n+-")
+
+    def scrub_escaped_end(line):
+        out, lo = [], 0
+        for end in KEY_END_RE.finditer(line):
+            seg = line[lo:end.start()]
+            if seg.endswith("\\n"):
+                seg = seg[:len(seg) - ESCAPED_KEY_TEXT_RE.match(seg[::-1]).end()]
+                out.append(seg + "[redacted]")
+            else:
+                out.append(seg + end.group(0))
+            lo = end.end()
+        return "".join(out) + line[lo:]
 
     found = False
     cut, prev = None, None  # prev: the last non-blank line before the current one
@@ -791,20 +823,25 @@ def _scrub_key_markers(lines):
             pass
         start = 1 if cut and HUNK_SPLIT_RE.match(lines[0]) else 0
         lines[start:cut + 1] = ["[redacted]" + lines[cut][end.end():]]
-    begin_at, nxt = None, None  # nxt: the first non-blank line after the current one
+    # nxt: the first non-blank, non-header line after the current one; header: whether a
+    # header line lies between the two
+    begin_at, nxt, header = None, None, False
     for i in range(len(lines) - 1, -1, -1):
         if KEY_BEGIN_RE.search(lines[i]):
             found = True
-            if nxt is not None and KEY_LINE_RE.match(lines[nxt]):
+            if (KEY_LINE_RE.match(lines[nxt]) if nxt is not None else header):
                 begin_at = i
-        if not blank(lines[i]):
-            nxt = i
+        if KEY_HEADER_LINE_RE.match(lines[i]):
+            header = True
+        elif not blank(lines[i]):
+            nxt, header = i, False
     if begin_at is not None:
         begin = KEY_BEGIN_RE.search(lines[begin_at])
         newline = "\n" if lines[-1].endswith("\n") else ""
         lines[begin_at:] = [lines[begin_at][:begin.start()] + "[redacted]" + newline]
     if found:
-        lines = [KEY_END_RE.sub("[redacted]", KEY_BEGIN_RE.sub("[redacted]", line))
+        lines = [KEY_END_RE.sub("[redacted]",
+                                KEY_BEGIN_RE.sub("[redacted]", scrub_escaped_end(line)))
                  for line in lines]
     return lines, found
 
@@ -820,8 +857,8 @@ def _scrub(text):
         run = match.group(0)[len(match.group(1)):]
         if STD_BASE64_RUN_RE.search(match.group(0)):  # the old match, diff `+` included
             runs = True
-        elif "/" in run or "+" in run or not all(
-                re.search(c, run) for c in ("[A-Z]", "[a-z]", "[0-9]")):
+        elif "/" in run or "+" in run or not all(  # whole match: a kept `\n`'s n counts
+                re.search(c, match.group(0)) for c in ("[A-Z]", "[a-z]", "[0-9]")):
             return match.group(0)  # a path, long identifier or separator, not a key
         return match.group(1) + "[redacted]"
 
@@ -830,8 +867,11 @@ def _scrub(text):
         lines, found = _scrub_key_markers(hunk.splitlines(keepends=True))
         runs = False
         hunk = BASE64_RUN_RE.sub(redact_run, "".join(lines))
-        if found or runs:
+        if found:
             hunk = KEY_TAIL_LINE_RE.sub(r"\1[redacted]", hunk)
+        elif runs:
+            hunk = AFTER_RUN_TAIL_LINE_RE.sub(r"\1[redacted]",
+                                              LONG_TAIL_LINE_RE.sub(r"\1[redacted]", hunk))
         hunks.append(hunk)
     return "".join(hunks)
 

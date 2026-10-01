@@ -547,12 +547,20 @@ class GateTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 1.0)
         self.assertIsNotNone(jev.GIT_COMMAND_RE.search("git --work-tree x --git-dir=y --no-pager commit"))
 
+    def _assert_fast(self, scan, label):
+        # Best of 3 runs, so a CPU-load spike on a shared CI runner doesn't fail one.
+        elapsed = []
+        for _ in range(3):
+            start = time.monotonic()
+            scan()
+            elapsed.append(time.monotonic() - start)
+            if elapsed[-1] < 2.0:
+                break
+        self.assertLess(min(elapsed), 2.0, f"{label}: {', '.join(f'{e:.2f}s' for e in elapsed)}")
+
     def _assert_scans_fast(self, command, label):
-        start = time.monotonic()
-        stripped = jev._strip_heredocs_and_quotes(command)
-        list(jev.GIT_COMMAND_RE.finditer(stripped))
-        elapsed = time.monotonic() - start
-        self.assertLess(elapsed, 2.0, f"{label}: {elapsed:.2f}s")
+        self._assert_fast(lambda: list(jev.GIT_COMMAND_RE.finditer(
+            jev._strip_heredocs_and_quotes(command))), label)
 
     def test_many_quoted_args_scan_fast(self):
         # Each quote used to re-join the whole scanned-so-far prefix and rescan it
@@ -578,9 +586,7 @@ class GateTests(unittest.TestCase):
                                ("".join(f"cat <<W{i}\n" for i in range(10000)),
                                 "distinct unterminated heredocs")):
             self._assert_scans_fast(command, label)
-            start = time.monotonic()
-            jev._scan_targets(command, "/repo")
-            self.assertLess(time.monotonic() - start, 2.0, label)
+            self._assert_fast(lambda: jev._scan_targets(command, "/repo"), label)
         start = time.monotonic()
         targets = jev._scan_targets("git commit -m x;" * 5000 + "git -C other push", "/repo")
         self.assertLess(time.monotonic() - start, 2.0)
@@ -1253,12 +1259,13 @@ class GateTests(unittest.TestCase):
         self.assertNotIn(body, out)
         self.assertNotIn(body.lower(), out)
         self.assertEqual(out, f"{head}@@ -5,3 +5,3 @@\n [redacted]\n-[redacted]\n+[redacted]\n")
-        # BEGIN only: redacted to the end of its hunk; the next hunk is kept.
+        # BEGIN only: redacted to the end of its hunk; the next hunk is kept. A one-word
+        # line in a hunk that held key material may be a key's last line, so it goes too.
         begin = (f"{head}@@ -1,2 +1,2 @@\n context\n+-----BEGIN RSA PRIVATE KEY-----\n+{body[:20]}\n"
                  "@@ -9 +9 @@\n+plain change\n")
         out = jev._scrub(begin)
         self.assertNotIn(body[:20], out)
-        self.assertEqual(out, f"{head}@@ -1,2 +1,2 @@\n context\n+[redacted]\n"
+        self.assertEqual(out, f"{head}@@ -1,2 +1,2 @@\n [redacted]\n+[redacted]\n"
                               "@@ -9 +9 @@\n+plain change\n")
         # END only: redacted from the start of its hunk; its `@@` line and earlier hunks stay.
         end = (f"{head}@@ -1 +1 @@\n+plain change\n@@ -20,2 +20,2 @@\n {body[:20]}\n"
@@ -1266,11 +1273,12 @@ class GateTests(unittest.TestCase):
         out = jev._scrub(end)
         self.assertNotIn(body[:20], out)
         self.assertEqual(out, f"{head}@@ -1 +1 @@\n+plain change\n@@ -20,2 +20,2 @@\n"
-                              "[redacted]\n+after\n")
+                              "[redacted]\n+[redacted]\n")
         # Report text (not a diff) is one hunk.
-        self.assertEqual(jev._scrub(f"see\n-----BEGIN PRIVATE KEY-----\n{body[:20]}"), "see\n[redacted]")
-        self.assertEqual(jev._scrub(f"{body[:20]}\n-----END PRIVATE KEY-----\nok"), "[redacted]\nok")
-        self.assertEqual(jev._scrub(f"line\n{body}\r\nok"), "line\n[redacted]\r\nok")
+        self.assertEqual(jev._scrub(f"see it\n-----BEGIN PRIVATE KEY-----\n{body[:20]}"), "see it\n[redacted]")
+        self.assertEqual(jev._scrub(f"{body[:20]}\n-----END PRIVATE KEY-----\nok"), "[redacted]\n[redacted]")
+        self.assertEqual(jev._scrub(f"{body[:20]}\n-----END PRIVATE KEY-----\nall ok"), "[redacted]\nall ok")
+        self.assertEqual(jev._scrub(f"a line\n{body}\r\nall ok"), "a line\n[redacted]\r\nall ok")
 
     def test_mid_key_edit_from_real_git_diff_is_scrubbed(self):
         # git appends the nearest preceding line starting with a letter (here a key body
@@ -1309,7 +1317,10 @@ class GateTests(unittest.TestCase):
             # Trailing whitespace.
             f"@@ -1 +1 @@\n+{body}   \n": "@@ -1 +1 @@\n+[redacted]   \n",
             # A JSON one-liner with literal `\n` separators.
-            f'+  "key": "{body}\\n{body2}\\n",\n': '+  "key": "[redacted]\\[redacted]\\n",\n',
+            f'+  "key": "{body}\\n{body2}\\n",\n': '+  "key": "[redacted]\\n[redacted]\\n",\n',
+            f'"{body}\\r\\n{body2}\\\\n"': '"[redacted]\\r\\n[redacted]\\\\n"',
+            # A run after `\n` that is short without its `n` is still redacted whole.
+            f'"x\\n{body[:39]}"': '"x\\[redacted]"',
             # Mid-line.
             f"tls.key: {body} # rotated\n": "tls.key: [redacted] # rotated\n",
         }
@@ -1358,6 +1369,65 @@ class GateTests(unittest.TestCase):
         self.assertEqual(jev._scrub(mid), "@@ -5,3 +5,3 @@\n [redacted]\n+[redacted]\n context line\n"
                                           "@@ -30 +30 @@\n+unchanged\n")
 
+    def test_scrub_very_short_last_key_lines(self):
+        body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+        for tail in ("Ab==", "QUJD", "x"):
+            # A mid-key hunk, and an END-only hunk whose short tail hides the body line.
+            mid = f"@@ -5,3 +5,3 @@\n {body}\n+{tail}\n context line\n@@ -30 +30 @@\n+{tail}\n"
+            self.assertEqual(jev._scrub(mid), "@@ -5,3 +5,3 @@\n [redacted]\n+[redacted]\n"
+                                              f" context line\n@@ -30 +30 @@\n+{tail}\n", tail)
+            end = f"@@ -5,4 +5,4 @@\n {body}\n+\n+{tail}\n+-----END RSA PRIVATE KEY-----\n"
+            self.assertEqual(jev._scrub(end), "@@ -5,4 +5,4 @@\n [redacted]\n+\n+[redacted]\n"
+                                              "+[redacted]\n", tail)
+
+    def test_scrub_keeps_short_code_lines_beside_a_sha(self):
+        # A long run that is not key body (a commit SHA) only widens the scrub to 8+ char
+        # base64-only lines and to a short line right after a fully redacted line.
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        text = "@@ -1,3 +1,3 @@\n-rev: " + sha + "\n+    return\n done\n"
+        self.assertEqual(jev._scrub(text), "@@ -1,3 +1,3 @@\n-rev: [redacted]\n+    return\n done\n")
+
+    def test_scrub_escaped_newline_n_still_counts_for_base64url_tokens(self):
+        # The `n` kept from a `\n` escape still counts as the token's lowercase letter.
+        token = "ABCDEFGHIJ-KLMNOPQRST_0123456789ABCDEFGHIJKLMNOP"
+        self.assertEqual(jev._scrub("\\n" + token), "\\n[redacted]")
+
+    def test_scrub_one_line_end_fragment_with_escaped_newlines(self):
+        body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+        for tail in ("Ab==", "QUJDREVGRw==", body[:30]):
+            for nl in ("\\n", "\\r\\n"):
+                text = (f'@@ -1,2 +1,2 @@\n "name": "deploy",\n'
+                        f'+  "key": "{body}{nl}{tail}{nl}-----END RSA PRIVATE KEY-----{nl}",\n')
+                out = jev._scrub(text)
+                self.assertEqual(out, '@@ -1,2 +1,2 @@\n "name": "deploy",\n'
+                                      f'+  "key": "[redacted]{nl}",\n', (tail, nl))
+        # A prose END mention not after a literal `\n` keeps the text before it.
+        self.assertEqual(jev._scrub("see -----END RSA PRIVATE KEY----- here"), "see [redacted] here")
+
+    def test_scrub_cut_encrypted_pem_headers(self):
+        body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+        headers = "+Proc-Type: 4,ENCRYPTED\n+DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n"
+        begin = "@@ -1,9 +1,9 @@\n context line\n+-----BEGIN RSA PRIVATE KEY-----\n"
+        # The hunk ends inside the headers, or past them with the body.
+        for text in (begin + headers, begin + headers + "+\n", begin + headers + f"+\n+{body[:24]}\n"):
+            self.assertEqual(jev._scrub(text), "@@ -1,9 +1,9 @@\n context line\n+[redacted]\n", text)
+        # The send cut falls inside an encrypted block.
+        size = 10 * 4 + (1 << 16)
+        head = "diff --git a/k b/k\n@@ -1 +1 @@\n"
+        block = "+-----BEGIN RSA PRIVATE KEY-----\n" + headers
+        filler = "+x = 1\n" * ((size - len(head) - len(block)) // 7)
+        diff = head + filler + block + "+\n" + f"+{body}\n" * 30
+        cut = jev._diff_prefix(diff, 10)
+        self.assertIn("ENCRYPTED", cut)
+        self.assertNotIn(body, cut)
+        sent = jev._scrub(jev._redact_diff(cut))
+        self.assertNotIn("ENCRYPTED", sent)
+        self.assertNotIn("0123456789ABCDEF", sent)
+        self.assertTrue(sent.endswith("+[redacted]\n"), sent[-80:])
+        # Header-like lines followed by other text are not a key block.
+        self.assertEqual(jev._scrub("-----BEGIN RSA PRIVATE KEY-----\nStatus: ok\nAll good"),
+                         "[redacted]\nStatus: ok\nAll good")
+
     def test_scrub_key_pairs_do_not_cross_files(self):
         body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
         diff = ("diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n+-----BEGIN RSA PRIVATE KEY-----\n"
@@ -1392,7 +1462,10 @@ class GateTests(unittest.TestCase):
                      "-----BEGIN " + "A" * 1_000_000,
                      "@@ -1 +1 @@\n-----BEGIN PRIVATE KEY-----\n" * 25_000,
                      "+" + "A" * 1_000_000 + " x\n",
-                     "\n" * 1_000_000 + "-----END RSA PRIVATE KEY-----"):
+                     "\n" * 1_000_000 + "-----END RSA PRIVATE KEY-----",
+                     "-----END RSA PRIVATE KEY-----\n" + "+Ab==\n" * 200_000,
+                     "-----BEGIN RSA PRIVATE KEY-----\n" + "+Name: value\n" * 100_000,
+                     "x" + "A\\n" * 400_000 + "-----END RSA PRIVATE KEY-----"):
             started = time.monotonic()
             out = jev._scrub(text)
             self.assertLess(time.monotonic() - started, 3.0, text[:40])
