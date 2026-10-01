@@ -59,7 +59,7 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual((self.home / "bin/rollover-open.py").read_bytes(),
                          (ROOT / "bin/rollover-open.py").read_bytes())
         instructions = (self.home / "CLAUDE.md").read_text(encoding="utf-8")
-        expected_command = ("python " if os.name == "nt" else "") + shlex.quote(str(helper))
+        expected_command = f"{install_module.hook_python()} {shlex.quote(str(helper))}"
         self.assertIn(f"using `{expected_command}`", instructions)
         if os.name == "posix":
             self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
@@ -90,6 +90,32 @@ class ClaudeInstallTests(unittest.TestCase):
         stop_commands = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
         self.assertIn("printf private", stop_commands)
         self.assertEqual(json.loads(self.home.joinpath("relay/config.json").read_text(encoding="utf-8")), config)
+
+    def test_installed_instructions_substitute_platform_interpreter(self):
+        # A placeholder token inside the install path must survive substitution literally.
+        self.home = self.home / "__PR_STATUS__ __PYTHON__ __RELAY__"
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        python = install_module.hook_python()
+        relay = shlex.quote(str(self.home / "relay/relay.py"))
+        helper = shlex.quote(str(self.home / "bin/pr-status"))
+        instructions = self.home.joinpath("CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn(f"{python} {relay} handoff --title", instructions)
+        self.assertIn(f"using `{python} {helper}`", instructions)
+        leftover = instructions.replace(relay, "").replace(helper, "")
+        for placeholder in ("__PYTHON__", "__RELAY__", "__PR_STATUS__"):
+            self.assertNotIn(placeholder, leftover)
+        settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
+        commands = [h["command"] for groups in settings["hooks"].values()
+                    for group in groups for h in group["hooks"]]
+        self.assertEqual(sorted(commands), sorted(f"{python} {relay} {action} 2>/dev/null || true"
+                                                  for action in ("prompt", "stop")))
+
+    def test_fill_placeholders_is_single_pass(self):
+        values = {"__PYTHON__": "__RELAY__", "__RELAY__": "'/x/__PR_STATUS__'",
+                  "__PR_STATUS__": "__PYTHON__"}
+        self.assertEqual(install_module.fill_placeholders("__PYTHON__ __RELAY__ __PR_STATUS__", values),
+                         "__RELAY__ '/x/__PR_STATUS__' __PYTHON__")
 
     @unittest.skipUnless(os.name == "posix", "shell entry points require POSIX process execution")
     def test_actual_shell_entry_point_runs(self):

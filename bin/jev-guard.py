@@ -32,19 +32,23 @@ hook invocations don't clobber each other's keys.
 
 Fail-open: any missing key, disabled config, error or timeout leaves the
 call unchanged. All Jev calls run under a hard wall-clock deadline of
-min(timeout_seconds, 4) seconds. All git subprocesses in one `gate()` call
-share a single wall-clock budget (GIT_SUBPROCESS_BUDGET_SECONDS); once it is
-spent, remaining git calls fail open, so the script always finishes inside
-the gate hook's 10 s timeout even in the worst case (4 s of git plus a 4 s
-classify_fn call).
+min(timeout_seconds, 4) seconds. Each hook invocation also shares one
+monotonic deadline (GATE_BUDGET_SECONDS for `gate`, SHORT_HOOK_BUDGET_SECONDS
+for `handback`/`agent-done`) across its git subprocesses, classifier call and
+state-lock wait: all git subprocesses in one `gate()` call share at most
+GIT_SUBPROCESS_BUDGET_SECONDS of it, the classifier gets only what remains,
+and `update_state` stops waiting for the lock at the deadline. Git or
+classifier work still pending when it passes fails open, and a lock wait that
+runs out only skips that state update, so the script finishes inside the hook
+timeouts in claude/install.py (10 s for gate, 5 s for the others).
 Nothing here logs diff text, file names, commands, or report text.
 """
 import bisect
+import errno
 import fnmatch
 import hashlib
 import json
 import os
-import posixpath
 import re
 import shlex
 import subprocess
@@ -60,16 +64,26 @@ try:
     import msvcrt
 except ImportError:
     msvcrt = None
+# Each hook invocation's shared monotonic deadline (git, classifier and state-lock
+# wait together). Below the 10 s (gate) and 5 s (handback, agent-done) hook timeouts
+# in claude/install.py, leaving margin for interpreter start-up.
+GATE_BUDGET_SECONDS = 8.0
+SHORT_HOOK_BUDGET_SECONDS = 4.0
 # How long update_state waits for the Windows lock before giving up (the hook fails
-# open), and how often a Windows tmp.replace is retried while another process has the
-# state file open.
+# open; never past the hook's deadline), and how often a Windows tmp.replace is
+# retried while another process has the state file open.
 MSVCRT_LOCK_SECONDS = 2.0
+# The errnos a non-blocking lock attempt raises when another process holds the lock;
+# any other OSError is re-raised at once instead of being retried until the deadline.
+FLOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES}
+MSVCRT_BUSY_ERRNOS = {errno.EACCES, getattr(errno, "EDEADLOCK", errno.EACCES)}
 REPLACE_ATTEMPTS = 5
 REPLACE_RETRY_SECONDS = 0.05
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
-    ROOT, ask, elapsed_ms, feature_enabled, load_config, noul, timestamp, write_log)
+    ROOT, ask, coerce_confidence, elapsed_ms, feature_enabled, load_config, noul, timestamp,
+    write_log)
 
 STATE_DIR = ROOT / "relay" / "state"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -202,15 +216,38 @@ _SPLIT_OPERATOR_RE = re.compile(r"(?<=[<$()])(?:\\\n)+(?=[<$(\[)])")
 _HEREDOC_SPLIT_RE = re.compile(r"<<(?:\\\n)*-?(?:[ \t]|\\\n)*")
 # A line that could end a heredoc (`WORD`, or indented for the `<<-` form).
 _TERMINATOR_LINE_RE = re.compile(r"(?m)^([ \t]*)([\w.-]+)[ \t]*\r?$")
-# Staged files whose hunks are never sent to Jev (matched case-insensitively against the
-# file's base name); only the file name and a `[redacted]` marker go out.
+# Staged files whose hunks are never sent to Jev (matched case-insensitively against every
+# component of the file's path, directories included, so `secrets/db.yaml` matches too);
+# only the file name and a `[redacted]` marker go out.
 REDACT_FILE_PATTERNS = (".env*", "*.env", "*.pem", "*.key", "*secret*", "id_rsa*", "*.p12", "*.pfx",
                          "credentials*", "*.jks", "*.keystore")
-# Token shapes scrubbed from diff and report text before it is sent.
+# Token shapes scrubbed from diff and report text before it is sent. A key body may not
+# contain another marker or cross a hunk/file boundary, so each BEGIN scans only up to the
+# next one (linear time).
 SECRET_RE = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"
+    r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
+    r"(?:(?!-----(?:BEGIN|END) |\ndiff --git |\n@@).)*"
+    r"-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
     r"|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}"
     r"|xox[abpr]-[\w-]{10,}", re.DOTALL)
+# Private key markers left unpaired after SECRET_RE, e.g. a hunk that edits only one end.
+KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
+KEY_END_RE = re.compile(r"-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
+# A line (after an optional diff prefix and indentation) that looks like key body; an
+# unpaired marker next to one redacts to its hunk's end/start, otherwise only itself.
+KEY_LINE_RE = re.compile(r"[+\- ]?[ \t]*[A-Za-z0-9+/=]{16,}[ \t\r\n]*$")
+# Where _scrub splits text into hunks, so an unpaired marker redacts only its own hunk.
+HUNK_SPLIT_RE = re.compile(r"(?m)^(?=@@|diff --git )")
+# Any long base64 run (key body, even mid-line or indented), scrubbed anywhere; a diff
+# line's leading `+`/`-` is kept. Runs with base64url `-`/`_` (JWK, tokens) are redacted
+# only if they mix upper, lower and digits or hold a standard run, sparing identifiers.
+BASE64_RUN_RE = re.compile(r"(?m)(^[+-]|(?<![\w+/=-]))[\w+/=-]{40,}(?![\w+/=-])", re.ASCII)
+STD_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{40}")
+# A short base64-only line (a key's last body line), scrubbed in hunks that held key material.
+KEY_TAIL_LINE_RE = re.compile(r"(?m)^([+\- ]?[ \t]*)[A-Za-z0-9+/]{8,}={0,2}(?=[ \t]*\r?$)")
+# A hunk header; git appends the nearest preceding "function" line to it, which can be a
+# key body line, so everything after the closing `@@` is dropped.
+HUNK_HEADER_RE = re.compile(r"^(@@+ (?:[-+]\d+(?:,\d+)? )+@@+)[^\r\n]*")
 DIFF_HEADER_RE = re.compile(r"^diff --git (?:\"?a/(.*?)\"?) (?:\"?b/(.*?)\"?)$")
 # Forced onto every `git diff` the guard runs so the parsed header shape (matched by
 # DIFF_HEADER_RE above) can't be defeated by the user's own git config: diff.noprefix
@@ -312,22 +349,42 @@ def _replace(tmp, path):
             time.sleep(REPLACE_RETRY_SECONDS)
 
 
-def _msvcrt_lock(lock_file):
-    """Lock the first byte of `lock_file` (Windows), retrying for MSVCRT_LOCK_SECONDS;
-    raises OSError if another process still holds it."""
+def _msvcrt_lock(lock_file, deadline=None):
+    """Lock the first byte of `lock_file` (Windows), retrying for MSVCRT_LOCK_SECONDS
+    or until `deadline` (a time.monotonic() value), whichever comes first, after at
+    least one attempt; raises OSError if another process still holds it."""
     lock_file.seek(0)
-    deadline = time.monotonic() + MSVCRT_LOCK_SECONDS
+    wait_until = time.monotonic() + MSVCRT_LOCK_SECONDS
+    if deadline is not None:
+        wait_until = min(wait_until, deadline)
     while True:
         try:
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
             return
-        except OSError:
-            if time.monotonic() >= deadline:
+        except OSError as exc:
+            if exc.errno not in MSVCRT_BUSY_ERRNOS or time.monotonic() >= wait_until:
                 raise
             time.sleep(0.01)
 
 
-def update_state(path, mutate_fn):
+def _flock_until(lock_file, deadline):
+    """fcntl.flock `lock_file` exclusively, retrying non-blocking attempts for
+    MSVCRT_LOCK_SECONDS or until `deadline` (a time.monotonic() value), whichever
+    comes first, after at least one attempt, so a held lock leaves later work in the
+    hook the same budget as on Windows; raises OSError (BlockingIOError) if another
+    process still holds it."""
+    wait_until = min(time.monotonic() + MSVCRT_LOCK_SECONDS, deadline)
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in FLOCK_BUSY_ERRNOS or time.monotonic() >= wait_until:
+                raise
+            time.sleep(0.01)
+
+
+def update_state(path, mutate_fn, deadline=None):
     """Read-modify-write `path`'s JSON state under an exclusive lock on `<path>.lock`.
 
     `mutate_fn(state)` mutates a freshly reloaded on-disk state dict in place (or
@@ -335,6 +392,10 @@ def update_state(path, mutate_fn):
     if this invocation's load was stale. The lock is `fcntl.flock`, or `msvcrt.locking`
     on Windows. If neither is available, the update runs without a lock: still
     correct for a single process, best-effort under real concurrency.
+
+    With a `deadline` (the hook's time.monotonic() deadline) the lock wait stops
+    there and raises OSError; without one, flock blocks and msvcrt waits
+    MSVCRT_LOCK_SECONDS.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,11 +405,14 @@ def update_state(path, mutate_fn):
     try:
         if fcntl is not None:
             lock_file = open(lock_path, "a+")
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            else:
+                _flock_until(lock_file, deadline)
             locked = True
         elif msvcrt is not None:
             lock_file = open(lock_path, "a+")
-            _msvcrt_lock(lock_file)
+            _msvcrt_lock(lock_file, deadline)
             locked = True
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
@@ -660,16 +724,18 @@ def _native_path(path):
 
 def _redact_diff(diff):
     """Replace the hunks of files matching REDACT_FILE_PATTERNS with `[redacted]`,
-    keeping each file's header lines (and so its name)."""
+    keeping each file's header lines (and so its name), and drop the context text git
+    appends to every hunk header."""
     out = []
     mode = "keep"  # "keep", "header" (a redacted file's header lines) or "drop" (its hunks)
     for line in diff.splitlines(keepends=True):
+        line = HUNK_HEADER_RE.sub(r"\1", line, count=1)
         header = DIFF_HEADER_RE.match(line.rstrip("\r\n"))
         if header or line.startswith("new file: "):  # the latter: untracked-file blocks
-            names = [posixpath.basename(name) for name in (header.groups() if header else ())
-                     if name]
-            redact = any(fnmatch.fnmatchcase(name.lower(), pattern)
-                         for name in names for pattern in REDACT_FILE_PATTERNS)
+            parts = [part for name in (header.groups() if header else ()) if name
+                     for part in name.split("/")]
+            redact = any(fnmatch.fnmatchcase(part.lower(), pattern)
+                         for part in parts for pattern in REDACT_FILE_PATTERNS)
             mode = "header" if redact else "keep"
             out.append(line)
         elif mode == "header":
@@ -683,9 +749,85 @@ def _redact_diff(diff):
     return "".join(out)
 
 
+def _diff_prefix(diff, limit):
+    """Bound the text scrubbed for sending to a generous multiple of `limit` so huge diffs
+    stay fast. The cut falls on a line boundary: a secret split mid-line could otherwise
+    escape its pattern, and whole lines keep key blocks detectable (an unpaired BEGIN
+    followed by body lines redacts to its hunk's end)."""
+    size = max(int(limit or 0), 0) * 4 + (1 << 16)
+    if len(diff) <= size:
+        return diff
+    cut = diff.rfind("\n", 0, size)
+    if cut < 0:
+        return "[diff omitted: first line too long]\n"
+    return diff[: cut + 1]
+
+
+def _scrub_key_markers(lines):
+    """Redact the private key markers left unpaired in one hunk's lines: an END just after
+    a key body line redacts from the hunk's start (keeping its `@@` line), a BEGIN just
+    before one to the hunk's end, and any other marker (e.g. a prose mention) only itself.
+    Returns the lines and whether any marker was found."""
+    def blank(line):
+        return not line.strip(" \t\r\n+-")
+
+    found = False
+    cut, prev = None, None  # prev: the last non-blank line before the current one
+    for i, line in enumerate(lines):
+        if KEY_END_RE.search(line):
+            found = True
+            if prev is not None and KEY_LINE_RE.match(lines[prev]):
+                cut = i
+        if not blank(line):
+            prev = i
+    if cut is not None:
+        for end in KEY_END_RE.finditer(lines[cut]):
+            pass
+        start = 1 if cut and HUNK_SPLIT_RE.match(lines[0]) else 0
+        lines[start:cut + 1] = ["[redacted]" + lines[cut][end.end():]]
+    begin_at, nxt = None, None  # nxt: the first non-blank line after the current one
+    for i in range(len(lines) - 1, -1, -1):
+        if KEY_BEGIN_RE.search(lines[i]):
+            found = True
+            if nxt is not None and KEY_LINE_RE.match(lines[nxt]):
+                begin_at = i
+        if not blank(lines[i]):
+            nxt = i
+    if begin_at is not None:
+        begin = KEY_BEGIN_RE.search(lines[begin_at])
+        newline = "\n" if lines[-1].endswith("\n") else ""
+        lines[begin_at:] = [lines[begin_at][:begin.start()] + "[redacted]" + newline]
+    if found:
+        lines = [KEY_END_RE.sub("[redacted]", KEY_BEGIN_RE.sub("[redacted]", line))
+                 for line in lines]
+    return lines, found
+
+
 def _scrub(text):
-    """Replace common secret token shapes (API keys, tokens, private key blocks)."""
-    return SECRET_RE.sub("[redacted]", text)
+    """Replace common secret token shapes (API keys, tokens, private key blocks, long
+    base64 runs). Unpaired key markers are handled per hunk (report text is one hunk) by
+    _scrub_key_markers, and a hunk that held key material also loses short base64 lines."""
+    def redact_run(match):
+        nonlocal runs
+        # Only standard-alphabet runs (PEM key body) hint at a short last key line;
+        # base64url runs (JWK, tokens) are redacted without widening the scrub.
+        run = match.group(0)[len(match.group(1)):]
+        if STD_BASE64_RUN_RE.search(match.group(0)):  # the old match, diff `+` included
+            runs = True
+        elif "/" in run or "+" in run or not all(
+                re.search(c, run) for c in ("[A-Z]", "[a-z]", "[0-9]")):
+            return match.group(0)  # a path, long identifier or separator, not a key
+        return match.group(1) + "[redacted]"
+
+    hunks = []
+    for hunk in HUNK_SPLIT_RE.split(SECRET_RE.sub("[redacted]", text)):
+        lines, found = _scrub_key_markers(hunk.splitlines(keepends=True))
+        runs = False
+        hunk = BASE64_RUN_RE.sub(redact_run, "".join(lines))
+        if found or runs:
+            hunk = KEY_TAIL_LINE_RE.sub(r"\1[redacted]", hunk)
+        hunks.append(hunk)
+    return "".join(hunks)
 
 
 def _run_git(args, cwd, deadline=None, git_opts=None):
@@ -995,18 +1137,25 @@ def _scan_targets(raw_command, base_cwd):
     return targets
 
 
-def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR):
+def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR,
+         deadline=None):
     """Return the PreToolUse hook output dict, or None to leave the command unchanged.
 
     Every git commit/push in the command is gated together: with a push anywhere the
     operation is a push, and the diff sent is each commit's pending diff followed by
     each push's unpushed range.
 
-    All git subprocess calls in one invocation share a wall-clock budget
-    (GIT_SUBPROCESS_BUDGET_SECONDS) instead of each getting its own 2 s, so a worst
-    case of several calls plus the classify_fn deadline can't exceed the hook timeout;
-    once the budget is spent, remaining git calls fail open (return None/allow).
+    The whole invocation runs under one monotonic `deadline` (by default
+    GATE_BUDGET_SECONDS from entry). All git subprocess calls share at most
+    GIT_SUBPROCESS_BUDGET_SECONDS of it instead of each getting its own 2 s; once that
+    is spent, remaining git calls fail open (return None/allow). The classifier gets
+    only what remains, and the denied-hash update stops waiting for its lock at the
+    deadline (the command is still denied), so the invocation stays inside the hook
+    timeout (each stage is bounded; it can overshoot the deadline only slightly).
     """
+    entered = time.monotonic()
+    if deadline is None:
+        deadline = entered + GATE_BUDGET_SECONDS
     if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
         return None
     if not feature_enabled(cfg, "risk_gate"):
@@ -1023,7 +1172,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     # Commits run before the push that follows them, so their diffs come first.
     targets.sort(key=lambda t: t[0] == "push")
 
-    deadline = time.monotonic() + GIT_SUBPROCESS_BUDGET_SECONDS
+    git_deadline = min(entered + GIT_SUBPROCESS_BUDGET_SECONDS, deadline)
     max_diff_chars = int(cfg.get("max_diff_chars") or 0)
     diff = ""
     names = []
@@ -1032,14 +1181,14 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     untracked_overflow = False
     untracked_identity = []
     for target_op, cwd, all_flag, git_opts in targets:
-        base = _push_base(cwd, deadline, git_opts) if target_op == "push" else None
-        part = _diff_range(target_op, all_flag, cwd, deadline, base, git_opts)
+        base = _push_base(cwd, git_deadline, git_opts) if target_op == "push" else None
+        part = _diff_range(target_op, all_flag, cwd, git_deadline, base, git_opts)
         if part is None:
             continue
-        names_out = _diff_names(target_op, all_flag, cwd, deadline, base, git_opts)
+        names_out = _diff_names(target_op, all_flag, cwd, git_deadline, base, git_opts)
         names_failed = names_failed or names_out is None
         part_names = [n for n in (names_out or "").split("\0") if n]
-        toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline, git_opts)
+        toplevel = _run_git(["rev-parse", "--show-toplevel"], cwd, git_deadline, git_opts)
         toplevel = toplevel.strip() if toplevel else None
         diff += part
         for name in part_names:
@@ -1051,7 +1200,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         if not all_flag:
             continue
         seen = set(part_names)
-        untracked = _untracked_files(cwd, deadline, git_opts)
+        untracked = _untracked_files(cwd, git_deadline, git_opts)
         untracked_overflow = untracked_overflow or len(untracked) > MAX_UNTRACKED
         for name in untracked[:MAX_UNTRACKED]:
             if name in seen:
@@ -1124,13 +1273,15 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     ask_state = {"operation": op, "files": names[:200]}
     if cfg.get("send_diff"):
         # Hunks of secret-looking files and common token shapes never leave the machine.
-        ask_state["diff"] = _scrub(_redact_diff(diff))[: cfg["max_diff_chars"]]
+        ask_state["diff"] = _scrub(_redact_diff(_diff_prefix(diff, cfg["max_diff_chars"])))[
+            : cfg["max_diff_chars"]]
     questions = {
         "risk": {"type": "choice", "instructions": RISK_INSTRUCTIONS, "criteria": RISK_CRITERIA},
         "needs_review": {"type": "noul", "instructions": NEEDS_REVIEW_INSTRUCTIONS},
     }
     errs = []
-    answers = ask(cfg, "risk_gate", ask_state, questions, classify_fn, errors=errs)
+    answers = ask(cfg, "risk_gate", ask_state, questions, classify_fn, errors=errs,
+                  deadline=deadline)
     if answers is None:
         if errs:
             log("allow", reason="unavailable", error=errs[0])
@@ -1144,13 +1295,10 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     if not isinstance(choice, str):
         log("allow")
         return None
-    # Confidence is only logged, so a missing, null or non-finite one doesn't skip the gate.
-    try:
-        confidence = float(answers["risk"].get("confidence"))
-    except Exception:
-        confidence = None
-    if confidence is not None and not 0.0 <= confidence <= 1.0:
-        confidence = None
+    # Confidence is only logged, so an invalid one (missing, null, str, bool, out of
+    # range) is logged as None, as in jev-route, and doesn't skip the gate.
+    risk = answers["risk"]
+    confidence = coerce_confidence(risk.get("confidence") if isinstance(risk, dict) else None)
     needs_review_p = noul(answers, "needs_review")
 
     risky = (choice != "none" and needs_review_p is not None
@@ -1164,7 +1312,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
 
     extra = {}
     try:
-        update_state(session_state_path(session_id, state_dir), add_denied)
+        update_state(session_state_path(session_id, state_dir), add_denied, deadline)
     except Exception as exc:
         # Still deny: without the saved hash, the identical retry is simply checked again.
         extra["state_error"] = type(exc).__name__
@@ -1220,7 +1368,7 @@ def _parse_sections(text):
 
 
 def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_blocks=True,
-                    errors=None):
+                    errors=None, deadline=None):
     """Parse RESULT/EVIDENCE/CONFIDENCE/UNVERIFIED sections and ask Jev whether the
     report is weak. Returns (reasons, reason_codes, supported, material_gap).
 
@@ -1235,7 +1383,8 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_
     Sections are parsed from the FULL text (a long report's RESULT/EVIDENCE/CONFIDENCE/
     UNVERIFIED block may come after `max_report_chars` of findings), so truncation is
     only applied to what's actually sent to the classifier below, after common token
-    shapes are scrubbed. `errors` is passed to `ask` (a failed call appends its reason)."""
+    shapes are scrubbed. `errors` is passed to `ask` (a failed call appends its reason),
+    and so is `deadline`, the hook's shared time.monotonic() deadline."""
     max_chars = cfg["max_report_chars"]
 
     sections = _parse_sections(text)
@@ -1264,7 +1413,8 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_
             "supported": {"type": "noul", "instructions": SUPPORTED_INSTRUCTIONS},
             "material_gap": {"type": "noul", "instructions": MATERIAL_GAP_INSTRUCTIONS},
         }
-        answers = ask(cfg, "report_check", ask_state, questions, classify_fn, errors=errors)
+        answers = ask(cfg, "report_check", ask_state, questions, classify_fn, errors=errors,
+                      deadline=deadline)
         if answers is not None:
             supported = noul(answers, "supported")
             material_gap = noul(answers, "material_gap")
@@ -1286,8 +1436,13 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_
     return reasons, reason_codes, supported, material_gap
 
 
-def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
-    """Return the PreToolUse hook output dict for a SubagentHandback call, or None."""
+def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR, deadline=None):
+    """Return the PreToolUse hook output dict for a SubagentHandback call, or None.
+
+    The classifier call and state-lock wait share one monotonic `deadline` (by default
+    SHORT_HOOK_BUDGET_SECONDS from entry)."""
+    if deadline is None:
+        deadline = time.monotonic() + SHORT_HOOK_BUDGET_SECONDS
     if not isinstance(payload, dict):
         return None
     if not feature_enabled(cfg, "report_check"):
@@ -1305,7 +1460,8 @@ def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
     start = time.monotonic()
     errs = []
     reasons, reason_codes, supported, material_gap = _analyze_report(
-        message, cfg, classify_fn, confidence_heuristic=False, gap_blocks=False, errors=errs)
+        message, cfg, classify_fn, confidence_heuristic=False, gap_blocks=False, errors=errs,
+        deadline=deadline)
 
     def log(decision):
         if not log_fn:
@@ -1333,7 +1489,7 @@ def handback(payload, cfg, classify_fn=None, log_fn=None, state_dir=STATE_DIR):
         s["handback_denied"] = ((s.get("handback_denied") or []) + [key])[-50:]
 
     try:
-        update_state(session_state_path(session_id, state_dir), add_handback_denied)
+        update_state(session_state_path(session_id, state_dir), add_handback_denied, deadline)
     except Exception:
         pass  # still deny; without the saved key the identical resend is checked again
     log("deny")
@@ -1356,7 +1512,8 @@ def _prune_critic_started(started, now_value):
             if isinstance(ts, (int, float)) and now_value - ts < 86400}
 
 
-def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR):
+def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR,
+               deadline=None):
     """Return the PostToolUse hook output dict, or None.
 
     critic_ts is stamped from when the critic *started* (its Agent/Task launch), not
@@ -1364,7 +1521,12 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     seen by it, so they must still need a fresh review once it comes back. `critic_started` (a per-agent-id map of launch
     timestamps under session state) bridges the async-launch PostToolUse event to the
     later SubagentHandback or completed-foreground-result event.
+
+    State-lock waits and the classifier call share one monotonic `deadline` (by default
+    SHORT_HOOK_BUDGET_SECONDS from entry).
     """
+    if deadline is None:
+        deadline = time.monotonic() + SHORT_HOOK_BUDGET_SECONDS
     if not isinstance(payload, dict):
         return None
     tool_name = payload.get("tool_name")
@@ -1391,7 +1553,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                 s["critic_started"] = started
 
             try:
-                update_state(session_state_path(session_id, state_dir), set_critic_ts)
+                update_state(session_state_path(session_id, state_dir), set_critic_ts, deadline)
             except Exception:
                 pass  # persisting critic timestamps is best effort
         return None
@@ -1418,7 +1580,8 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                     s["critic_started"] = started
 
                 try:
-                    update_state(session_state_path(session_id, state_dir), add_critic_started)
+                    update_state(session_state_path(session_id, state_dir), add_critic_started,
+                                 deadline)
                 except Exception:
                     pass  # persisting critic timestamps is best effort
             return None
@@ -1453,7 +1616,8 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
             s["critic_started"] = started
 
         try:
-            update_state(session_state_path(session_id, state_dir), set_critic_ts_completed)
+            update_state(session_state_path(session_id, state_dir), set_critic_ts_completed,
+                         deadline)
         except Exception:
             pass  # persisting critic timestamps is best effort
 
@@ -1471,7 +1635,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     start = time.monotonic()
     errs = []
     reasons, reason_codes, supported, material_gap = _analyze_report(
-        text, cfg, classify_fn, errors=errs)
+        text, cfg, classify_fn, errors=errs, deadline=deadline)
 
     if log_fn:
         entry = {"ts": timestamp(), "feature": "report_check", "event": "agent_done",

@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,16 @@ class RelayTests(unittest.TestCase):
                                     "cache_creation_input_tokens": 0}}
         }) + "\n")
         return path
+
+    def test_handoff_command_uses_platform_interpreter(self):
+        script = shlex.quote(str(RELAY))
+        for name, python in (("nt", "python"), ("posix", "python3")):
+            with self.subTest(os_name=name):
+                with patch.object(relay_module.os, "name", name):
+                    how = relay_module.build_how(RELAY)
+                self.assertIn(f"`{python} {script} handoff --title", how)
+        python = "python" if os.name == "nt" else "python3"
+        self.assertIn(f"`{python} {shlex.quote(str(RELAY.resolve()))} handoff --title", relay_module.HOW)
 
     def test_status_reads_latest_main_thread_usage(self):
         result = self.run_relay("status", str(self.transcript(175000)))

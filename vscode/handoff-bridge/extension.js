@@ -15,16 +15,57 @@ function handoffHome() {
 // On Windows the native realpath also expands 8.3 short names, as Python's resolve() does.
 const realpath = process.platform === 'win32' ? fs.realpathSync.native : fs.realpathSync;
 
-function realHandoffPath(root, handoff) {
-  let folder;
-  try { folder = realpath(path.resolve(root, 'handoffs')); } catch { return null; }
-  let resolved;
-  try { resolved = realpath(path.resolve(handoff)); } catch { return null; }
+function handoffsFolder(root) {
+  try { return realpath(path.resolve(root, 'handoffs')); } catch { return null; }
+}
+
+function inside(folder, resolved) {
   const prefix = folder + path.sep;
-  const matches = process.platform === 'win32'
+  return process.platform === 'win32'
     ? resolved.toLowerCase().startsWith(prefix.toLowerCase())
     : resolved.startsWith(prefix);
-  return matches ? resolved : null;
+}
+
+function realHandoffPath(folder, handoff) {
+  if (!folder) return null;
+  let resolved;
+  try { resolved = realpath(path.resolve(handoff)); } catch { return null; }
+  return inside(folder, resolved) ? resolved : null;
+}
+
+// O_NOFOLLOW refuses a symlink swapped in for the resolved file; Windows has no such flag.
+const OPEN_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+
+// Read the validated handoff through one handle, before any await, so the checked file is
+// the one copied. Validation and open are separate path lookups, so after opening, the path
+// is resolved again against the handoffs folder validated before, and the handle must be the
+// regular file it names (same device and inode). On Linux the handle's own path must also
+// lie in that folder. This catches a replaced final component, and a handoffs folder swapped
+// for a link if the swap is still in place after the open. A swap undone between the open
+// and these checks cannot be ruled out without openat2(RESOLVE_BENEATH), which Node lacks.
+// realpath cannot see hard links: a link inside handoffs to a file elsewhere resolves inside.
+// The helper creates each handoff as a new file with one link, so more links are refused.
+// All of this is defense in depth against same-user tampering, not a security boundary.
+function readHandoff(folder, resolved) {
+  let fd;
+  try { fd = fs.openSync(resolved, OPEN_FLAGS); } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ELOOP') return null;
+    throw error;
+  }
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const after = realHandoffPath(folder, resolved);
+    let named;
+    try { named = after && fs.lstatSync(after, { bigint: true }); } catch { return null; }
+    if (!named || !opened.isFile() || opened.nlink !== 1n ||
+        opened.dev !== named.dev || opened.ino !== named.ino) return null;
+    let opener;
+    try { opener = fs.readlinkSync(`/proc/self/fd/${fd}`); } catch { /* no procfs */ }
+    if (opener !== undefined && !inside(folder, opener)) return null;
+    return fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function writeAck(root, id, result) {
@@ -113,8 +154,9 @@ async function openRequest(root, id, viaUri) {
   }
   try {
     const isCodex = request.client === 'codex';
+    const folder = isCodex ? handoffsFolder(root) : null;
     const resolvedHandoff = isCodex && typeof request.handoff === 'string'
-      ? realHandoffPath(root, request.handoff) : request.handoff;
+      ? realHandoffPath(folder, request.handoff) : request.handoff;
     if (!['codex', 'claude'].includes(request.client) ||
         typeof request.handoff !== 'string' || typeof request.prompt !== 'string' ||
         !Number.isFinite(request.created_at) ||
@@ -125,14 +167,8 @@ async function openRequest(root, id, viaUri) {
     }
     let handoff;
     if (isCodex) {
-      // Read through one handle now, before any await, so the checked file is the one copied.
-      const fd = fs.openSync(resolvedHandoff, 'r');
-      try {
-        if (!fs.fstatSync(fd).isFile()) throw new Error('invalid or expired handoff request');
-        handoff = fs.readFileSync(fd, 'utf8');
-      } finally {
-        fs.closeSync(fd);
-      }
+      handoff = readHandoff(folder, resolvedHandoff);
+      if (handoff === null) throw new Error('invalid or expired handoff request');
     }
     if (request.client === 'claude') {
       await vscode.commands.executeCommand('claude-vscode.primaryEditor.open', undefined, request.prompt);
