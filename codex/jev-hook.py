@@ -104,22 +104,27 @@ def route(payload, cfg, classify_fn=None):
         answer = answers["model"]
         choice = answer["choice"]
     except (TypeError, KeyError):
-        # Malformed shape (e.g. answers["model"] is a string), same as client.ask()'s own check.
+        choice = None
+    if not isinstance(choice, str):
+        # Malformed shape (answers["model"] not a dict, no string choice), same as client.ask()'s
+        # own check and bin/jev-route.py; an unknown string label is "invalid label" below.
         log(cfg, {**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
     confidence = client.coerce_confidence(answer.get("confidence"))
     escalated = None
-    if not isinstance(choice, str) or choice not in MODELS or choice not in cfg["labels"]:
+    if choice not in MODELS or choice not in cfg["labels"]:
         why = "invalid label"
     elif confidence is None:
         why = "invalid confidence"
     else:
         # Without a model the subagent inherits the parent's, so only the weakest
         # model is a likely downgrade; it needs downgrade_min_confidence.
-        # Escalate only to models the user kept in jev.labels.
+        # Escalate only to models the user kept in jev.labels, and take the weakest from them too
+        # (with a single kept model nothing is a downgrade).
         ranks = {t: r for t, r in RANK.items() if t in cfg["labels"]}
         escalated = client.stronger_tier(answer.get("probabilities"), ranks, RANK[choice], cfg["escalate_mass"])
-        floor = cfg["downgrade_min_confidence"] if RANK[choice] == 0 else cfg["min_confidence"]
+        weakest = len(ranks) > 1 and RANK[choice] == min(ranks.values())
+        floor = cfg["downgrade_min_confidence"] if weakest else cfg["min_confidence"]
         why = "applied" if escalated or confidence >= float(floor) else "below confidence threshold"
     # Never write a raw non-string/oversized choice; repr() is UTF-8-safe (handles lone surrogates too).
     display_choice = client.safe_repr(choice) if why == "invalid label" else choice
@@ -148,11 +153,13 @@ def subagent_start(payload, cfg):
     if payload.get("agent_type") != "critic" or not client.feature_enabled(cfg, "risk_gate"):
         return None
     guard = guard_module()
+    deadline = time.monotonic() + guard.SHORT_HOOK_BUDGET_SECONDS
     sid = payload.get("session_id")
     aid = payload.get("agent_id")
     if sid and aid:
         guard.update_state(guard.session_state_path(sid, STATE),
-                           lambda s: s.setdefault("critic_started", {}).update({aid: time.time()}))
+                           lambda s: s.setdefault("critic_started", {}).update({aid: time.time()}),
+                           deadline)
     return None
 
 
@@ -164,6 +171,7 @@ def subagent_stop(payload, cfg, classify_fn=None):
     if not isinstance(message, str):
         return None
     guard = guard_module()
+    deadline = time.monotonic() + guard.SHORT_HOOK_BUDGET_SECONDS
     if role == "critic" and client.feature_enabled(cfg, "risk_gate"):
         sid, aid = payload.get("session_id"), payload.get("agent_id")
         if sid and aid:
@@ -172,11 +180,14 @@ def subagent_stop(payload, cfg, classify_fn=None):
                 when = started.pop(aid, None)
                 if isinstance(when, (int, float)):
                     s["critic_ts"] = max(s.get("critic_ts") or 0, when)
-            guard.update_state(guard.session_state_path(sid, STATE), complete)
+            try:
+                guard.update_state(guard.session_state_path(sid, STATE), complete, deadline)
+            except Exception:
+                pass  # a busy lock at the deadline must not skip the report check below
     if not client.feature_enabled(cfg, "report_check") or role not in cfg.get("report_roles", []):
         return None
     reasons, codes, supported, gap = guard._analyze_report(message, cfg, classify_fn, confidence_heuristic=False,
-                                                            gap_blocks=False)
+                                                            gap_blocks=False, deadline=deadline)
     log(cfg, {"ts": client.timestamp(), "feature": "report_check", "role": role,
               "weak": bool(reasons), "reasons": codes, "supported": supported, "material_gap": gap})
     if reasons and not payload.get("stop_hook_active"):
@@ -193,6 +204,7 @@ def shift(payload, cfg, classify_fn=None):
     if not isinstance(prompt, str) or not isinstance(sid, str):
         return None
     guard = guard_module()
+    deadline = time.monotonic() + guard.SHORT_HOOK_BUDGET_SECONDS
     path = guard.session_state_path(sid, STATE)
     state = guard.load_session_state(sid, STATE)
     recent = state.get("recent_prompts", [])
@@ -200,13 +212,18 @@ def shift(payload, cfg, classify_fn=None):
     if recent:
         answers = client.ask(cfg, "shift", {"recent_prompts": recent[-3:], "new_prompt": prompt[:2000]},
                              {"continues": {"type": "noul", "instructions":
-                                            "Does this prompt continue the recent task, including corrections and follow-ups?"}}, classify_fn)
+                                            "Does this prompt continue the recent task, including corrections and follow-ups?"}}, classify_fn,
+                             deadline=deadline)
         p = client.noul(answers, "continues")
         if p is not None and p < cfg["shift_low"]:
             context = "[jev] This appears to start a new task. Preserve the current task state and follow the user's latest instruction."
         log(cfg, {"ts": client.timestamp(), "feature": "shift", "p": p,
                   "decision": "new" if context else "continue_or_unsure"})
-    guard.update_state(path, lambda s: s.update(recent_prompts=(recent + [prompt[:2000]])[-3:]))
+    try:
+        guard.update_state(path, lambda s: s.update(recent_prompts=(recent + [prompt[:2000]])[-3:]),
+                           deadline)
+    except Exception:
+        pass  # still return the new-task context computed above
     if context:
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}
     return None

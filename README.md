@@ -289,7 +289,7 @@ installed `relay/config.json`:
 | `respect_explicit_model` | `false` | route: never override a call that already sets `model` |
 | `pinned_agents` | `["critic", "fork"]` | route: subagent types that are never rerouted |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
-| `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted |
+| `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted. A removed tier's full model id (e.g. `claude-opus-4-1` with `opus` removed) can still be rewritten to a kept tier, as its alias would be. `opusplan` counts as the opus tier, so it is never rewritten to `opus` |
 | `shift_low`, `shift_high` | `0.25`, `0.75` | shift: probability-of-continuation thresholds |
 | `send_diff`, `max_diff_chars` | `true`, `12000` | risk_gate: send the truncated diff, or only the operation and file names |
 | `risk_min_probability` | `0.6` | risk_gate: minimum "needs review" probability to deny |
@@ -356,7 +356,8 @@ The Codex installer:
   `bin/agent-run.py` launcher, and `bin/agent-report.py` under
   `${CODEX_HOME:-$HOME/.codex}`. Claude Code does not need to be installed.
 - Merges the marked orchestrator section into global `AGENTS.md`, preserving
-  content outside that section. Existing instructions receive a backup when
+  content outside that section. The rollover command in it uses `python` on
+  Windows and `python3` elsewhere. Existing instructions receive a backup when
   changed. A global `AGENTS.override.md` is left alone and reported because it
   can shadow `AGENTS.md`.
 - Creates `config.toml` from `codex/config.example.toml` only when absent.

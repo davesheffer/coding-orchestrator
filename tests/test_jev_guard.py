@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import json
 import os
@@ -5,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -770,6 +772,61 @@ class GateTests(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(self.logs[-1]["decision"], "deny")
         self.assertEqual(self.logs[-1]["state_error"], "PermissionError")
+
+    def test_git_and_classifier_share_the_hook_deadline(self):
+        self.stage_change()
+        seen = []
+        real_run_git = jev._run_git
+
+        def spy_run_git(args, cwd, deadline=None):
+            seen.append(deadline)
+            return real_run_git(args, cwd, deadline)
+        ask_deadlines = []
+        real_ask = jev.ask
+
+        def spy_ask(*args, **kwargs):
+            ask_deadlines.append(kwargs.get("deadline"))
+            return real_ask(*args, **kwargs)
+        deadline = time.monotonic() + 3.0
+        with mock.patch.object(jev, "_run_git", spy_run_git), mock.patch.object(jev, "ask", spy_ask):
+            jev.gate(self.payload("git commit -m x"), self.cfg, self.classify(), self.logs.append,
+                     state_dir=self.state_dir, deadline=deadline)
+        self.assertTrue(seen)
+        self.assertTrue(all(d is not None and d <= deadline for d in seen), seen)
+        self.assertEqual(ask_deadlines, [deadline])
+
+    def test_slow_classifier_is_cut_off_at_the_hook_deadline(self):
+        self.stage_change()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def slow(body, key):
+            release.wait(5)
+            return risk_response()
+        start = time.monotonic()
+        with mock.patch.object(jev, "GATE_BUDGET_SECONDS", 0.6):
+            out = self.gate(self.payload("git commit -m x"), classify_fn=slow)
+        # Far below the 5 s the classifier would take, with room for a loaded machine.
+        self.assertLess(time.monotonic() - start, 2.5)
+        self.assertIsNone(out)
+        if self.logs:  # git may have used the whole budget under load, which also allows
+            self.assertEqual(self.logs[-1]["error"], "TimeoutError")
+
+    def test_spent_deadline_fails_open_without_classifier(self):
+        self.stage_change()
+        out = jev.gate(self.payload("git commit -m x"), self.cfg, self.classify(), self.logs.append,
+                       state_dir=self.state_dir, deadline=time.monotonic() - 1)
+        self.assertIsNone(out)
+        self.assertEqual(self.calls, [])
+
+    def test_string_or_bool_confidence_is_logged_as_none(self):
+        self.stage_change()
+        for i, confidence in enumerate(("0.9", True)):
+            out = self.gate(self.payload("git commit -m x", session_id=f"coerce{i}"),
+                            classify_fn=self.classify(confidence=confidence))
+            self.assertIsNotNone(out, confidence)
+            self.assertEqual(self.logs[-1]["decision"], "deny")
+            self.assertIsNone(self.logs[-1]["confidence"], confidence)
 
     def test_unavailable_classifier_is_logged_without_details(self):
         self.stage_change()
@@ -1576,6 +1633,51 @@ class UpdateStateTests(unittest.TestCase):
             jev.msvcrt.locking(held.fileno(), jev.msvcrt.LK_UNLCK, 1)
         jev.update_state(self.path, lambda s: s.__setitem__("x", 1))
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {"x": 1})
+
+    def test_held_lock_gives_up_at_deadline(self):
+        self.path.parent.mkdir(parents=True)
+        with open(self.path.with_name(self.path.name + ".lock"), "a+") as held:
+            if jev.fcntl is not None:
+                jev.fcntl.flock(held.fileno(), jev.fcntl.LOCK_EX)
+            else:
+                jev._msvcrt_lock(held)
+            try:
+                start = time.monotonic()
+                with mock.patch.object(jev, "MSVCRT_LOCK_SECONDS", 30):
+                    with self.assertRaises(OSError):
+                        jev.update_state(self.path, lambda s: s.__setitem__("x", 1),
+                                         deadline=time.monotonic() + 0.1)
+                self.assertLess(time.monotonic() - start, 0.8)
+            finally:
+                if jev.fcntl is not None:
+                    jev.fcntl.flock(held.fileno(), jev.fcntl.LOCK_UN)
+                else:
+                    held.seek(0)
+                    jev.msvcrt.locking(held.fileno(), jev.msvcrt.LK_UNLCK, 1)
+        self.assertFalse(self.path.exists())
+        jev.update_state(self.path, lambda s: s.__setitem__("x", 1), deadline=time.monotonic() + 1)
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {"x": 1})
+
+    def assert_lock_error_not_retried(self, target, name):
+        error = OSError(errno.EBADF, "bad file descriptor")
+        start = time.monotonic()
+        with mock.patch.object(target, name, side_effect=error) as lock, \
+                mock.patch.object(jev, "MSVCRT_LOCK_SECONDS", 30):
+            with self.assertRaises(OSError) as raised:
+                jev.update_state(self.path, lambda s: s.__setitem__("x", 1),
+                                 deadline=time.monotonic() + 30)
+        self.assertEqual(raised.exception.errno, errno.EBADF)
+        self.assertEqual(lock.call_count, 1)
+        self.assertLess(time.monotonic() - start, 1.0)
+        self.assertFalse(self.path.exists())
+
+    @unittest.skipUnless(jev.fcntl is not None, "fcntl locking is POSIX-only")
+    def test_flock_non_contention_error_raises_at_once(self):
+        self.assert_lock_error_not_retried(jev.fcntl, "flock")
+
+    @unittest.skipUnless(jev.fcntl is None and jev.msvcrt is not None, "msvcrt locking is Windows-only")
+    def test_msvcrt_non_contention_error_raises_at_once(self):
+        self.assert_lock_error_not_retried(jev.msvcrt, "locking")
 
 
 class PersistenceFailureTests(unittest.TestCase):

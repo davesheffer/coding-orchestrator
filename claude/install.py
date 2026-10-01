@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -128,6 +129,11 @@ def hook_python() -> str:
     return "python" if os.name == "nt" else "python3"
 
 
+def fill_placeholders(text: str, values: dict[str, str]) -> str:
+    """Substitute all placeholders in one pass, so a value is never rescanned."""
+    return re.sub("|".join(map(re.escape, values)), lambda match: values[match.group()], text)
+
+
 def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
     """Match only complete commands emitted by our current/legacy template."""
     if not isinstance(command, str):
@@ -245,8 +251,8 @@ def merge_hooks(existing: dict, template: dict, relay: Path) -> dict:
         for group in wanted_groups:
             copy = json.loads(json.dumps(group))
             for hook in copy["hooks"]:
-                hook["command"] = hook["command"].replace(
-                    "__PYTHON__", hook_python()).replace("__RELAY__", shlex.quote(str(relay)))
+                hook["command"] = fill_placeholders(hook["command"], {
+                    "__PYTHON__": hook_python(), "__RELAY__": shlex.quote(str(relay))})
             cleaned.append(copy)
         hooks[event] = cleaned
     return result
@@ -317,12 +323,11 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[1]
     dest = Path(os.environ.get("CLAUDE_HOME") or Path.home() / ".claude").expanduser().absolute()
     source_claude = (root / "CLAUDE.md").read_bytes()
-    pr_status = shlex.quote(str(dest / "bin/pr-status"))
-    if os.name == "nt":
-        pr_status = "python " + pr_status
-    source_claude = source_claude.replace(b"__PYTHON__", hook_python().encode()).replace(
-        b"__RELAY__", shlex.quote(str(dest / "relay/relay.py")).encode()
-    ).replace(b"__PR_STATUS__", pr_status.encode())
+    source_claude = fill_placeholders(source_claude.decode("utf-8"), {
+        "__PYTHON__": hook_python(),
+        "__RELAY__": shlex.quote(str(dest / "relay/relay.py")),
+        "__PR_STATUS__": f"{hook_python()} {shlex.quote(str(dest / 'bin/pr-status'))}",
+    }).encode("utf-8")
     managed_block(source_claude, root / "CLAUDE.md")
     hook_template = parse_json(root / "hooks.json", (root / "hooks.json").read_bytes())
 

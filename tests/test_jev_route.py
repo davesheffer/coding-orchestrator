@@ -196,7 +196,19 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(cfg["min_confidence"], 0.7)
         cfg = self.load({"escalate_mass": 5, "downgrade_min_confidence": True, "min_confidence": -1})
         self.assertEqual((cfg["escalate_mass"], cfg["downgrade_min_confidence"], cfg["min_confidence"]),
-                         (1.0, 0.8, 0.0))
+                         (0.4, 0.8, 0.5))
+
+    def test_huge_or_non_numeric_min_confidence_still_routes(self):
+        # float(10 ** 400) raises OverflowError; verdict/decide must not raise after load_config.
+        for bad in (10 ** 400, "high", [0.5], {"x": 1}):
+            with self.subTest(bad=repr(bad)[:20]):
+                cfg = self.load({"min_confidence": bad, "downgrade_min_confidence": bad})
+                self.assertEqual((cfg["min_confidence"], cfg["downgrade_min_confidence"]), (0.5, 0.8))
+                self.assertEqual(jev.verdict("opus", 0.6, None, cfg), ("applied", "opus", None))
+                logs = []
+                out = self.decide(self.payload, cfg, self.classify(), logs.append)
+                self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+                self.assertEqual(len(logs), 1)
 
     def test_no_escalation_below_mass(self):
         fn = self.probs("sonnet", 0.7, {"sonnet": 0.7, "opus": 0.2, "fable": 0.1})
@@ -405,17 +417,101 @@ class DecideTests(unittest.TestCase):
                 self.assertIsNone(logs[0]["confidence"])
                 self.assertTrue(logs[0]["reason"].endswith("skipped: invalid confidence"))
 
-    def test_invalid_label_non_string_choice_is_logged_not_raised(self):
+    def test_missing_or_non_string_choice_is_malformed_like_codex(self):
+        for answer in ({"type": "choice", "confidence": 0.9},
+                       {"type": "choice", "choice": ["opus", "x"], "confidence": 0.9},
+                       {"type": "choice", "choice": None, "confidence": 0.9}):
+            with self.subTest(answer=answer):
+                logs = []
+                self.assertIsNone(self.decide(self.payload, self.cfg,
+                                              lambda body, key: {"answers": {"model": answer}}, logs.append))
+                self.assertEqual(len(logs), 1)
+                self.assertEqual((logs[0]["applied"], logs[0]["reason"], logs[0]["error"]),
+                                 (False, "unavailable", "MalformedResponse"))
+                self.assertNotIn("choice", logs[0])
+                json.dumps(logs[0])
+        # An unknown string label stays "invalid label".
         logs = []
-        def fn(body, key):  # response() would key probabilities by the unhashable list
-            return {"answers": {"model": {"type": "choice", "choice": ["opus", "x"], "confidence": 0.9}}}
-        self.assertIsNone(self.decide(self.payload, self.cfg, fn, logs.append))
-        self.assertEqual(len(logs), 1)
-        entry = logs[0]
-        self.assertFalse(entry["applied"])
-        self.assertEqual(entry["choice"], repr(["opus", "x"]))
-        self.assertTrue(entry["reason"].endswith("skipped: invalid label"))
-        json.dumps(entry)
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="gpt"), logs.append))
+        self.assertEqual(logs[0]["choice"], repr("gpt"))
+        self.assertTrue(logs[0]["reason"].endswith("skipped: invalid label"))
+
+    def test_non_string_explicit_model_is_not_rewritten(self):
+        for model in (["opus"], {"model": "opus"}, 5, True, ["x" * 1000]):
+            with self.subTest(model=repr(model)[:20]):
+                self.calls.clear()
+                self.payload["tool_input"]["model"] = model
+                logs = []
+                self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(), logs.append))
+                self.assertEqual(self.calls, [])
+                self.assertEqual(len(logs), 1)
+                entry = logs[0]
+                self.assertEqual((entry["applied"], entry["reason"]), (False, "skipped: invalid model"))
+                self.assertEqual(entry["current"], jev.safe_repr(model))
+                self.assertLess(len(json.dumps(entry)), 400)
+        # Disabled: still unchanged, and silent like every other disabled path.
+        logs = []
+        self.assertIsNone(self.decide(self.payload, {**self.cfg, "enabled": False}, self.classify(), logs.append))
+        self.assertEqual(logs, [])
+
+    def test_empty_or_blank_model_is_unset(self):
+        self.agent(self.home, "builder", "opus")
+        for model in ("", "   "):
+            with self.subTest(model=model):
+                self.payload["tool_input"]["model"] = model
+                logs = []
+                # Falls back to the frontmatter model (opus), so opus is the same tier...
+                self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="opus"), logs.append))
+                self.assertEqual(logs[-1]["current"], "opus")
+                self.assertTrue(logs[-1]["reason"].endswith("skipped: same model"))
+                # ...and an upgrade is applied like with no model at all.
+                out = self.decide(self.payload, self.cfg, self.classify(choice="fable", confidence=0.9))
+                self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "fable")
+
+    def test_huge_subagent_type_is_bounded(self):
+        huge = ["x" * 5000]
+        self.payload["tool_input"]["subagent_type"] = huge
+        for model in ("sonnet", ["opus"]):  # normal path, then invalid-model path
+            with self.subTest(model=model):
+                self.calls.clear()
+                self.payload["tool_input"]["model"] = model
+                logs = []
+                self.decide(self.payload, self.cfg, self.classify(), logs.append)
+                self.assertEqual(logs[0]["subagent_type"], jev.safe_repr(huge))
+                self.assertLess(len(json.dumps(logs[0])), 1000)
+                if self.calls:
+                    self.assertEqual(self.calls[0][0]["state"]["subagent_type"], jev.safe_repr(huge))
+
+    def test_junk_max_prompt_chars_still_routes(self):
+        cfg = self.load({"max_prompt_chars": "6000x"})
+        self.assertEqual(cfg["max_prompt_chars"], 6000)
+        out = self.decide(self.payload, cfg, self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+
+    def test_oversized_current_is_bounded_in_log_and_reason(self):
+        self.payload["tool_input"]["model"] = "m" * 10000
+        logs = []
+        out = self.decide(self.payload, self.cfg, self.classify(), logs.append)
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(logs[0]["current"], jev.safe_repr("m" * 10000))
+        self.assertLess(len(reason), 200)
+        self.assertLess(len(json.dumps(logs[0])), 1000)
+        self.assertEqual(jev.display_model({"a": [1]}), repr({"a": [1]}))
+        self.assertEqual(jev.display_model(None), "inherit")
+
+    def test_opusplan_is_opus_tier(self):
+        self.assertEqual(jev.model_tier("opusplan", jev.TIER_RANK), "opus")
+        self.assertEqual(jev.model_tier("OpusPlan", jev.AGENT_MODELS), "opus")
+        self.payload["tool_input"]["model"] = "opusplan"
+        logs = []
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="opus"), logs.append))
+        self.assertEqual(logs[-1]["current"], "opusplan")
+        self.assertTrue(logs[-1]["reason"].endswith("skipped: same model"))
+        # A downgrade from opusplan needs downgrade confidence, as from opus.
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.7)))
+        del self.payload["tool_input"]["model"]
+        self.agent(self.home, "builder", "opusplan")
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="opus")))
 
     def test_invalid_label_choice_is_truncated_and_ascii_safe_in_log(self):
         long_choice = "x" * 200
