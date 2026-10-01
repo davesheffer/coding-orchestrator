@@ -142,7 +142,10 @@ def pinned(tool_input, cfg):
     """True when the call is never classified (pinned agent or respected explicit model)."""
     if tool_input.get("subagent_type") in (cfg.get("pinned_agents") or []):
         return True
-    return bool(cfg.get("respect_explicit_model") and tool_input.get("model"))
+    model = tool_input.get("model")
+    # Same predicate as current_model: only a non-blank string pins; a non-string is invalid
+    # (logged by decide), not a silent pin.
+    return bool(cfg.get("respect_explicit_model") and isinstance(model, str) and model.strip())
 
 
 def desc_hash(description):
@@ -153,8 +156,9 @@ def desc_hash(description):
 
 
 def build_state(tool_input, cfg):
+    description = tool_input.get("description")  # a non-string counts as absent
     state = {"subagent_type": bounded(tool_input.get("subagent_type") or "general-purpose"),
-             "description": tool_input.get("description") or ""}
+             "description": description if isinstance(description, str) else ""}
     if cfg.get("send_prompt", True):
         state["prompt"] = str(tool_input.get("prompt") or "")[:int(cfg["max_prompt_chars"])]
     return state

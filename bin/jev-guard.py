@@ -82,8 +82,14 @@ REPLACE_RETRY_SECONDS = 0.05
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
-    ROOT, ask, coerce_confidence, elapsed_ms, feature_enabled, load_config, noul, timestamp,
-    write_log)
+    DEFAULTS, ROOT, ask, coerce_confidence, config_number, elapsed_ms, feature_enabled, load_config,
+    noul, timestamp, write_log)
+
+def _char_limit(cfg, key):
+    """cfg[key] as a non-negative whole number of characters; junk falls back to its default."""
+    value = config_number(cfg.get(key), 0.0, float(1 << 40))
+    return int(value) if value is not None and value.is_integer() else DEFAULTS[key]
+
 
 STATE_DIR = ROOT / "relay" / "state"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -1173,7 +1179,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     targets.sort(key=lambda t: t[0] == "push")
 
     git_deadline = min(entered + GIT_SUBPROCESS_BUDGET_SECONDS, deadline)
-    max_diff_chars = int(cfg.get("max_diff_chars") or 0)
+    max_diff_chars = _char_limit(cfg, "max_diff_chars")
     diff = ""
     names = []
     paths = []  # where each name's mtime is read for critic coverage
@@ -1273,8 +1279,8 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     ask_state = {"operation": op, "files": names[:200]}
     if cfg.get("send_diff"):
         # Hunks of secret-looking files and common token shapes never leave the machine.
-        ask_state["diff"] = _scrub(_redact_diff(_diff_prefix(diff, cfg["max_diff_chars"])))[
-            : cfg["max_diff_chars"]]
+        ask_state["diff"] = _scrub(_redact_diff(_diff_prefix(diff, max_diff_chars)))[
+            : max_diff_chars]
     questions = {
         "risk": {"type": "choice", "instructions": RISK_INSTRUCTIONS, "criteria": RISK_CRITERIA},
         "needs_review": {"type": "noul", "instructions": NEEDS_REVIEW_INSTRUCTIONS},
@@ -1385,7 +1391,7 @@ def _analyze_report(text, cfg, classify_fn=None, confidence_heuristic=True, gap_
     only applied to what's actually sent to the classifier below, after common token
     shapes are scrubbed. `errors` is passed to `ask` (a failed call appends its reason),
     and so is `deadline`, the hook's shared time.monotonic() deadline."""
-    max_chars = cfg["max_report_chars"]
+    max_chars = _char_limit(cfg, "max_report_chars")
 
     sections = _parse_sections(text)
     reasons = []
