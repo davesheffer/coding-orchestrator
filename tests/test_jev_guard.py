@@ -959,6 +959,99 @@ class GateTests(unittest.TestCase):
             jev._scan_targets(command, "/repo")
             self.assertLess(time.monotonic() - start, 2.0, command[:30])
 
+    def _assert_cwds_among(self, command, op, *cwds):
+        targets = [t[:2] for t in jev._scan_targets(command, "/repo")]
+        for cwd in cwds:
+            self.assertIn((op, cwd), targets, command)
+
+    def test_issue_57_cd_after_or(self):
+        # bash: `cd q || cd sub` stays in q when q exists, and a `git add .` that
+        # succeeds skips the cd after its `||`; the cd's own directory stays a target.
+        j = os.path.join
+        self._assert_cwds_among("cd q || cd sub && git commit", "commit",
+                                j("/repo", "q"), j("/repo", "q", "sub"))
+        self._assert_cwds_among('git add . || cd -- "d e" && ( git push )', "push",
+                                "/repo", j("/repo", "d e"))
+        # A blank segment after the `||` keeps it (bash: /repo/a).
+        self._assert_cwds_among("cd a ||\n cd b; git push", "push", j("/repo", "a"))
+        # The cd right before a `||` failed (bash, with no `nope` dir).
+        for command, op, cwd in (("cd nope || cd sub && git commit", "commit", j("/repo", "sub")),
+                                 ("cd a && cd nope || cd b; git push", "push", j("/repo", "a", "b")),
+                                 ("cd nope || { cd b; git push; }", "push", j("/repo", "b"))):
+            self._assert_cwds_among(command, op, cwd)
+
+    def test_issue_57_case_branches(self):
+        # Each branch's end cwd (bash: `case x in x) cd sub;; …` leaves /repo/sub), the cwd
+        # before the case, a `;&` fall-through, and two cases in sequence (bash: x/y).
+        j = os.path.join
+        for command, op, cwds in (
+                ("case x in x) cd sub;; y) cd a;; esac; git commit", "commit",
+                 ("/repo", j("/repo", "sub"), j("/repo", "a"))),
+                ("case a in a) cd x;; esac\ncase b in b) cd y;; esac; git push", "push",
+                 ("/repo", j("/repo", "x", "y"), j("/repo", "y"))),
+                ("case a in a) cd x;& b) cd y;; esac; git push", "push",
+                 ("/repo", j("/repo", "x", "y"), j("/repo", "y"))),
+                ("case a in a) cd x;;& b) cd y;; esac; git push", "push",
+                 (j("/repo", "x", "y"), j("/repo", "x"))),
+                ("case x in x) cd sub\nesac; git push", "push", ("/repo", j("/repo", "sub"))),
+                ("cd w; case x in x) case y in y) cd a;; esac; cd b;; esac; git push", "push",
+                 (j("/repo", "w"), j("/repo", "w", "a", "b"), j("/repo", "w", "b"))),
+                ("(case x in x) cd sub;; esac); git push", "push", ("/repo",))):
+            self._assert_cwds_among(command, op, *cwds)
+        # Subshells restore while branch cds count (bash: /repo/d e when $y matches).
+        command = ('( cd -P "d e" && git add . )\ncase "$y" in a|b) cd "d e";; esac; '
+                   "git commit --all")
+        targets = jev._scan_targets(command, "/repo")
+        for cwd in ("/repo", j("/repo", "d e")):
+            self.assertIn(("commit", cwd, True, None), targets)
+        # The branch ends kept per case are capped, the earliest first.
+        command = ("case x in " + "".join(f"p{i}) cd d{i};; " for i in range(40))
+                   + "esac; git push")
+        cwds = [t[1] for t in jev._scan_targets(command, "/repo")]
+        for cwd in ["/repo"] + [j("/repo", f"d{i}") for i in range(jev.MAX_CASE_BRANCHES - 1)]:
+            self.assertIn(cwd, cwds)
+        self.assertNotIn(j("/repo", "d39"), cwds)
+
+    def test_issue_57_escaped_blank_in_option_value(self):
+        j = os.path.join
+        for command, op, cwd in (("git -C a\\ b push", "push", j("/repo", "a b")),
+                                 ("git -C a\\ b -C c\\\\d commit -m x", "commit",
+                                  j("/repo", "a b", "c\\d")),
+                                 ("git -c x=a\\ b --foo=c\\ d push", "push", "/repo"),
+                                 ('git -C "a"\\ b push', "push", j("/repo", "a b"))):
+            self.assertEqual([t[:2] for t in jev._scan_targets(command, "/repo")], [(op, cwd)],
+                             command)
+        # `a\\` is a whole value, so `b` is the subcommand; a backslash-newline still
+        # ends the value as before.
+        self.assertEqual(self._ops("git -C a\\\\ b push"), [])
+        self.assertTrue(jev.GIT_COMMAND_RE.search("git -C a\\\npush"))
+
+    def test_issue_57_all_flag_search_is_shared(self):
+        # _all_args agrees with each match's own segment search.
+        for command in ("git commit -a (git commit (git commit -m x", "git commit-a",
+                        "git commit (git push -a", "git commit -m x; git commit --all",
+                        "git commit\tgit commit -am x | git push", "(git commit -a(git commit)"):
+            matches = list(jev.GIT_COMMAND_RE.finditer(command))
+            self.assertTrue(matches, command)
+            expected = []
+            for m in matches:
+                end = jev._SEGMENT_END_RE.search(command, m.end())
+                expected.append(bool(jev.ALL_FLAG_RE.search(
+                    command[m.end():end.start() if end else len(command)])))
+            self.assertEqual(jev._all_args(command, matches), expected, command)
+
+    def test_issue_57_constructs_scan_fast(self):
+        # The first was quadratic (6.5 s at 20000).
+        for command, label in (("git commit -a (" * 20000, "commits without separators"),
+                               ("cd q || cd sub && " * 10000 + "git push", "cds after ||"),
+                               ("case x in a) cd a;; " * 10000 + "esac; git push", "case branches"),
+                               ("git -C a\\ b " * 10000 + "push", "escaped -C values"),
+                               ("case x in " + "".join(f"p{i}) cd d{i};; " for i in range(40))
+                                + "esac; " + "cd a; " * 10000 + "git push", "branch cds")):
+            self._assert_scans_fast(command, label)
+            self._assert_fast(lambda: jev._scan_targets(command, "/repo"), label)
+        self.assertTrue(jev._scan_targets("git commit -a (" * 3, "/repo")[0][2])
+
     # ---- command forms, multiple ops, push base, redaction ----
 
     def test_command_forms_detected(self):
