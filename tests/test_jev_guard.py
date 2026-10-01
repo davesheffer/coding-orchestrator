@@ -1052,6 +1052,172 @@ class GateTests(unittest.TestCase):
             self._assert_fast(lambda: jev._scan_targets(command, "/repo"), label)
         self.assertTrue(jev._scan_targets("git commit -a (" * 3, "/repo")[0][2])
 
+    def _cwds(self, command, op=None):
+        return {t[1] for t in jev._scan_targets(command, "/repo") if op in (None, t[0])}
+
+    def test_issue_63_command_substitution_output(self):
+        # bash runs the output of a command-position substitution as a command (here
+        # `cd b`), so git runs in /repo/b.
+        j = os.path.join
+        for command in ("`echo cd b`; git commit", "$(echo cd b); git commit",
+                        "$(printf 'cd b'); git commit", "x; $(echo \"cd\" b) && git commit",
+                        "$(echo -n cd b)\ngit commit", "$(echo -ne cd b); git commit", "true && `echo cd b` && git commit"):
+            self.assertIn(j("/repo", "b"), self._cwds(command, "commit"), command)
+        self.assertEqual(self._ops("$(echo git push)"), ["push"])
+        # Not read as a command: an operator or expansion in the output, a format, or
+        # a substitution that isn't at command position.
+        for command in ("$(echo 'cd b; x'); git commit", "$(echo cd $d); git commit",
+                        "$(printf 'cd %s' b); git commit", "x=$(echo cd b); git commit",
+                        "$(echo cd b | cat); git commit", "$(ls cd b); git commit"):
+            self.assertEqual(self._cwds(command, "commit"), {"/repo"}, command)
+
+    def test_issue_63_heredoc_substitutions(self):
+        # An unquoted heredoc body is expanded, so its `$( )` and backtick commands run
+        # in the cwd of the heredoc's command.
+        j = os.path.join
+        for command, op, cwd in (
+                ("cat <<EOF\n$(git push)\nEOF\n", "push", "/repo"),
+                ("cd a; cat <<EOF\n`git push`\nEOF\n", "push", j("/repo", "a")),
+                ("cat <<-EOF\n\t$(cd b; git push)\n\tEOF\n", "push", j("/repo", "b")),
+                ("cat <<EOF\n$(git push)\n", "push", "/repo"),
+                ("cat <<-EOF\n$(git push)", "push", "/repo"),
+                ("cat <<EOF\nx $(echo $(git push)) y\nEOF", "push", "/repo"),
+                ("cat <<EOF >out\n$(git commit -m x)\nEOF\n", "commit", "/repo"),
+                ("cat <<A <<B\n$(true)\nA\n$(git commit -m x)\nB\n", "commit", "/repo"),
+                ("cat <<EOF; cd b\n$(git push)\nEOF\n", "push", "/repo"),
+                ("echo $(cat <<EOF\n$(git push)\nEOF\n)", "push", "/repo"),
+                ("cat <<EOF\n$(cat <<E2\n$(git push)\nE2\n)\nEOF\n", "push", "/repo"),
+                ("cat <<EOF\n$(echo \"a)\"; git push)\nEOF\n", "push", "/repo")):
+            self.assertIn(cwd, self._cwds(command, op), command)
+        # Inert: a quoted or escaped delimiter, an escaped substitution, an arithmetic,
+        # and plain text.
+        for command in ("cat <<'EOF'\n$(git push)\nEOF\n", "cat <<\"EOF\"\n$(git push)\nEOF\n",
+                        "cat <<\\EOF\n$(git push)\nEOF\n", "cat <<EOF\n\\$(git push)\nEOF\n",
+                        "cat <<EOF\n\\`git push\\`\nEOF\n", "cat <<EOF\n$((1+2)) git push\nEOF\n",
+                        "cat <<EOF\ngit push\nEOF\n"):
+            self.assertEqual(self._ops(command), [], command)
+        # The commands run before the heredoc command, which keeps its own words (a cd
+        # still resolves, and its -a flag stays).
+        for command in ("cd a <<EOF; git push\n$(true)\nEOF\n",
+                        "cd a <<EOF\n$(true)\nEOF\ngit push",
+                        "cd a <<EOF && git push\n$(true)\nEOF\n",
+                        "cd \"a b\" <<EOF; git push\n$(true)\nEOF\n",
+                        "cd a <<EOF >/dev/null; git push\n$(true)\nEOF\n",
+                        "cd a <<EOF <<B; git push\n$(true)\nEOF\n$(true)\nB\n",
+                        "cd a >&2 <<EOF; git push\n`true`\nEOF\n"):
+            expected = os.path.join("/repo", "a b" if '"a b"' in command else "a")
+            self.assertIn(expected, self._cwds(command, "push"), command)
+        self.assertIn(os.path.join("/repo", "a"),
+                      self._cwds("cd a && cat <<EOF\n$(git push)\nEOF\n", "push"))
+        # A `$( )` in the heredoc command's words stays whole: the commands go before the
+        # command, so the git is still found, with its -a flag.
+        for command, cwd in (
+                ("git -C $(pwd) commit -am x <<EOF\n$(true)\nEOF\n", "/repo"),
+                ("git commit --date=$(date -R) -a -F - <<EOF\nRelease $(cat VERSION)\nEOF\n",
+                 "/repo"),
+                ("git commit -m $(date +%s) -a <<EOF\n$(true)\nEOF\n", "/repo"),
+                ("cd a; git commit --author=$(whoami) -am x <<EOF\n$(true)\nEOF\n",
+                 os.path.join("/repo", "a")),
+                ("x=$(cd b; cat <<EOF\n$(git push)\nEOF\n)", os.path.join("/repo", "b"))):
+            targets = jev._scan_targets(command, "/repo")
+            self.assertTrue(targets, command)
+            self.assertIn(cwd, {t[1] for t in targets}, command)
+            if "commit" in command:
+                self.assertTrue(any(t[0] == "commit" and t[2] for t in targets), command)
+        # A pipeline stage's cd runs in a subshell, so the commands go before the
+        # pipeline (the last real segment), not before the stage.
+        a = os.path.join("/repo", "a")
+        for command, cwd in (("true | cd a <<EOF\n$(true)\nEOF\ngit push", "/repo"),
+                             ("true |& cd a <<EOF\n$(true)\nEOF\ngit push", "/repo"),
+                             ("true | cd a <<EOF; git push\n$(true)\nEOF\n", "/repo"),
+                             ("cd a; echo | cd b <<EOF\n$(git push)\nEOF\ngit commit -m x", a),
+                             ("cd a; x | cat <<EOF\n$(git push)\nEOF\n", a),
+                             ("cd a; x & cat <<EOF\n$(git push)\nEOF\n", a)):
+            self.assertIn(cwd, self._cwds(command), command)
+        self.assertEqual(self._cwds("true | cd a <<EOF\n$(true)\nEOF\ngit push"), {"/repo"})
+        # The inserted commands don't hide that a cd follows an `||`.
+        j = os.path.join
+        self._assert_cwds_among("cd nope || cd b <<EOF\n$(true)\nEOF\ngit push", "push",
+                                j("/repo", "nope"), j("/repo", "b"))
+        self._assert_cwds_among("cd a && cd nope || cd b <<EOF\n$(true)\nEOF\ngit push", "push",
+                                j("/repo", "a", "b"), j("/repo", "a", "nope"))
+        # The heredoc's own line keeps its -a flag.
+        command = "git commit <<EOF -am x\n$(true)\nEOF\n"
+        self.assertEqual([t[:3] for t in jev._scan_targets(command, "/repo")],
+                         [("commit", "/repo", True)])
+
+    def test_issue_63_mixed_or_chains(self):
+        j = os.path.join
+        # Every success/failure combination (bash: b when `nope` and `a` fail; c when
+        # also `b` does; a when it succeeds).
+        for command, cwds in (
+                ("cd nope || cd b || cd c; git push", ("b", "c", "nope")),
+                ("cd a || cd b || cd c; git push", ("a", "b", "c")),
+                ("cd w && cd x || cd y && cd z || cd v; git push",
+                 (j("w", "y", "z"), j("w", "y", "v"), j("w", "x", "z"))),
+                ("cd a || cd b || cd c || cd d || cd e; git commit", ("a", "b", "c", "d", "e"))):
+            self._assert_cwds_among(command, command[-3:] == "mit" and "commit" or "push",
+                                    *[j("/repo", c) for c in cwds])
+        # With more than MAX_OR_ENUM only the two one-sided readings are kept.
+        command = "cd a || cd b || cd c || cd d || cd e || cd f; git push"
+        cwds = self._cwds(command)
+        self.assertEqual({j("/repo", "a"), j("/repo", "f")} - cwds, set())
+        self.assertNotIn(j("/repo", "b"), cwds)
+
+    def test_issue_63_case_with_or(self):
+        j = os.path.join
+        for command, cwds in (
+                ("case x in x) cd a;; esac || cd b; git push", ("a", "b")),
+                ("case x in x) cd a;; esac && cd b || cd c; git push", (j("a", "b"), j("a", "c"))),
+                ("case x in x) cd a;; esac || cd b && cd c || cd d; git push", (j("a", "c"),)),
+                ("case x in y) cd a;; esac || cd b; git push", (".", "b"))):
+            self._assert_cwds_among(command, "push", *[j("/repo", c) if c != "." else "/repo"
+                                                       for c in cwds])
+        # Without a case the old readings are unchanged.
+        self._assert_cwds_among("cd a || cd b; git push", "push", j("/repo", "a"))
+
+    def test_issue_63_target_cap(self):
+        command = ("case x in " + "".join(f"p{i}) cd d{i};; " for i in range(16))
+                   + "esac; " + "cd a; git push; " * 40)
+        with self.assertRaises(jev.TooManyTargets):
+            jev._scan_targets(command, "/repo", jev.MAX_TARGETS)
+        # Exactly the cap is fine, and a scan without a cap is unchanged.
+        at_cap = "".join(f"git -C d{i} push;" for i in range(jev.MAX_TARGETS))
+        self.assertEqual(len(jev._scan_targets(at_cap, "/repo", jev.MAX_TARGETS)), jev.MAX_TARGETS)
+        with self.assertRaises(jev.TooManyTargets):
+            jev._scan_targets(at_cap + "git -C x push", "/repo", jev.MAX_TARGETS)
+        self.assertGreater(len(jev._scan_targets(command, "/repo")), jev.MAX_TARGETS)
+        # The gate denies instead of reviewing a subset.
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        hook = out["hookSpecificOutput"]
+        self.assertEqual(hook["permissionDecision"], "deny")
+        self.assertIn("Too many git targets to review", hook["permissionDecisionReason"])
+        self.assertEqual(self.calls, [])
+        self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
+                         ("deny", "too_many_targets"))
+        # Ordinary commands are unaffected.
+        self.assertIsNone(self.gate(self.payload(at_cap), classify_fn=self.classify()))
+        self.stage_change()
+        out = self.gate(self.payload("cd . || cd x; git commit -m x"),
+                        classify_fn=self.classify())
+        self.assertIn("security", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_issue_63_constructs_scan_fast(self):
+        for command, label in (("$(echo cd b); " * 10000 + "git push", "echo substitutions"),
+                               ("; `echo " * 10000 + "git push", "unclosed backticks"),
+                               ("cat <<EOF\n$(git push)\nEOF\n" * 5000, "heredoc commands"),
+                               ("cat <<EOF\n" + "$(" * 20000 + "\nEOF\n", "open heredoc commands"),
+                               ("cat <<EOF\n" + "`" * 20000 + "\nEOF\n", "heredoc backticks"),
+                               ("cat <<EOF\n$(" + "cat <<E2\n$(git push)\nE2\n" * 5000 + ")\nEOF\n",
+                                "nested heredocs"),
+                               ("cd a || cd b || cd c || cd d; " + "git push; " * 10000,
+                                "enumerated ||"),
+                               ("case x in a) cd a;; esac || cd b && cd c || cd d; "
+                                + "git push; " * 10000, "case with ||"),
+                               ("case x in a) cd a;; esac; " + "cd q || cd sub && " * 10000
+                                + "git push", "case with many ||")):
+            self._assert_fast(lambda: jev._scan_targets(command, "/repo"), label)
+
     # ---- command forms, multiple ops, push base, redaction ----
 
     def test_command_forms_detected(self):
