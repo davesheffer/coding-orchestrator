@@ -567,7 +567,7 @@ class GateTests(unittest.TestCase):
         targets = jev._scan_targets("git commit -m x;" * 5000 + "git -C other push", "/repo")
         self.assertLess(time.monotonic() - start, 2.0)
         # Every match is resolved: the last push keeps its own directory.
-        self.assertIn(("push", os.path.join("/repo", "other"), False), targets)
+        self.assertIn(("push", os.path.join("/repo", "other"), False, None), targets)
         # Repeated quoted global options once backtracked exponentially (25 s at 26).
         for n in (30, 60):
             for command in ("git " + '-C "a" ' * n + "status; git push --force",
@@ -606,7 +606,7 @@ class GateTests(unittest.TestCase):
         # quoted value must not move the later push to that directory.
         for opt in ('--git-dir "', '--work-tree="', '-c "'):
             command = "git " + opt + '\ncd sub\n" status; git push'
-            self.assertEqual(jev._scan_targets(command, "/repo"), [("push", "/repo", False)], command)
+            self.assertEqual(jev._scan_targets(command, "/repo"), [("push", "/repo", False, None)], command)
 
     def test_arithmetic_shift_is_not_a_heredoc(self):
         command = "echo $((1<<3))\ngit push --force\n3\n"
@@ -648,6 +648,292 @@ class GateTests(unittest.TestCase):
                         "echo $(( ( 1 ))\ncat <<EOF\ndon't\nEOF\ngit push -f 'x'\n"):
             self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")][-1:],
                              ["commit" if "commit" in command else "push"], command)
+
+    def _ops(self, command):
+        return [t[0] for t in jev._scan_targets(command, "/repo")]
+
+    def test_issue_39_detections(self):
+        for command, op in (
+                # A heredoc inside a `$( )` nested in `$(( ))` is still a heredoc.
+                ("x=$(( $(cat <<EOF | wc -c\ndon't\nEOF\n) ))\ngit push -f 'x'\n", "push"),
+                # A case pattern inside that `$( )` doesn't close it early.
+                ("echo $(( $(case x in a) echo 1;; esac) <<3 ))\ngit push\n3\n", "push"),
+                # `((1) …)` is nested subshells: the no-arithmetic reading catches it.
+                ("((1) ; cat <<EOF\n\"\nEOF\ngit push \"x\")\n", "push"),
+                # A backslash-newline splitting an operator.
+                ("cat <\\\n<EOF\n\"\nEOF\ngit push \"x\"\n", "push"),
+                ("cat <<\\\nEOF\n\"\nEOF\ngit push \"x\"\n", "push"),
+                ("cat <\\\n<\\\nEOF\n\"\nEOF\ngit push \"x\"\n", "push"),
+                ("echo $\\\n(( $(cat <<EOF | wc -c\ndon't\nEOF\n) ))\ngit push -f 'x'\n", "push"),
+                ("(\\\n(1<<3))\ngit push\n3\n", "push"),
+                # Quoting and option parsing.
+                ('git -C "a\\" b" push', "push"),
+                ("git --git-dir -x push", "push"),
+                ("GIT.EXE commit -m x", "commit"),
+                ("Git push", "push"),
+                ("/opt/{x}/git push", "push"),
+                ('"/opt/git(1)/bin/git" push', "push"),
+                ("'git' push", "push"),
+                ('"C:\\Program Files\\Git\\cmd\\git.exe" commit -m x', "commit"),
+                ("X=a\\ b git push", "push"),
+                ('git -c "x; git push" commit -m y', "commit")):
+            self.assertEqual(self._ops(command), [op], command)
+        # `X=/usr/bin/git push` runs `push`, not git.
+        for command in ("X=/usr/bin/git push", 'echo "git" push'):
+            self.assertEqual(self._ops(command), [], command)
+
+    def test_issue_39_cwd(self):
+        j = os.path.join
+        for command, cwd in (
+                ('cd -- "dir" && git push', j("/repo", "dir")),
+                ('cd -P "dir" && git push', j("/repo", "dir")),
+                ("(cd build && make) && git push", "/repo"),
+                ("x=$(cd sub && pwd); git push", "/repo"),
+                ("X=`cd sub`; git push", "/repo"),
+                ("(cd sub && git push)", j("/repo", "sub")),
+                ('git -C "\ncd sub\n" status; git push', "/repo"),
+                ('git --foo-C "\ncd sub\n" status; git push', "/repo"),
+                ('git -c x=' + "a" * 600 + ' --foo-c "\ncd sub\n" status; git push', "/repo"),
+                ('git -c x=' + "a" * 600 + ' --foo-C "\ncd sub\n" status; git push', "/repo"),
+                ("git -C $JEV_UNSET_39 push", "/repo"),
+                ('cd "$JEV_UNSET_39" && git push', "/repo"),
+                ("git -C a -C b push", j("/repo", "a", "b"))):
+            targets = jev._scan_targets(command, "/repo")
+            self.assertEqual([t[1] for t in targets], [cwd], command)
+
+    def test_issue_39_git_dir_and_work_tree(self):
+        j = os.path.join
+        for command, target in (
+                ('git --git-dir="other/.git" push',
+                 ("push", "/repo", False, ("--git-dir", j("/repo", "other/.git")))),
+                ("git --git-dir other/.git --work-tree 'o t' push",
+                 ("push", j("/repo", "o t"), False,
+                  ("--git-dir", j("/repo", "other/.git"), "--work-tree", j("/repo", "o t")))),
+                ("git -C sub --git-dir=/opt/x.git commit -m y",
+                 ("commit", j("/repo", "sub"), False, ("--git-dir", "/opt/x.git"))),
+                # A --work-tree alone keeps the cwd (repository discovery) but is passed on.
+                ("git --work-tree w commit -m y",
+                 ("commit", "/repo", False, ("--work-tree", j("/repo", "w"))))):
+            self.assertEqual(jev._scan_targets(command, "/repo"), [target], command)
+        # The diff is taken from the named repository, not the payload cwd's.
+        repo = self.repo.as_posix()
+        self.assert_detected(f'git --git-dir="{repo}/.git" --work-tree="{repo}" commit -m x',
+                             cwd=tempfile.gettempdir())
+
+    def test_issue_39_work_tree_threaded_to_git(self):
+        with mock.patch.object(jev.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
+            jev._run_git(["status"], "/repo", git_opts=("--work-tree", "/w"))
+        self.assertEqual(run.call_args[0][0], ["git", "--work-tree", "/w", "status"])
+        # `commit -a` with only a --work-tree diffs that work tree (the repository is
+        # still discovered from the cwd), not the cwd's own clean checkout.
+        work = self.repo.parent / "work"
+        work.mkdir()
+        (work / "a.txt").write_text("changed\n", encoding="utf-8")
+        out = self.gate(self.payload(f'git --work-tree="{work.as_posix()}" commit -am x'),
+                        classify_fn=self.classify())
+        self.assertIsNotNone(out)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_issue_39_case_pattern_in_subshell_keeps_cwd(self):
+        # A case pattern's `)` inside a subshell doesn't restore the cwd from before it.
+        j = os.path.join
+        other = j("/repo", "other")
+        self.assertEqual([t[:2] for t in jev._scan_targets(
+            "(cd other && case $x in y) git push;; esac)", "/repo")], [("push", other)])
+        # Nested cases and a subshell after `esac`: checked on the normal reading (the
+        # union with the no-restore reading in _scan_targets adds spurious cwds).
+        command = ("(cd other && case $a in x) case $b in y) true;; esac; git push;; esac; "
+                   "(cd sub && make); git commit -m m); git push")
+        cd_index = jev._cd_dirs(command)
+        self.assertEqual([jev._git_target(command, m, "/repo", None, cd_index)[:2]
+                          for m in jev.GIT_COMMAND_RE.finditer(command)],
+                         [("push", other), ("commit", other), ("push", "/repo")])
+        targets = [t[:2] for t in jev._scan_targets(command, "/repo")]
+        for target in (("push", other), ("commit", other), ("push", "/repo")):
+            self.assertIn(target, targets)
+        self.assertEqual([t[:2] for t in jev._scan_targets(
+            '(cd other && case "$x" in y) git push;; esac)', "/repo")], [("push", other)])
+
+    def _normal_reading(self, command):
+        # (op, cwd) per git match with the normal cd reading only (no no-restore union).
+        stripped = jev._strip_heredocs_and_quotes(command)
+        cd_index = jev._cd_dirs(stripped)
+        return [jev._git_target(stripped, m, "/repo", None, cd_index)[:2]
+                for m in jev.GIT_COMMAND_RE.finditer(stripped)]
+
+    def test_issue_39_case_word_with_blanks_keeps_cwd(self):
+        # A case word with blanks inside a `$( )`/`${ }`/backtick substitution opens a
+        # case, so its pattern `)` doesn't close the subshell; with a `case` in the
+        # command, the reading where no `)` restores the cwd is added as well.
+        j = os.path.join
+        other = ("push", j("/repo", "other"))
+        for command in ("(cd other && case $(uname -s) in Linux) git push;; esac)",
+                        "(cd other && case ${x:-a b} in y) git push;; esac)",
+                        "(cd other && case $(f $(g)) in y) git push;; esac)",
+                        "(cd other && case `uname -s` in y) git push;; esac)"):
+            self.assertEqual(self._normal_reading(command), [other], command)
+            self.assertIn(other, [t[:2] for t in jev._scan_targets(command, "/repo")], command)
+        command = "(cd a; X=$(cd b); case $(uname -s) in p) git push;; esac)"
+        self.assertEqual(self._normal_reading(command), [("push", j("/repo", "a"))])
+        self.assertIn(("push", j("/repo", "a")), [t[:2] for t in jev._scan_targets(command, "/repo")])
+
+    def test_issue_39_esac_right_after_pattern(self):
+        # `p)esac` closes the case, so the `)` after `cd b` ends the subshell.
+        command = "(cd a; case x in p)esac; cd b); git push"
+        self.assertEqual(self._normal_reading(command), [("push", "/repo")])
+        self.assertIn(("push", "/repo"), [t[:2] for t in jev._scan_targets(command, "/repo")])
+
+    def test_issue_39_case_branch_cd(self):
+        # A case pattern's `)` splits nothing, so `pattern) cd dir` moves nothing in the
+        # normal reading (as before #39); the cwd before the case is always a target,
+        # and the branch's own directory is one too (the branch may run).
+        j = os.path.join
+        for command, before, branch in (
+                ('case "$1" in deploy) cd ../other;; esac\ngit push', "/repo", j("/repo", "../other")),
+                ("case $x in a) cd sub;; esac; git push", "/repo", j("/repo", "sub")),
+                ("cd a; case $x in a) cd b;; b) cd c;; esac; git push", j("/repo", "a"), None),
+                ("case $x in\n  a) cd sub ;;\nesac\ngit push", "/repo", j("/repo", "sub")),
+                ("case x in a) cd sub; git push;; esac", "/repo", j("/repo", "sub"))):
+            self.assertEqual(self._normal_reading(command), [("push", before)], command)
+            targets = [t[:2] for t in jev._scan_targets(command, "/repo")]
+            self.assertIn(("push", before), targets, command)
+            if branch:
+                self.assertIn(("push", branch), targets, command)
+        # A cd before the case still counts in every reading.
+        self.assertEqual([t[:2] for t in jev._scan_targets(
+            "(cd other && case $x in y) git push;; esac)", "/repo")], [("push", j("/repo", "other"))])
+
+    def test_issue_39_unparsed_case_word_branch_cd(self):
+        # A case word _CASE_RE rejects opens no case frame, so the branch cd counts in
+        # the normal reading; the case_cds=False reading still ignores it (any `case`
+        # word up to its `esac`), so the cwd before the case is a target.
+        # Inside a subshell, such a case's pattern `)` doesn't close the subshell in that
+        # reading, so a cd after `esac` stays inside it.
+        for command in ("case $(echo $(echo $(echo x))) in a) cd sub;; esac; git push",
+                        "case $(( (1) )) in 2) cd sub;; esac; git push",
+                        "( case $(f $(g $(h))) in x) git commit;; esac ; cd sub )\ngit push",
+                        "( case $(f $(g $(h))) in x) cd a;; esac ; cd sub )\ngit push",
+                        "( case $(a $(b $(c))) in x) true;; esac ; cd sub ); git push",
+                        "(cd a; case $(f $(g $(h))) in x) true;; esac; cd sub); git push"):
+            self.assertIn(("push", "/repo"), [t[:2] for t in jev._scan_targets(command, "/repo")],
+                          command)
+        # `$(( ))` is a case word, so the normal reading gets it right too.
+        self.assertEqual(self._normal_reading("case $(( (1) )) in 2) cd sub;; esac; git push"),
+                         [("push", "/repo")])
+        self.assertTrue(jev._CASE_RE.match("case $((1+2)) in"))
+
+    def test_issue_39_many_git_commands_scan_fast(self):
+        # Each match used to copy the rest of the command (7 s / 22 s at 64000).
+        # (A kept quoted -C value costs more per command, hence fewer of those.)
+        for unit, count in (("git push; ", 32000), ('git -C "a" push; ', 16000),
+                            ("git commit -am x; ", 16000)):
+            start = time.monotonic()
+            targets = jev._scan_targets(unit * count, "/repo")
+            self.assertLess(time.monotonic() - start, 2.0, unit)
+            self.assertEqual(len(targets), 1, unit)
+        self.assertTrue(jev._scan_targets("git commit -am x; " * 3, "/repo")[0][2])
+        self.assertFalse(jev._scan_targets("git commit -m x; git commit -a", "/repo")[0][2])
+
+    def test_issue_39_keep_precheck_and_option_split(self):
+        # _may_keep only skips tails none of the keep regexes match.
+        for tail in ("git -C ", "git -c ", "x git --git-dir=", "x git --work-tree  ", "cd ",
+                     ";cd -- ", "(cd -P\t", "x" + "a" * 600 + " -C ", "git --foo-C ", "echo ;",
+                     "a b", "", "  ", "git -Cx ", "cd\n", "${${--foo-C  ", "x--git-dir="):
+            if (jev._GIT_DASH_C_PREFIX_RE.search(tail) or jev._CD_PREFIX_RE.search(tail)
+                    or jev._LOOSE_KEEP_RE.search(tail)):
+                self.assertTrue(jev._may_keep(tail), repr(tail))
+        self.assertFalse(jev._may_keep("echo 'a' ;"))
+        # The unquoted fast path splits on shlex's blanks only.
+        for segment in (" -C a\x0bb", " -C a\xa0b --git-dir=x\x1cy", " -C a\r\n-C\tb"):
+            self.assertEqual(jev._global_opts(segment),
+                             jev._global_opts(segment + " -c 'z'"), repr(segment))
+
+    def test_issue_39_esac_before_redirection_or_after_ampersand(self):
+        # The `esac` closes the case, so the `)` after it ends the subshell and the
+        # later push runs in the payload cwd.
+        for command in ("(cd other && case x in x) true;; esac>/dev/null); git push",
+                        "(cd other && case x in x) true;; esac<x); git push",
+                        "(cd other && case x in x) true;; esac<<EOF\nb\nEOF\n); git push",
+                        "(cd other && case x in x) true &esac); git push"):
+            stripped = jev._strip_heredocs_and_quotes(command)
+            match = list(jev.GIT_COMMAND_RE.finditer(stripped))[-1]
+            self.assertIsNone(jev._cd_prefix_dir(stripped, match.start()), command)
+            self.assertIn(("push", "/repo"), [t[:2] for t in jev._scan_targets(command, "/repo")],
+                          command)
+
+    def test_issue_39_long_dash_c_chain(self):
+        # -C accumulates like cd and is capped the same way (quadratic before: 2.5 s).
+        j = os.path.join
+        start = time.monotonic()
+        targets = jev._scan_targets("git " + "-C a " * 160000 + "push", "/repo")
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual([t[:2] for t in targets], [("push", "/repo")])
+        long_chain = "git " + "-C a " * 3000
+        for command, cwd in ((long_chain + "-C b push", "/repo"),
+                             (long_chain + "-C /opt/x -C y push", j("/repo", j("/opt/x", "y"))),
+                             ("cd sub; " + long_chain + "push", j("/repo", "sub"))):
+            self.assertEqual([t[1] for t in jev._scan_targets(command, "/repo")], [cwd],
+                             command[-30:])
+
+    def test_issue_39_many_distinct_targets_scan_fast(self):
+        # The target dedupe was a list scan per match (6.6 s at 20000).
+        command = "".join(f"git -C d{i} push;" for i in range(20000))
+        start = time.monotonic()
+        targets = jev._scan_targets(command, "/repo")
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual(len(targets), 20000)
+        self.assertEqual(targets[-1][:2], ("push", os.path.join("/repo", "d19999")))
+
+    def test_issue_39_case_needs_word_and_in(self):
+        # `case` inside `$( )` without `in` opens no case statement, so its `)` closes
+        # the substitution and the `<<` after it is a shift, not a heredoc.
+        for command in ("echo $[ $(echo case x) + (1<<3) ]\ngit push\n3\n",
+                        "echo $[ $( echo case x ) + (1<<3) ]\ngit push\n3\n"):
+            self.assertEqual(self._ops(command), ["push"], command)
+
+    def test_issue_39_long_cd_chain(self):
+        # Accumulating `cd a; ` * N was quadratic (19.6 s / 6.4 GB at 80000); past
+        # MAX_CD_PATH_CHARS the cds are dropped (payload cwd) until an absolute cd.
+        start = time.monotonic()
+        targets = jev._scan_targets("cd a; " * 80000 + "git push", "/repo")
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual([t[:2] for t in targets], [("push", "/repo")])
+        long_chain = "cd a; " * 3000
+        self.assertEqual([t[1] for t in jev._scan_targets(long_chain + "cd b; git push", "/repo")],
+                         ["/repo"])
+        self.assertEqual([t[1] for t in jev._scan_targets(long_chain + "cd /opt/x; cd y; git push",
+                                                          "/repo")],
+                         [os.path.join("/repo", os.path.join("/opt/x", "y"))])
+        # A subshell restores the capped state it started from.
+        self.assertEqual([t[1] for t in jev._scan_targets("cd sub; (" + long_chain + "); git push",
+                                                          "/repo")],
+                         [os.path.join("/repo", "sub")])
+
+    def test_issue_39_git_path_with_equals(self):
+        self.assertEqual(self._ops("/opt/a=b/git push"), ["push"])
+        self.assertEqual(self._ops("FOO=bar git push"), ["push"])
+        for command in ("X=/usr/bin/git push", "X=a/git push", "x_1=/opt/a=b/git push"):
+            self.assertEqual(self._ops(command), [], command)
+
+    def test_issue_39_constructs_scan_fast(self):
+        for command in ("case x in a) " * 5000 + "git push", "esac " * 20000,
+                        "`" * 20001 + "git push", "(" * 10000 + ")" * 10000,
+                        "$(( " + "(" * 10000 + "<<3\n", "<" + "\\\n" * 20000 + "x",
+                        "<<" + "\\\n" * 20000 + "E", 'git -C "' + '\\"' * 20000 + '" push',
+                        "git" + " --git-dir -x" * 5000 + " push", '"git" ;' * 10000,
+                        "x=" + "\\ " * 20000 + " git push", '"' + "'\\\"'" * 5000 + ";cd a" * 2000,
+                        "cd -- " * 5000 + '"d"' * 5000, "case " * 20000, 'case "' * 20000,
+                        "case x" * 20000, "(case x " * 10000 + "in", "a=" * 20000 + "/git push",
+                        "/=" * 20000 + " push", "(cd a && case x in y) " * 5000,
+                        "case $(" * 20000, "case ${" * 20000, "case `" * 20000,
+                        "(case $(x " * 10000, "{case ${x " * 10000, "case $((x " * 10000,
+                        ";case `x " * 10000, "case $(x)$(x)$(x)" * 5000,
+                        "case $(( (" * 10000, "case $((x))$((x))" * 5000,
+                        "case x in a) cd b;; " * 5000 + "git push"):
+            start = time.monotonic()
+            jev._scan_targets(command, "/repo")
+            self.assertLess(time.monotonic() - start, 2.0, command[:30])
 
     # ---- command forms, multiple ops, push base, redaction ----
 
@@ -778,9 +1064,9 @@ class GateTests(unittest.TestCase):
         seen = []
         real_run_git = jev._run_git
 
-        def spy_run_git(args, cwd, deadline=None):
+        def spy_run_git(args, cwd, deadline=None, git_opts=None):
             seen.append(deadline)
-            return real_run_git(args, cwd, deadline)
+            return real_run_git(args, cwd, deadline, git_opts)
         ask_deadlines = []
         real_ask = jev.ask
 
