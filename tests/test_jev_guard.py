@@ -1353,23 +1353,25 @@ class GateTests(unittest.TestCase):
         self.assertNotIn(body.lower(), out)
         self.assertEqual(out, f"{head}@@ -5,3 +5,3 @@\n [redacted]\n-[redacted]\n+[redacted]\n")
         # BEGIN only: redacted to the end of its hunk; the next hunk is kept. A one-word
-        # line in a hunk that held key material may be a key's last line, so it goes too.
-        begin = (f"{head}@@ -1,2 +1,2 @@\n context\n+-----BEGIN RSA PRIVATE KEY-----\n+{body[:20]}\n"
-                 "@@ -9 +9 @@\n+plain change\n")
+        # line in a hunk that held key material may be a key's last line, so it goes too,
+        # unless it is under 8 lowercase letters.
+        begin = (f"{head}@@ -1,3 +1,3 @@\n context\n contexts\n+-----BEGIN RSA PRIVATE KEY-----\n"
+                 f"+{body[:20]}\n@@ -9 +9 @@\n+plain change\n")
         out = jev._scrub(begin)
         self.assertNotIn(body[:20], out)
-        self.assertEqual(out, f"{head}@@ -1,2 +1,2 @@\n [redacted]\n+[redacted]\n"
+        self.assertEqual(out, f"{head}@@ -1,3 +1,3 @@\n context\n [redacted]\n+[redacted]\n"
                               "@@ -9 +9 @@\n+plain change\n")
         # END only: redacted from the start of its hunk; its `@@` line and earlier hunks stay.
         end = (f"{head}@@ -1 +1 @@\n+plain change\n@@ -20,2 +20,2 @@\n {body[:20]}\n"
-               "+-----END OPENSSH PRIVATE KEY-----\n+after\n")
+               "+-----END OPENSSH PRIVATE KEY-----\n+after\n+Ab1\n")
         out = jev._scrub(end)
         self.assertNotIn(body[:20], out)
         self.assertEqual(out, f"{head}@@ -1 +1 @@\n+plain change\n@@ -20,2 +20,2 @@\n"
-                              "[redacted]\n+[redacted]\n")
+                              "[redacted]\n+after\n+[redacted]\n")
         # Report text (not a diff) is one hunk.
         self.assertEqual(jev._scrub(f"see it\n-----BEGIN PRIVATE KEY-----\n{body[:20]}"), "see it\n[redacted]")
-        self.assertEqual(jev._scrub(f"{body[:20]}\n-----END PRIVATE KEY-----\nok"), "[redacted]\n[redacted]")
+        self.assertEqual(jev._scrub(f"{body[:20]}\n-----END PRIVATE KEY-----\nok"), "[redacted]\nok")
+        self.assertEqual(jev._scrub(f"{body[:20]}\n-----END PRIVATE KEY-----\nOK"), "[redacted]\n[redacted]")
         self.assertEqual(jev._scrub(f"{body[:20]}\n-----END PRIVATE KEY-----\nall ok"), "[redacted]\nall ok")
         self.assertEqual(jev._scrub(f"a line\n{body}\r\nall ok"), "a line\n[redacted]\r\nall ok")
 
@@ -1464,13 +1466,15 @@ class GateTests(unittest.TestCase):
 
     def test_scrub_very_short_last_key_lines(self):
         body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
-        for tail in ("Ab==", "QUJD", "x"):
-            # A mid-key hunk, and an END-only hunk whose short tail hides the body line.
+        for tail in ("Ab==", "QUJD", "x", "X"):
+            # A mid-key hunk, and an END-only hunk whose short tail hides the body line (an
+            # all-lowercase tail under 8 chars is kept there, like a one-word code line).
             mid = f"@@ -5,3 +5,3 @@\n {body}\n+{tail}\n context line\n@@ -30 +30 @@\n+{tail}\n"
             self.assertEqual(jev._scrub(mid), "@@ -5,3 +5,3 @@\n [redacted]\n+[redacted]\n"
                                               f" context line\n@@ -30 +30 @@\n+{tail}\n", tail)
             end = f"@@ -5,4 +5,4 @@\n {body}\n+\n+{tail}\n+-----END RSA PRIVATE KEY-----\n"
-            self.assertEqual(jev._scrub(end), "@@ -5,4 +5,4 @@\n [redacted]\n+\n+[redacted]\n"
+            kept = tail if tail == "x" else "[redacted]"
+            self.assertEqual(jev._scrub(end), f"@@ -5,4 +5,4 @@\n [redacted]\n+\n+{kept}\n"
                                               "+[redacted]\n", tail)
 
     def test_scrub_keeps_short_code_lines_beside_a_sha(self):
@@ -1548,6 +1552,79 @@ class GateTests(unittest.TestCase):
                 "+short0123456789\n")
         self.assertEqual(jev._scrub(text), text)
 
+    def test_scrub_quoted_string_literal_tails(self):
+        body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+        for line, kept in (('"Ab==\\n"', '"[redacted]\\n"'), ("'QUJD',", "'[redacted]',"),
+                           ('"Ab==\\n" +', '"[redacted]\\n" +'),
+                           ('"QUJD\\r\\n");', '"[redacted]\\r\\n");'),
+                           ('b"Ab==\\n"', 'b"[redacted]\\n"'), ("rb'QUJD' ,", "rb'[redacted]' ,"),
+                           ("`Ab==\\n` +", "`[redacted]\\n` +")):
+            # A mid-key hunk (Go/JS/Python concatenation) and an END-only hunk.
+            mid = f'@@ -5,2 +5,2 @@\n \t"{body}\\n" +\n+\t{line}\r\n'
+            self.assertEqual(jev._scrub(mid), f'@@ -5,2 +5,2 @@\n \t"[redacted]\\n" +\n+\t{kept}\r\n', line)
+            end = (f'@@ -5,3 +5,3 @@\n     "{body}\\n"\n+    {line}\n'
+                   '+    "-----END RSA PRIVATE KEY-----\\n"\n')
+            self.assertEqual(jev._scrub(end), f'@@ -5,3 +5,3 @@\n     "[redacted]\\n"\n+    {kept}\n'
+                                              '+    "[redacted]\\n"\n', line)
+        # Unbalanced quotes, more text after the literal, or no key material: kept.
+        for line in ('"Ab==\'', "'QUJD', 'x'", '"Ab==\\n" + y'):
+            text = f"@@ -1,2 +1,2 @@\n -----END RSA PRIVATE KEY-----\n+{line}\n"
+            self.assertEqual(jev._scrub(text), f"@@ -1,2 +1,2 @@\n [redacted]\n+{line}\n", line)
+        self.assertEqual(jev._scrub('@@ -1 +1 @@\n+"Ab==\\n" +\n'), '@@ -1 +1 @@\n+"Ab==\\n" +\n')
+
+    def test_scrub_one_line_begin_fragment_with_escaped_newlines(self):
+        body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+        for tail in ("Ab==", "QUJDREVGRw==", body[:30]):
+            for nl in ("\\n", "\\r\\n"):
+                text = (f'@@ -1,2 +1,2 @@\n "name": "deploy",\n'
+                        f'+  "key": "-----BEGIN RSA PRIVATE KEY-----{nl}{body}{nl}{tail}{nl}",\n')
+                self.assertEqual(jev._scrub(text), '@@ -1,2 +1,2 @@\n "name": "deploy",\n'
+                                                   '+  "key": "[redacted]",\n', (tail, nl))
+                # Spaces between the escape and an END marker.
+                text = f'+  "key": "{body}{nl}{tail}{nl} \t-----END RSA PRIVATE KEY-----{nl}",\n'
+                self.assertEqual(jev._scrub(text), f'+  "key": "[redacted]{nl}",\n', (tail, nl))
+        # A prose BEGIN mention not before a literal `\n` keeps the text after it.
+        self.assertEqual(jev._scrub("see -----BEGIN RSA PRIVATE KEY----- here\\nAbc"),
+                         "see [redacted] here\\nAbc")
+
+    def test_scrub_pgp_checksum_lines(self):
+        body = "lQOYBGE5ZmMBCADGzC3hQ8e8ZJ1dHtQx1Fs0V2uJp4bKsX7cTnWmY9RaE6oLvIqg"
+        end = "-----END PGP PRIVATE KEY BLOCK-----"
+        # The checksum line does not block an END's cut to its hunk's start.
+        for last in (f" {body[:20]}\n", " ZmOo12Qx==\n", ""):
+            text = f"@@ -9,3 +9,3 @@\n {body}\n{last}+=Ab12\n+{end}\n+after it\n"
+            self.assertEqual(jev._scrub(text), "@@ -9,3 +9,3 @@\n[redacted]\n+after it\n", last)
+        # It goes in a mid-key hunk and beside a marker, and stays without key material.
+        mid = f"@@ -5,3 +5,3 @@\n {body}\n ZmOo12Qx==\n+=Ab12\r\n"
+        self.assertEqual(jev._scrub(mid), "@@ -5,3 +5,3 @@\n [redacted]\n [redacted]\n+[redacted]\r\n")
+        text = f"@@ -9,3 +9,3 @@\n see {end} here\n+=Ab12\n"
+        self.assertEqual(jev._scrub(text), "@@ -9,3 +9,3 @@\n see [redacted] here\n+[redacted]\n")
+        self.assertEqual(jev._scrub("@@ -1 +1 @@\n+=Ab12\n"), "@@ -1 +1 @@\n+=Ab12\n")
+
+    def test_scrub_cut_encrypted_pem_headers_with_short_body(self):
+        headers = "+Proc-Type: 4,ENCRYPTED\n+DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n"
+        begin = "@@ -1,9 +1,9 @@\n context line\n+-----BEGIN RSA PRIVATE KEY-----\n"
+        for tail in ("+\n+Ab==\n", "+\n+QUJDREVGRw==\n+x\n+\n", "+=Ab12\r\n"):
+            self.assertEqual(jev._scrub(begin + headers + tail),
+                             "@@ -1,9 +1,9 @@\n context line\n+[redacted]\n", tail)
+        # ... or up to an END (a pair the hunk split itself never leaves).
+        lines = ["-----BEGIN RSA PRIVATE KEY-----\n", "Proc-Type: 4,ENCRYPTED\n", "\n", "Ab==\n",
+                 "-----END RSA PRIVATE KEY-----\n", "after it\n"]
+        self.assertEqual(jev._scrub_key_markers(lines), (["[redacted]\n"], True))
+        # Headers followed by other text, or short lines without headers, are not a key block.
+        self.assertEqual(jev._scrub(begin + headers + "+x = 1\n"),
+                         "@@ -1,9 +1,9 @@\n context line\n+[redacted]\n" + headers + "+x = 1\n")
+        self.assertEqual(jev._scrub(begin + "+\n+pass\n"), "@@ -1,9 +1,9 @@\n context line\n+[redacted]\n+\n+pass\n")
+
+    def test_scrub_keeps_short_lowercase_lines_beside_a_marker(self):
+        text = ('@@ -1,8 +1,8 @@\n+PEM = "-----BEGIN RSA PRIVATE KEY-----"\n+    return\n     pass\n'
+                '-else\n+    "abc",\n+    Ab1\n+    abcdefgh\n+    x+y\n+    ab=\n+    b"abc"\n'
+                '+    b"Ab"\n+    f`QUJD`\n')
+        self.assertEqual(jev._scrub(text), '@@ -1,8 +1,8 @@\n+PEM = "[redacted]"\n+    return\n     pass\n'
+                                           '-else\n+    "abc",\n+    [redacted]\n+    [redacted]\n'
+                                           '+    [redacted]\n+    [redacted]\n+    b"abc"\n'
+                                           '+    b"[redacted]"\n+    f`[redacted]`\n')
+
     def test_scrub_adversarial_input_is_fast(self):
         for text in ("-----BEGIN RSA PRIVATE KEY-----" + "A" * 1_000_000,
                      "-----BEGIN RSA PRIVATE KEY-----\n" * 32_000,
@@ -1558,7 +1635,21 @@ class GateTests(unittest.TestCase):
                      "\n" * 1_000_000 + "-----END RSA PRIVATE KEY-----",
                      "-----END RSA PRIVATE KEY-----\n" + "+Ab==\n" * 200_000,
                      "-----BEGIN RSA PRIVATE KEY-----\n" + "+Name: value\n" * 100_000,
-                     "x" + "A\\n" * 400_000 + "-----END RSA PRIVATE KEY-----"):
+                     "x" + "A\\n" * 400_000 + "-----END RSA PRIVATE KEY-----",
+                     "x" + "A\\n " * 300_000 + "-----END RSA PRIVATE KEY-----",
+                     "x" + " " * 1_000_000 + "\\n-----END RSA PRIVATE KEY-----",
+                     "-----BEGIN RSA PRIVATE KEY-----\\n" * 32_000,
+                     "-----BEGIN RSA PRIVATE KEY-----" + " " * 1_000_000 + "x",
+                     "-----BEGIN RSA PRIVATE KEY-----\n+Name: v\n" + "+Ab==\n" * 200_000,
+                     "-----END RSA PRIVATE KEY-----\n" + '+"Ab==\\n" +\n' * 100_000,
+                     "-----END RSA PRIVATE KEY-----\n+\"" + "A" * 1_000_000 + "\\n\"x\n",
+                     "-----END RSA PRIVATE KEY-----\n+" + "a" * 1_000_000 + "\n",
+                     "+" + "A" * 50 + "\n" + '+"' + "A" * 1_000_000 + "'\n",
+                     "-----END RSA PRIVATE KEY-----\n" + '+"Ab==" ' + " " * 1_000_000 + "x\n",
+                     "-----END RSA PRIVATE KEY-----\n" + '+"Ab==" ' + "\t" * 1_000_000 + "x\n",
+                     "+" + "A" * 50 + "\n" + '+"AAAAAAAA" ' + " " * 1_000_000 + "x\n",
+                     "+" + "A" * 50 + " " * 1_000_000 + "x\n+Ab==\n",
+                     "+" + "A" * 50 + '"' + " " * 1_000_000 + ",x\n+Ab==\n"):
             started = time.monotonic()
             out = jev._scrub(text)
             self.assertLess(time.monotonic() - started, 3.0, text[:40])

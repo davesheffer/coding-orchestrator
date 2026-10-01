@@ -254,12 +254,18 @@ KEY_END_RE = re.compile(r"-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
 # A line (after an optional diff prefix and indentation) that looks like key body; an
 # unpaired marker next to one redacts to its hunk's end/start, otherwise only itself.
 KEY_LINE_RE = re.compile(r"[+\- ]?[ \t]*[A-Za-z0-9+/=]{16,}[ \t\r\n]*$")
+# A base64-only line of any length, e.g. a short key body after encrypted PEM headers.
+BASE64_LINE_RE = re.compile(r"[+\- ]?[ \t]*[A-Za-z0-9+/=]+[ \t\r\n]*$")
+# A PGP armor checksum line (`=` and 4 base64 chars), which ends a key body like its last line.
+CRC_LINE_RE = re.compile(r"[+\- ]?[ \t]*=[A-Za-z0-9+/]{4}[ \t\r\n]*$")
 # An encrypted PEM header line (`Proc-Type: 4,ENCRYPTED`, `DEK-Info: <cipher>,<IV>`) or other
 # `Name: value` line, which a BEGIN marker's block may hold before its first key line.
 KEY_HEADER_LINE_RE = re.compile(r"[+\- ]?[ \t]*[A-Za-z][A-Za-z0-9-]*:")
 # Base64 and escape text written backwards from an END marker that follows a literal `\n`
 # (a one-line key fragment such as JSON `"...body\ntail\n-----END ... KEY-----\n"`).
 ESCAPED_KEY_TEXT_RE = re.compile(r"[A-Za-z0-9+/=\\]*")
+# ... and forwards from a BEGIN marker followed by a literal `\n` (`"-----BEGIN ...\nbody\n"`).
+ESCAPED_BEGIN_TEXT_RE = re.compile(r"[ \t]*(?:\\r)?\\n[A-Za-z0-9+/=\\]*")
 # Where _scrub splits text into hunks, so an unpaired marker redacts only its own hunk.
 HUNK_SPLIT_RE = re.compile(r"(?m)^(?=@@|diff --git )")
 # Any long base64 run (key body, even mid-line or indented), scrubbed anywhere; a diff
@@ -269,17 +275,29 @@ HUNK_SPLIT_RE = re.compile(r"(?m)^(?=@@|diff --git )")
 BASE64_RUN_RE = re.compile(
     r"(?m)(^[+-]|(?<=\\)n|(?<![\w+/=-]))[\w+/=-]{40,}(?![\w+/=-])", re.ASCII)
 STD_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{40}")
-# A base64-only line of any length (a key's last body line), scrubbed in hunks with a key
-# marker; a lone `+` (an added blank line) is kept. Hunks with only a long base64 run (a
-# key body, but also e.g. a commit SHA) lose base64-only lines of 8+ chars, so ordinary
-# one-word code lines survive there.
+# A base64-only line of any length (a key's last body line) or PGP checksum line, scrubbed
+# in hunks with a key marker; a lone `+` (an added blank line) and a line of under 8
+# lowercase letters (`return`, `pass`: little key entropy) are kept. Hunks with only a long
+# base64 run (a key body, but also e.g. a commit SHA) lose base64-only lines of 8+ chars,
+# so ordinary one-word code lines survive there. A tail may be a quoted string literal
+# (`"`, `'` or a backtick, optionally after a `b`/`f`/`r`-style prefix), with a literal
+# `\n`/`\r\n` escape before its closing quote and a trailing `,`/`+`/`)`/`;` (concatenation,
+# list items, call arguments); the quotes and the rest are kept. Whitespace runs are split
+# by a punctuation char between quantifiers, so a long one is never rescanned (linear time).
+_TAIL_QUOTE = r"([bfrBFR]{0,2}([\"'`]))?(?!\+[ \t]*\r?$)"
+_TAIL_END = r"(?=(?(3)(?:\\r)?(?:\\n)?\3(?:[ \t]*[,+);]{1,2})?)[ \t]*\r?$)"
+_CRC = r"|=[A-Za-z0-9+/]{4}"
 KEY_TAIL_LINE_RE = re.compile(
-    r"(?m)^([+\- ]?[ \t]*)(?!\+[ \t]*\r?$)[A-Za-z0-9+/]+={0,2}(?=[ \t]*\r?$)")
-LONG_TAIL_LINE_RE = re.compile(r"(?m)^([+\- ]?[ \t]*)[A-Za-z0-9+/]{8,}={0,2}(?=[ \t]*\r?$)")
+    r"(?m)^(?![+\- ]?[ \t]*(?:[bfrBFR]{0,2}[\"'`])?[a-z]{1,7}"
+    r"(?![A-Za-z0-9+/=]|[\"'`][A-Za-z0-9+/=]))([+\- ]?[ \t]*)" + _TAIL_QUOTE
+    + r"(?:[A-Za-z0-9+/]+={0,2}" + _CRC + ")" + _TAIL_END)
+LONG_TAIL_LINE_RE = re.compile(
+    r"(?m)^([+\- ]?[ \t]*)" + _TAIL_QUOTE + r"(?:[A-Za-z0-9+/]{8,}={0,2}" + _CRC + ")" + _TAIL_END)
 # ... and a base64-only line of any length right after a redacted key-body line.
 AFTER_RUN_TAIL_LINE_RE = re.compile(
-    r"(?m)^([+\- ]?[ \t]*\[redacted\][ \t]*\r?\n[+\- ]?[ \t]*)(?!\+[ \t]*\r?$)"
-    r"[A-Za-z0-9+/]+={0,2}(?=[ \t]*\r?$)")
+    r"(?m)^([+\- ]?[ \t]*(?:[bfrBFR]{0,2}[\"'`])?\[redacted\](?:\\r)?(?:\\n)?[\"'`]?"
+    r"(?:[ \t]*[,+);]{1,2})?[ \t]*\r?\n[+\- ]?[ \t]*)" + _TAIL_QUOTE + r"[A-Za-z0-9+/]+={0,2}"
+    + _TAIL_END)
 # A hunk header; git appends the nearest preceding "function" line to it, which can be a
 # key body line, so everything after the closing `@@` is dropped.
 HUNK_HEADER_RE = re.compile(r"^(@@+ (?:[-+]\d+(?:,\d+)? )+@@+)[^\r\n]*")
@@ -803,11 +821,13 @@ def _diff_prefix(diff, limit):
 def _scrub_key_markers(lines):
     """Redact the private key markers left unpaired in one hunk's lines: an END just after
     a key body line redacts from the hunk's start (keeping its `@@` line), a BEGIN just
-    before one (past any `Name: value` header lines, which alone also count when they run to
-    the hunk's end, as in a cut encrypted block) to the hunk's end, an END just after a
-    literal backslash-n the base64 and escape text before it on its line, and any other
-    marker (e.g. a prose mention) only itself. Returns the lines and whether any marker was
-    found."""
+    before one (past any `Name: value` header lines, which also count when only they, blank
+    lines and short base64 lines run to the hunk's end or an END, as in a cut encrypted
+    block) to the hunk's end, an END just after a literal backslash-n (and spaces) the base64
+    and escape text before it on its line, a BEGIN just before one the base64 and escape
+    text after it, and any other marker (e.g. a prose mention) only itself. A PGP checksum
+    line counts as a key body line before an END. Returns the lines and whether any marker
+    was found."""
     def blank(line):
         return not line.strip(" \t\r\n+-")
 
@@ -815,12 +835,24 @@ def _scrub_key_markers(lines):
         out, lo = [], 0
         for end in KEY_END_RE.finditer(line):
             seg = line[lo:end.start()]
-            if seg.endswith("\\n"):
-                seg = seg[:len(seg) - ESCAPED_KEY_TEXT_RE.match(seg[::-1]).end()]
+            text = seg.rstrip(" \t")
+            if text.endswith("\\n"):
+                seg = text[:len(text) - ESCAPED_KEY_TEXT_RE.match(text[::-1]).end()]
                 out.append(seg + "[redacted]")
             else:
                 out.append(seg + end.group(0))
             lo = end.end()
+        return "".join(out) + line[lo:]
+
+    def scrub_escaped_begin(line):
+        out, lo = [], 0
+        for begin in KEY_BEGIN_RE.finditer(line):
+            if begin.start() < lo:
+                continue
+            text = ESCAPED_BEGIN_TEXT_RE.match(line, begin.end())
+            if text:
+                out.append(line[lo:begin.start()] + "[redacted]")
+                lo = text.end()
         return "".join(out) + line[lo:]
 
     found = False
@@ -828,7 +860,7 @@ def _scrub_key_markers(lines):
     for i, line in enumerate(lines):
         if KEY_END_RE.search(line):
             found = True
-            if prev is not None and KEY_LINE_RE.match(lines[prev]):
+            if prev is not None and (KEY_LINE_RE.match(lines[prev]) or CRC_LINE_RE.match(lines[prev])):
                 cut = i
         if not blank(line):
             prev = i
@@ -838,13 +870,23 @@ def _scrub_key_markers(lines):
         start = 1 if cut and HUNK_SPLIT_RE.match(lines[0]) else 0
         lines[start:cut + 1] = ["[redacted]" + lines[cut][end.end():]]
     # nxt: the first non-blank, non-header line after the current one; header: whether a
-    # header line lies between the two
+    # header line lies between the two; short: whether only header, blank and base64-only
+    # lines run from the current line to the hunk's end or an END, short_header: whether a
+    # header line is among them
     begin_at, nxt, header = None, None, False
+    short, short_header = True, False
     for i in range(len(lines) - 1, -1, -1):
         if KEY_BEGIN_RE.search(lines[i]):
             found = True
-            if (KEY_LINE_RE.match(lines[nxt]) if nxt is not None else header):
+            if (KEY_LINE_RE.match(lines[nxt]) if nxt is not None else header) or (
+                    short and short_header):
                 begin_at = i
+        if KEY_END_RE.search(lines[i]):
+            short, short_header = True, False
+        elif KEY_HEADER_LINE_RE.match(lines[i]):
+            short_header = True
+        elif not (blank(lines[i]) or BASE64_LINE_RE.match(lines[i])):
+            short, short_header = False, False
         if KEY_HEADER_LINE_RE.match(lines[i]):
             header = True
         elif not blank(lines[i]):
@@ -854,8 +896,8 @@ def _scrub_key_markers(lines):
         newline = "\n" if lines[-1].endswith("\n") else ""
         lines[begin_at:] = [lines[begin_at][:begin.start()] + "[redacted]" + newline]
     if found:
-        lines = [KEY_END_RE.sub("[redacted]",
-                                KEY_BEGIN_RE.sub("[redacted]", scrub_escaped_end(line)))
+        lines = [KEY_END_RE.sub("[redacted]", KEY_BEGIN_RE.sub(
+                     "[redacted]", scrub_escaped_begin(scrub_escaped_end(line))))
                  for line in lines]
     return lines, found
 
@@ -882,10 +924,10 @@ def _scrub(text):
         runs = False
         hunk = BASE64_RUN_RE.sub(redact_run, "".join(lines))
         if found:
-            hunk = KEY_TAIL_LINE_RE.sub(r"\1[redacted]", hunk)
+            hunk = KEY_TAIL_LINE_RE.sub(r"\1\2[redacted]", hunk)
         elif runs:
-            hunk = AFTER_RUN_TAIL_LINE_RE.sub(r"\1[redacted]",
-                                              LONG_TAIL_LINE_RE.sub(r"\1[redacted]", hunk))
+            hunk = AFTER_RUN_TAIL_LINE_RE.sub(r"\1\2[redacted]",
+                                              LONG_TAIL_LINE_RE.sub(r"\1\2[redacted]", hunk))
         hunks.append(hunk)
     return "".join(hunks)
 
