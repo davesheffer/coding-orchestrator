@@ -243,6 +243,30 @@ class DecideTests(unittest.TestCase):
         out = self.decide(self.payload, cfg, self.classify())
         self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
 
+    def test_blank_or_non_string_explicit_model_does_not_pin(self):
+        cfg = {**self.cfg, "respect_explicit_model": True}
+        self.payload["tool_input"]["model"] = " "
+        out = self.decide(self.payload, cfg, self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+        for model in (["opus"], {"model": "opus"}, 5, True):
+            with self.subTest(model=repr(model)):
+                self.calls.clear()
+                self.payload["tool_input"]["model"] = model
+                logs = []
+                self.assertIsNone(self.decide(self.payload, cfg, self.classify(), logs.append))
+                self.assertEqual(self.calls, [])
+                self.assertEqual([e["reason"] for e in logs], ["skipped: invalid model"])
+
+    def test_non_string_description_still_routes_and_logs(self):
+        for description in (["Fix"], {"a": 1}, 5):
+            with self.subTest(description=repr(description)):
+                self.payload["tool_input"]["description"] = description
+                logs = []
+                out = self.decide(self.payload, self.cfg, self.classify(), logs.append)
+                self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+                self.assertEqual(len(logs), 1)
+                self.assertNotIn("desc_hash", logs[0])
+
     def test_invalid_label_is_noop(self):
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="gpt")))
 
