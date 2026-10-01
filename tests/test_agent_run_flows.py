@@ -27,14 +27,15 @@ JEV_LEAKY = dict(ISOLATED, off_list='CONNECTED', allow_host='CONNECTED')
 class FlowTests(unittest.TestCase):
     def run_flow(self, responses, probes, approved=True, extra_args=(), jev=False, launched=None,
                  stdin=None, tools=None, raises=None, final=b'RESULT: test response', break_final_read=False,
-                 role='model="gpt-6-luna"\nmodel_reasoning_effort="low"\ndeveloper_instructions="Read-only scout"\n'):
+                 role='model="gpt-6-luna"\nmodel_reasoning_effort="low"\ndeveloper_instructions="Read-only scout"\n',
+                 role_name='scout'):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TEST_TMPDIR')) as temp:
             root = Path(temp)
             workspace = root / 'workspace'
             workspace.mkdir()
             (root / 'agents').mkdir()
-            (root / 'agents/scout.toml').write_text(role)
-            (root / 'agent-routing.json').write_text(json.dumps({'network_fallback_roles': ['scout'] if approved else []}))
+            (root / 'agents' / f'{role_name}.toml').write_text(role)
+            (root / 'agent-routing.json').write_text(json.dumps({'network_fallback_roles': [role_name] if approved else []}))
             if jev:
                 (root / 'jev').mkdir()
                 (root / 'jev/config.json').write_text(json.dumps({'jev': {'enabled': True}}))
@@ -62,7 +63,7 @@ class FlowTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, code)
 
             def observed(_):
-                return {'model': calls[-1], 'effort': 'low'}
+                return {'model': calls[-1], 'effort': 'medium' if role_name == 'builder' else 'low'}
 
             original_read_text = Path.read_text
 
@@ -86,7 +87,7 @@ class FlowTests(unittest.TestCase):
                  patch.object(agent.sys, 'stdin', stdin), \
                  patch.object(Path, 'read_text', guarded_read_text), \
                  contextlib.redirect_stdout(output):
-                args = ['scout', '--cd', str(workspace), *source, *extra_args]
+                args = [role_name, '--cd', str(workspace), *source, *extra_args]
                 if raises is None:
                     code = agent.main(args)
                 else:
@@ -104,10 +105,45 @@ class FlowTests(unittest.TestCase):
         second = '{"type":"thread.started","thread_id":"second"}\n{"type":"turn.completed"}\n'
         code, calls, report, _ = self.run_flow([(1, first), (0, second)], [GOOD, GOOD, GOOD])
         self.assertEqual(code, 0)
-        self.assertEqual(calls, ['gpt-6-luna', 'gpt-6-sol'])
-        self.assertEqual(report['attempts'][1]['observed']['model'], 'gpt-6-sol')
+        self.assertEqual(calls, ['gpt-6-luna', 'gpt-6.1-sol'])
+        self.assertEqual(report['attempts'][1]['observed']['model'], 'gpt-6.1-sol')
         self.assertGreaterEqual(report['preflight_ms'], 0)
         self.assertGreaterEqual(report['attempts'][1]['duration_ms'], 0)
+
+    def test_scout_retries_legacy_sol_only_after_both_new_models_unavailable(self):
+        unavailable = '{"type":"thread.started"}\n{"type":"error","message":"model_not_found"}\n'
+        complete = '{"type":"thread.started"}\n{"type":"turn.completed"}\n'
+        code, calls, report, _ = self.run_flow([(1, unavailable), (1, unavailable), (0, complete)], [ISOLATED])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-sol'])
+        self.assertEqual([attempt['requested_effort'] for attempt in report['attempts']], ['low'] * 3)
+
+    def test_builder_retries_legacy_sol_with_same_effort_and_boundaries(self):
+        unavailable = '{"type":"thread.started"}\n{"type":"error","message":"model_not_found"}\n'
+        complete = '{"type":"thread.started"}\n{"type":"turn.completed"}\n'
+        launched = []
+        role = 'model="gpt-6.1-sol"\nmodel_reasoning_effort="medium"\ndeveloper_instructions="Builder"\n'
+        code, calls, report, _ = self.run_flow([(1, unavailable), (0, complete)], [ISOLATED],
+                                               role=role, role_name='builder', launched=launched)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ['gpt-6.1-sol', 'gpt-6-sol'])
+        self.assertEqual([attempt['requested_effort'] for attempt in report['attempts']], ['medium', 'medium'])
+        settings = [[arg for arg in command if arg.startswith(('model_reasoning_effort=',
+                    'sandbox_mode=', 'sandbox_workspace_write=', 'permissions.'))] for command in launched]
+        self.assertEqual(settings[0], settings[1])
+        self.assertIn('model_reasoning_effort="medium"', settings[0])
+
+    def test_builder_generic_error_stops_before_fallback(self):
+        role = 'model="gpt-6.1-sol"\nmodel_reasoning_effort="medium"\ndeveloper_instructions="Builder"\n'
+        for message in ('permission denied', 'tests failed', '401 unauthorized',
+                        'rate limit exceeded', 'unknown error'):
+            with self.subTest(message=message):
+                stream = '{"type":"thread.started"}\n' + json.dumps({'type': 'error', 'message': message}) + '\n'
+                code, calls, report, _ = self.run_flow([(1, stream)], [ISOLATED],
+                                                       role=role, role_name='builder')
+                self.assertEqual(code, 1)
+                self.assertEqual(calls, ['gpt-6.1-sol'])
+                self.assertEqual(report['status'], 'failed-no-retry')
 
     def test_corrupt_partial_work_stops_without_retry(self):
         bad = '{"type":"item.started",\n{"type":"error","message":"model_not_found"}\n'

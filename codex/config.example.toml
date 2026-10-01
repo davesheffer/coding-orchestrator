@@ -1,5 +1,5 @@
 # Defaults for a new Codex home; existing config.toml is preserved.
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "medium"
 
 [agents]

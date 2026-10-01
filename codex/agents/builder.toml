@@ -1,7 +1,7 @@
 # Codex role translated from the bundled agents/builder.md.
 name = "builder"
 description = "Implement a specified change in assigned files and run its acceptance check. Use for mechanical edits and clear briefs; leave design and root cause to the main session."
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "medium"
 sandbox_mode = "workspace-write"
 approval_policy = "never"

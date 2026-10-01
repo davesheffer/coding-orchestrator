@@ -158,7 +158,7 @@ ALL_FLAG_RE = re.compile(r"(?:^|\s)(--all|-[A-Za-z]*a[A-Za-z]*)(?=\s|$)")
 _ALL_FLAG_AT_RE = re.compile(r"(?:--all|-[A-Za-z]*a[A-Za-z]*)(?=\s|$)")
 # `cd <dir>` as its own segment (split on &&, ;, ||, or a `(` subshell opener) before
 # the git segment.
-CD_RE = re.compile(r"^\s*cd\s+(.+?)\s*$")
+CD_RE = re.compile(r"^\s*(?:(?:then|else|do)[ \t]+)?cd\s+(.+?)\s*$")
 # A heredoc operator (`<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`, `<<\WORD`); the
 # scanner in _strip_heredocs_and_quotes only tries it outside quotes and comments, and
 # never on a here-string (`<<<`). Group 1 captures a leading `-` (the `<<-` form, which
@@ -190,7 +190,7 @@ _GIT_DASH_C_PREFIX_RE = re.compile(
 # `cd`, any options (`cd -- "dir"`, `cd -P "dir"`), then the quoted target. Each
 # option needs a leading `-` after its blanks, so a blank run has one way to split.
 _CD_WORD = r"cd(?:[ \t]+-[\w-]*)*"
-_CD_PREFIX_RE = re.compile(_SEP + _LEAD + _CD_WORD + r"[ \t]+$")
+_CD_PREFIX_RE = re.compile(_SEP + _LEAD + r"(?:(?:then|else|do)[ \t]+)?" + _CD_WORD + r"[ \t]+$")
 # A kept quoted `-c` value (or one after any token ending in `-c`, e.g. `--foo-c`) is
 # never read back (only -C, cd, --git-dir and --work-tree values are): it is emitted as
 # `""`, so e.g. a newline-and-`cd` or a `; git push` inside it can't be taken for a
@@ -217,7 +217,7 @@ _GIT_WORD_RE = re.compile(r"(?i)(?:.*[/\\])?git(?:\.exe)?")
 # there), so at most one `"` and one `'` rescan to the end.
 # Group 2 is a candidate `case`/`esac` keyword (see _case_step), which splits nothing.
 _CD_SPLIT_RE = re.compile(
-    r"""\\[\s\S]|"(?:[^"\\]|\\[\s\S])*"|'[^']*'|(&&|\|\||;|\n|\(|\)|\{|`)|(case|esac)""")
+    r"""\\[\s\S]|"(?:[^"\\]|\\[\s\S])*"|'[^']*'|(&&|\|\||(?<![|<>;])&(?![>|])|;|\n|\(|\)|\{|`)|(case|esac)""")
 # Longest directory _cd_dirs accumulates (`cd a; ` * N would otherwise grow it, and the
 # time and memory to build it, quadratically); see _cd_segment_dir.
 MAX_CD_PATH_CHARS = 4096
@@ -225,8 +225,10 @@ MAX_CD_PATH_CHARS = 4096
 # branch ends), so a cd costs at most this many joins.
 MAX_CASE_BRANCHES = 16
 # Most `||` operators with a cd next to them whose every success/failure combination
-# _scan_targets enumerates (2**k readings); with more, only the two one-sided readings.
-MAX_OR_ENUM = 4
+# _scan_targets enumerates (2**k readings); the gate denies above this bound.
+MAX_OR_ENUM = 8
+MAX_SUBST_DEPTH = 8
+MAX_SCAN_WORK = 4_000_000
 # Most distinct targets one command may have; past it _scan_targets raises
 # TooManyTargets and the gate denies (a pathological command otherwise reaches tens of
 # thousands of targets and hundreds of MB).
@@ -236,7 +238,7 @@ MAX_HEREDOC_DEPTH = 3
 
 
 class TooManyTargets(Exception):
-    """A command has more than the allowed number of distinct git targets."""
+    """A command exceeds a target, nesting, or analysis-work bound."""
 
 # A backslash-newline inside an operator (`<\` newline `<EOF`, `$\` newline `(`) is
 # removed by bash before the operator is read, so _scan_targets also scans the
@@ -591,6 +593,111 @@ def _case_step(text, i, open_cases):
     return 0
 
 
+def _subst_end(text, start, depth=0, bounded=False):
+    """Closing index of a command substitution, ignoring quoted brackets and case patterns."""
+    if depth >= MAX_SUBST_DEPTH:
+        raise TooManyTargets
+    level, cases, pending = 1, [0], []
+    i = start + 2
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "#" and (i == 0 or text[i - 1] in " \t\n;&|()"):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        if text.startswith("<<", i) and not text.startswith("<<<", i):
+            heredoc = HEREDOC_RE.match(text, i)
+            if heredoc:
+                pending.append((heredoc.group(2) or heredoc.group(3) or heredoc.group(4),
+                                bool(heredoc.group(1))))
+                i = heredoc.end()
+                continue
+        if ch == "\n" and pending:
+            i += 1
+            for word, dash in pending:
+                while i < len(text):
+                    end = text.find("\n", i)
+                    end = len(text) if end < 0 else end
+                    line = text[i:end].rstrip("\r")
+                    i = min(end + 1, len(text))
+                    if (line.lstrip("\t") if dash else line) == word:
+                        break
+                else:
+                    return None
+            pending.clear()
+            continue
+        if ch in "'\"":
+            end = (_double_quote_end(text, i, depth + 1) if ch == '"'
+                   else _quote_end(text, i))
+            if end is None:
+                return None
+            i = end
+            continue
+        if text.startswith("$(", i) and not text.startswith("$((", i):
+            level += 1
+            if level > MAX_SUBST_DEPTH:
+                if bounded:
+                    raise TooManyTargets
+                return None
+            cases.append(0)
+            i += 2
+            continue
+        if ch in "ce":
+            cases[-1] += _case_step(text, i, cases[-1])
+        if ch == "(":
+            level += 1
+            cases.append(0)
+        elif ch == ")" and not cases[-1]:
+            level -= 1
+            cases.pop()
+            if not level:
+                return i + 1
+        i += 1
+    return None
+
+
+def _double_quote_end(text, start, depth=0):
+    """End of a double quote, skipping command substitutions with their own quotes."""
+    if depth >= MAX_SUBST_DEPTH:
+        raise TooManyTargets
+    i = start + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+        elif text.startswith("$(", i) and not text.startswith("$((", i):
+            i = _subst_end(text, i, depth + 1)
+            if i is None:
+                return None
+        elif text[i] == '"':
+            return i + 1
+        else:
+            i += 1
+    return None
+
+
+def _quoted_substitutions(text, depth):
+    """Only executable substitutions in a double-quoted value, as separate commands."""
+    if depth >= MAX_SUBST_DEPTH and "$(" in text:
+        raise TooManyTargets
+    parts, i = [], 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text.startswith("$(", i) and not text.startswith("$((", i):
+            end = _subst_end(text, i)
+            if end is None:
+                raise TooManyTargets
+            parts.append("$(" + _strip(text[i + 2:end - 1], depth=depth + 1)[0] + ")")
+            i = end
+            continue
+        i += 1
+    return " ".join(parts)
+
+
 def _strip(command, mode="default", depth=0):
     """(text, frame_open) for _strip_heredocs_and_quotes: `mode` is "default" (the
     frame model below), "legacy" (the older `((`/`))` count) or "none" (a `<<` is never
@@ -629,14 +736,16 @@ def _strip(command, mode="default", depth=0):
 
     def starts_segment(at):
         """Whether command[at] ends the separator after which a new segment starts, as
-        _CD_SPLIT_RE splits: `;`, newline, a `{ ` and the second char of `&&` / `||`
-        (a single `&` or `|`, `|&`, `>&2`, `&>`, `>|` and `{a,b}` are not: a pipeline
-        stage or background command is not a place a cd moves)."""
+        _CD_SPLIT_RE splits: `;`, newline, standalone `&`, a `{ ` and the second
+        char of `&&` / `||`. A single `|`, `|&`, `>&2`, `&>`, `>|` and `{a,b}`
+        do not split here."""
         ch = command[at]
         if ch in ";\n":
             return True
         if ch in "&|":
-            return command[at - 1:at] == ch
+            return command[at - 1:at] == ch or (ch == "&" and
+                    command[at - 1:at] not in ("|", "<", ">", ";") and
+                    command[at + 1:at + 2] not in ("&", ">", "|"))
         return (ch == "{" and (at == 0 or command[at - 1] in " \t\n;&|(")
                 and command[at + 1:at + 2] in (" ", "\t", "\n"))
 
@@ -700,26 +809,47 @@ def _strip(command, mode="default", depth=0):
             if command.startswith("\n", i + 1):
                 i += 2  # line continuation: `git \<newline>commit` is one command
                 continue
+            if command.startswith("$(", i + 1):
+                end = _subst_end(command, i + 1)
+                if end is not None:
+                    emit(" ")  # escaped $, so the apparent substitution is inert
+                    i = end
+                    continue
             emit(command[i:i + 2])
             i += 2
             continue
         if ch in "'\"":
-            end = _quote_end(command, i)
+            end = _double_quote_end(command, i) if ch == '"' else _quote_end(command, i)
             if end is None:
                 # Unbalanced quote: keep the rest; a spurious check is safer than
                 # hiding a later git command.
                 emit(command[i:])
                 break
+            nested = ""
+            if ch == '"' and "$(" in command[i:end]:
+                nested = _quoted_substitutions(command[i + 1:end - 1], depth)
+                if nested:
+                    out[seg_slot] += nested + "; "
             if _may_keep(tail) and (
                     _GIT_DASH_C_PREFIX_RE.search(tail) or _CD_PREFIX_RE.search(tail)
                     or (trimmed and _LOOSE_KEEP_RE.search(tail))):
-                emit('""' if _OPAQUE_VALUE_RE.search(tail) else command[i:end])
+                emit('"$()"' if ch == '"' and nested else
+                     ('""' if _OPAQUE_VALUE_RE.search(tail) else command[i:end]))
             elif (_GIT_WORD_RE.fullmatch(command, i + 1, end - 1)
                   and (end == n or command[end] in " \t\n;&|()<>")
                   and _COMMAND_POS_RE.search(tail)):
                 # A quoted word the command word goes on after (`'git'x push`) is
                 # dropped instead, as before, which keeps the rest of it visible.
                 emit("git")
+            i = end
+            continue
+        if command.startswith("$(", i) and _may_keep(tail) and _GIT_DASH_C_PREFIX_RE.search(tail):
+            end = _subst_end(command, i, bounded=True)
+            if end is None:
+                raise TooManyTargets
+            inner = _strip(command[i + 2:end - 1], mode, depth + 1)[0]
+            out[seg_slot] += _SLOT_MARK + "$(" + inner + "); "
+            emit('"$()"')
             i = end
             continue
         if ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
@@ -922,6 +1052,159 @@ def _subst_commands(command):
     return None if result == command else result
 
 
+def _literal_output(inner, depth=0, bounded=False):
+    """Provable literal output of a narrow echo/printf command, or None."""
+    if depth >= MAX_SUBST_DEPTH:
+        raise TooManyTargets
+    if len(inner) > MAX_CD_PATH_CHARS:
+        if bounded and re.match(r"[ \t]*(?:echo|printf)[ \t]+", inner):
+            raise TooManyTargets
+        return None
+    m = re.fullmatch(r"[ \t]*(echo|printf)[ \t]+([\s\S]*?)[ \t]*", inner)
+    if not m:
+        return None
+    args = m.group(2)
+    # An entire nested substitution is one shell word; evaluate only another literal
+    # echo/printf, never a general command or an expression embedded in a word.
+    nested = re.fullmatch(r"(.*?)(\$\([\s\S]*\))(.*?)", args)
+    if nested:
+        start = args.find("$(")
+        end = _subst_end(args, start)
+        if end is None or "$" in args[:start] + args[end:]:
+            return None
+        output = _literal_output(args[start + 2:end - 1], depth + 1, bounded)
+        if output is None or _SUBST_META_RE.search(output):
+            return None
+        quote, escaped = None, False
+        for char in args[:start]:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote != "'":
+                escaped = True
+            elif char == quote:
+                quote = None
+            elif char in "'\"" and quote is None:
+                quote = char
+        if quote == "'":
+            return None
+        replacement = (output.strip().replace("\\", "\\\\").replace('"', '\\"')
+                       if quote == '"' else shlex.quote(output.strip()))
+        args = args[:start] + replacement + args[end:]
+    if "$" in args or "`" in args or re.search(r"[;&|<>]", args):
+        return None
+    try:
+        words = shlex.split(args)
+    except ValueError:
+        return None
+    if m.group(1) == "echo":
+        while words and re.fullmatch(r"-[neE]+", words[0]):
+            words.pop(0)
+        output = " ".join(words)
+    else:
+        if len(words) != 1 or "%" in words[0]:
+            return None
+        output = words[0].replace("\\n", "\n")
+        if "\\" in output:
+            return None
+    return output if output.strip() and not re.search(r"[;&|<>()$`]", output) else None
+
+
+_STATIC_TOKEN_RE = re.compile(r"""\\[\s\S]|'[^']*'|\beval[ \t]+"\$\(|"|#|<<|\n|\$\(""")
+_LITERAL_COMMAND_RE = re.compile(r"[ \t]*(?:echo|printf)[ \t]+")
+
+
+def _static_command_reading(command, bounded=False):
+    """One reading with literal command-position substitutions/eval made visible."""
+    out, pos, scanned, changed, pending = [], 0, 0, False, []
+    for m in _STATIC_TOKEN_RE.finditer(command):
+        start = m.start()
+        if start < scanned:
+            continue
+        token = m.group(0)
+        if token[0] in "\\'":
+            continue
+        if token == '"':
+            scanned = _double_quote_end(command, start) or len(command)
+            continue
+        if token == "#":
+            if start == 0 or command[start - 1] in " \t\n;&|()":
+                end = command.find("\n", start)
+                scanned = len(command) if end < 0 else end
+            continue
+        if token == "<<":
+            if command[start - 1:start] == "<" or command[start + 2:start + 3] == "<":
+                continue
+            heredoc = HEREDOC_RE.match(command, start)
+            if heredoc:
+                pending.append((heredoc.group(2) or heredoc.group(3) or heredoc.group(4),
+                                bool(heredoc.group(1))))
+                scanned = heredoc.end()
+            continue
+        if token == "\n":
+            scanned = m.end()
+            for word, dash in pending:
+                while scanned < len(command):
+                    end = command.find("\n", scanned)
+                    end = len(command) if end < 0 else end
+                    line = command[scanned:end].rstrip("\r")
+                    scanned = min(end + 1, len(command))
+                    if (line.lstrip("\t") if dash else line) == word:
+                        break
+            pending.clear()
+            continue
+        lead = start
+        while lead > pos and command[lead - 1] in " \t":
+            lead -= 1
+        if start < pos or (lead > pos and command[lead - 1] not in ";&|\n({"):
+            continue
+        is_eval = m.group(0).startswith("eval")
+        sub_start = command.find("$(", start, m.end()) if is_eval else start
+        if not _LITERAL_COMMAND_RE.match(command, sub_start + 2):
+            continue
+        end = _subst_end(command, sub_start, bounded=bounded)
+        if end is None:
+            break
+        outer_end = end + 1 if is_eval and command[end:end + 1] == '"' else end
+        if is_eval and outer_end == end:
+            continue
+        output = _literal_output(command[sub_start + 2:end - 1], bounded=bounded)
+        if output is None:
+            continue
+        out.extend((command[pos:start], output.rstrip("\n")))
+        pos, scanned, changed = outer_end, outer_end, True
+    return "".join(out) + command[pos:] if changed else None
+
+
+_CONDITIONAL_CD_RE = re.compile(
+    r"""\\[\s\S]|"(?:[^"\\]|\\[\s\S])*"|'[^']*'|"""
+    r"""\b(then|else)(\s+)cd([ \t]+(?:"(?:[^"\\]|\\[\s\S])*"|'[^']*'|\\[\s\S]|[^\s;&|()'"\\])+)""")
+
+
+def _conditional_readings(command, bounded):
+    """Read simple if branch cds as optional, since the condition is unknown."""
+    if not re.search(r"\bif\b", command):
+        return ()
+    matches = [m for m in _CONDITIONAL_CD_RE.finditer(command) if m.group(1)]
+    if len(matches) > MAX_OR_ENUM:
+        if bounded:
+            raise TooManyTargets
+        return ()
+    if bounded and len(command) * (2 ** len(matches) - 1) > MAX_SCAN_WORK:
+        raise TooManyTargets
+    readings = []
+    for picks in itertools.product((False, True), repeat=len(matches)):
+        if not any(picks):
+            continue
+        parts, pos = [], 0
+        for match, skip in zip(matches, picks):
+            parts.append(command[pos:match.start()])
+            parts.append(match.group(1) + match.group(2) + (":" if skip else
+                         "cd" + match.group(3)))
+            pos = match.end()
+        readings.append("".join(parts) + command[pos:])
+    return tuple(readings)
+
+
 def _native_path(path):
     """On Windows, translate a Git Bash / MSYS drive path (`/c/Users/me`) to `C:/Users/me`
     and expand `~`, so it can be joined with the payload cwd."""
@@ -1012,12 +1295,13 @@ def _scrub_key_markers(lines):
     found = False
     cut, prev = None, None  # prev: the last non-blank line before the current one
     for i, line in enumerate(lines):
+        if blank(line):
+            continue
         if KEY_END_RE.search(line):
             found = True
             if prev is not None and (KEY_LINE_RE.match(lines[prev]) or CRC_LINE_RE.match(lines[prev])):
                 cut = i
-        if not blank(line):
-            prev = i
+        prev = i
     if cut is not None:
         for end in KEY_END_RE.finditer(lines[cut]):
             pass
@@ -1030,6 +1314,8 @@ def _scrub_key_markers(lines):
     begin_at, nxt, header = None, None, False
     short, short_header = True, False
     for i in range(len(lines) - 1, -1, -1):
+        if blank(lines[i]):
+            continue
         if KEY_BEGIN_RE.search(lines[i]):
             found = True
             if (KEY_LINE_RE.match(lines[nxt]) if nxt is not None else header) or (
@@ -1039,18 +1325,18 @@ def _scrub_key_markers(lines):
             short, short_header = True, False
         elif KEY_HEADER_LINE_RE.match(lines[i]):
             short_header = True
-        elif not (blank(lines[i]) or BASE64_LINE_RE.match(lines[i])):
+        elif not BASE64_LINE_RE.match(lines[i]):
             short, short_header = False, False
         if KEY_HEADER_LINE_RE.match(lines[i]):
             header = True
-        elif not blank(lines[i]):
+        else:
             nxt, header = i, False
     if begin_at is not None:
         begin = KEY_BEGIN_RE.search(lines[begin_at])
         newline = "\n" if lines[-1].endswith("\n") else ""
         lines[begin_at:] = [lines[begin_at][:begin.start()] + "[redacted]" + newline]
     if found:
-        lines = [KEY_END_RE.sub("[redacted]", KEY_BEGIN_RE.sub(
+        lines = [line if "-----" not in line else KEY_END_RE.sub("[redacted]", KEY_BEGIN_RE.sub(
                      "[redacted]", scrub_escaped_begin(scrub_escaped_end(line))))
                  for line in lines]
     return lines, found
@@ -1249,6 +1535,8 @@ def _or_cd_ordinals(command):
                 ords.add(after_ord)
             if this_ord is not None:
                 ords.add(this_ord)
+            if len(ords) > MAX_OR_ENUM:
+                return sorted(ords)
         if after != "||" or _has_text(segment, op):
             after, after_ord = op, this_ord
         if op == "(" or (op == "`" and not (opened and opened[-1][0] == "`")):
@@ -1264,7 +1552,7 @@ def _or_cd_ordinals(command):
 def _cd_dirs(command, restore=True, case_cds=True, or_cds=True, or_left_cds=True,
              or_choice=None):
     """([segment ends], [cd directory in effect after each]) for the command's
-    &&/||/;/newline/`(`/`)`/`{`/backtick segments (successive cds accumulate; relative
+    &&/||/&/;/newline/`(`/`)`/`{`/backtick segments (successive cds accumulate; relative
     results stay relative to the payload cwd; None before any cd). A `(` subshell or a
     backtick substitution gets its own cwd: its closing `)`/backtick restores the one in
     effect at the opener. A case pattern's `)` splits nothing, so a `pattern) cd dir`
@@ -1280,6 +1568,7 @@ def _cd_dirs(command, restore=True, case_cds=True, or_cds=True, or_left_cds=True
     command so resolving each git match is a bisect, not a rescan of its prefix."""
     ends, dirs = [], []
     result, capped, pos = None, False, 0
+    list_start = (result, capped)
     after, after_ord, ors = None, None, 0  # the separator before the segment; `||` count
     saved = []  # (opener, cd result and capped at it) for each open `(` / backtick
     # Open `case` statements per frame (cases[0]: no frame), as in _strip: while the
@@ -1311,22 +1600,27 @@ def _cd_dirs(command, restore=True, case_cds=True, or_cds=True, or_left_cds=True
         this_ord = None
         if op == "||":
             this_ord, ors = ors, ors + 1
-        if ((case_cds or not (open_cases or loose))
+        if (op != "&" and (case_cds or not (open_cases or loose))
                 and not _or_cd_skipped(after, after_ord, op, this_ord, or_cds, or_left_cds,
                                        or_choice)):
             result, capped = _cd_segment_dir(segment, result, capped)
+        if op == "&":
+            result, capped = list_start
+        if op in (";", "&") or (op == "\n" and (segment.strip() or after not in ("&&", "||"))):
+            list_start = (result, capped)
         if after != "||" or _has_text(segment, op):
             after, after_ord = op, this_ord  # a blank segment (`||` newline `cd b`) keeps the `||`
         if (op == "(" and restore) or (op == "`" and not (saved and saved[-1][0] == "`")):
             # The heredoc commands _strip puts before a command are transparent to the
             # `||` the segment before it follows (`cd a || cd b <<EOF` with a `$( )`
             # body still has `cd b` after the `||`).
-            saved.append((op, result, capped, after, after_ord, _is_subst(command, sep)))
+            saved.append((op, result, capped, after, after_ord, _is_subst(command, sep), list_start))
+            list_start = (result, capped)
             cases.append(0)
         elif op in (")", "`") and saved and saved[-1][0] == ("(" if op == ")" else "`"):
             # Restored before it is recorded: a git match starting at this `)` (e.g.
             # `X=$(cd sub) git push`) runs outside the subshell.
-            _, result, capped, was_after, was_ord, subst = saved.pop()
+            _, result, capped, was_after, was_ord, subst, list_start = saved.pop()
             if subst:
                 after, after_ord = was_after, was_ord
             open_cases -= cases.pop()
@@ -1369,6 +1663,7 @@ def _case_branch_dirs(command, git_starts, or_cds=True, or_left_cds=True, or_cho
     out, k = [], 0
     after, after_ord, ors = None, None, 0  # as in _cd_dirs
     cands, recorded, pos = ((None, False),), ((None, False),), 0
+    list_start = cands
     saved = []  # (opener, candidates at it) for each open `(` / backtick
     # Open case statements per frame (frames[0]: no frame), innermost last: (candidates
     # before it, {branch-end candidate: None}).
@@ -1390,9 +1685,13 @@ def _case_branch_dirs(command, git_starts, or_cds=True, or_left_cds=True, or_cho
         if op == "||":
             this_ord, ors = ors, ors + 1
         target = _cd_target(segment)
-        if target is not None and not _or_cd_skipped(after, after_ord, op, this_ord, or_cds,
+        if op != "&" and target is not None and not _or_cd_skipped(after, after_ord, op, this_ord, or_cds,
                                                       or_left_cds, or_choice):
             cands = _merge_cands(_join_capped(r, target, c) for r, c in cands)
+        if op == "&":
+            cands = list_start
+        if op in (";", "&") or (op == "\n" and (segment.strip() or after not in ("&&", "||"))):
+            list_start = cands
         if after != "||" or _has_text(segment, op):
             after, after_ord = op, this_ord
         i = sep.start()
@@ -1408,10 +1707,11 @@ def _case_branch_dirs(command, git_starts, or_cds=True, or_left_cds=True, or_cho
         elif op == ")" and frames[-1]:
             pass  # a case pattern's `)`: splits, restores nothing
         elif op == "(" or (op == "`" and not (saved and saved[-1][0] == "`")):
-            saved.append((op, cands, after, after_ord, _is_subst(command, sep)))
+            saved.append((op, cands, after, after_ord, _is_subst(command, sep), list_start))
+            list_start = cands
             frames.append([])
         elif op in (")", "`") and saved and saved[-1][0] == ("(" if op == ")" else "`"):
-            _, cands, was_after, was_ord, subst = saved.pop()
+            _, cands, was_after, was_ord, subst, list_start = saved.pop()
             if subst:
                 after, after_ord = was_after, was_ord
             frames.pop()
@@ -1444,7 +1744,7 @@ def _cd_target(segment):
     except ValueError:
         tokens = m.group(1).split()
     # Drop options (-P, --) and redirections (2>/dev/null) around the directory.
-    tokens = [t for t in tokens if not t.startswith("-") and not re.match(r"^\d*[<>]", t)]
+    tokens = [t for t in tokens if not t.startswith("-") and not re.match(r"^(?:\d*[<>]|&>)", t)]
     if len(tokens) != 1:
         return None
     return _usable_path(tokens[0])
@@ -1549,6 +1849,8 @@ def _scan_targets(raw_command, base_cwd, max_targets=None):
     # Also with a command-position `echo cd b` substitution replaced by its output, which
     # the shell runs as a command (see _subst_commands).
     raws += tuple(r for r in map(_subst_commands, raws) if r is not None)
+    raws += tuple(r for raw in raws[:2]
+                  if (r := _static_command_reading(raw, max_targets is not None)) is not None)
     for raw_command in raws:
         command, frame_open = _strip(raw_command)
         commands.append(command)
@@ -1557,13 +1859,17 @@ def _scan_targets(raw_command, base_cwd, max_targets=None):
                 commands.append(_strip(raw_command, "legacy")[0])
             if frame_open:
                 commands.append(_strip(raw_command, "none")[0])
-    targets, seen = [], set()
+    commands += [reading for command in tuple(commands)
+                 for reading in _conditional_readings(command, max_targets is not None)]
+    targets, seen, scan_work = [], set(), 0
     for k, command in enumerate(commands):
         if command in commands[:k]:
             continue
+        matches = list(GIT_COMMAND_RE.finditer(command))
+        if not matches:
+            continue
         add = GIT_ADD_RE.search(command)
         add_end = add.end() if add else None
-        cd_indexes = [_cd_dirs(command)]
         # A case word _CASE_RE doesn't take (`case $(f $(g $(h))) in`) leaves its
         # pattern `)` taken for a subshell's, restoring the cwd too early, and a cd in a
         # case branch may or may not run; so with a `case` in the command, also resolve
@@ -1572,7 +1878,6 @@ def _scan_targets(raw_command, base_cwd, max_targets=None):
         # with a `||`, each success/failure combination of the ones with a cd next to
         # them (at most MAX_OR_ENUM, else no cd right after any, or none right before
         # any), also for the case branches (see _cd_dirs, _case_branch_dirs).
-        matches = list(GIT_COMMAND_RE.finditer(command))
         or_readings = ()
         if "||" in command:
             ords = _or_cd_ordinals(command)
@@ -1580,10 +1885,17 @@ def _scan_targets(raw_command, base_cwd, max_targets=None):
                 or_readings = tuple({"or_choice": dict(zip(ords, picks))}
                                     for picks in itertools.product("RL", repeat=len(ords)))
             elif ords:
+                if max_targets is not None:
+                    raise TooManyTargets
                 or_readings = ({"or_cds": False}, {"or_left_cds": False})
+        has_case = bool(_CASE_WORD_RE.search(command))
+        scan_work += len(command) * (len(or_readings) + 1) * (2 if has_case else 1)
+        if max_targets is not None and scan_work > MAX_SCAN_WORK:
+            raise TooManyTargets
+        cd_indexes = [_cd_dirs(command)]
         branch_dirs = []
         resolved = {}
-        if _CASE_WORD_RE.search(command):
+        if has_case:
             cd_indexes.append(_cd_dirs(command, restore=False))
             cd_indexes.append(_cd_dirs(command, case_cds=False))
             starts = [m.start() for m in matches]
@@ -1651,9 +1963,9 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": (
-                f"[jev risk gate] Too many git targets to review: the scanner found more "
-                f"than {MAX_TARGETS} candidate git targets (cwd/option combinations) in "
-                "this command. Split it into smaller commands."),
+                "[jev risk gate] Too many git targets to review safely: this command "
+                f"exceeds a scanner limit ({MAX_TARGETS} candidate targets, bounded "
+                "branching, or substitution depth). Split it into smaller commands."),
         }}
     if not targets:
         return None

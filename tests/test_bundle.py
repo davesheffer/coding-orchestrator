@@ -24,7 +24,7 @@ class BundleContractTests(unittest.TestCase):
         expected = {
             "scout": ("sonnet", "gpt-6-luna", "read-only"),
             "runner": ("sonnet", "gpt-6-luna", "workspace-write"),
-            "builder": ("sonnet", "gpt-6-sol", "workspace-write"),
+            "builder": ("sonnet", "gpt-6.1-sol", "workspace-write"),
             "critic": ("fable", "gpt-6-astra", "read-only"),
         }
         for name in ROLES:

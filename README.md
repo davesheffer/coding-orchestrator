@@ -21,10 +21,10 @@ sending messages stay with the orchestrator and the user's authorization.
 
 | Role | Responsibility | Claude Code | Codex model / reasoning |
 |---|---|---|---|
-| Orchestrator | Design, ambiguity, root causes, final verification | Opus 5.5 | GPT-6 Sol / medium |
+| Orchestrator | Design, ambiguity, root causes, final verification | Opus 5.5 | GPT-6.1 Sol / medium |
 | `scout` | Read-only lookup and reconnaissance | Sonnet | GPT-6 Luna / low |
 | `runner` | Exact commands; exit codes and verbatim failures | Sonnet | GPT-6 Luna / low |
-| `builder` | A specified change, then its acceptance check | Sonnet | GPT-6 Sol / medium |
+| `builder` | A specified change, then its acceptance check | Sonnet | GPT-6.1 Sol / medium |
 | `critic` | Fresh-context adversarial review | Fable | GPT-6 Astra / high |
 
 The cross-client tier mapping is **Sol → Opus 5.5**, **Astra → Fable**,
@@ -225,25 +225,33 @@ or a newline, and after `VAR=value`, `then`/`do`/`else` and the
 `nice -n 5`). It understands `git -c k=v`, `--no-pager`, `-C <dir>` and earlier
 `cd <dir>` steps in the same command, including a subshell
 (`cd <dir> && git add -A && git commit`, `(cd <dir> && git commit)`) and, on
-Windows, Git Bash paths such as `cd /c/Users/me/repo`. It ignores quoted text,
-comments and heredoc bodies (a `<<` inside quotes or a comment is not a
-heredoc), honours backslash escapes and `\`-newline continuations, and gates
+Windows, Git Bash paths such as `cd /c/Users/me/repo`. It ignores literal quoted text,
+comments and quoted heredoc bodies, while scanning executable substitutions in
+double quotes and unquoted heredocs. It honours backslash escapes and
+`\`-newline continuations, and gates
 every commit and push in the command: with a push anywhere, it asks about the
 staged diff plus the unpushed commits, as a push. A push is compared with its
 upstream, else the push remote's default branch (`refs/remotes/<remote>/HEAD`,
 where the remote is `remote.pushDefault` or `origin`), else `origin/main`, else
 `origin/master`; with none of these, the push is not checked. Known bypasses:
-`sh -c`/`bash -c`/`eval`, a shell alias or function, `xargs`, git run through a
-variable (`$GIT push`) or a quoted path, wrappers with value options
-(`sudo -u me git`), keywords such as `if git commit`, and `"$(git push)"` inside
-double quotes. It also misses `git commit <pathspec>` with nothing staged, and
-`--git-dir`/`--work-tree` or `GIT_DIR`/`GIT_WORK_TREE` pointing at another repo
-(these are detected, but the gate still diffs the current directory). It also
+`sh -c`/`bash -c`, general `eval`, a shell alias or function, `xargs`, git run through a
+variable (`$GIT push`), wrappers with value options
+(`sudo -u me git`), and keywords such as `if git commit`. It also misses
+`git commit <pathspec>` with nothing staged, and `GIT_DIR`/`GIT_WORK_TREE`
+environment overrides. It also
 does not scan the body of a `bash <<EOF ... EOF` heredoc or a separate
 `bash script.sh` file: a git command inside either runs unseen. Git calls
 within one gate run share a single time budget; if it runs out, the gate
 allows the call. With more than 1,000 untracked files, only the first 1,000 are
 sent, and the change always counts as needing review.
+
+The scanner also follows literal command-position `echo`/`printf` substitutions,
+a narrow literal `eval` form, and candidate directories across `||` and simple
+conditional branches. Background command lists do not move the foreground shell.
+Dynamic directory values retain a parent-directory fallback; the scanner does
+not execute the command to discover its value. Commands exceeding 256 candidate
+targets or the branching, nesting, or analysis-work limits are denied with a
+request to split the command.
 
 Before anything is sent, the gate replaces the hunks of staged files named
 `.env*`, `*.env`, `*.pem`, `*.key`, `*secret*`, `id_rsa*`, `*.p12`, `*.pfx`,
@@ -440,7 +448,7 @@ your custom `CODEX_HOME` path.
 Start a **new Codex session** from the project you want to work on:
 
 ```sh
-codex -m gpt-6-sol -c 'model_reasoning_effort="medium"'
+codex -m gpt-6.1-sol -c 'model_reasoning_effort="medium"'
 ```
 
 Try: “Use scout to locate the task-report renderer. Explain its entry points;
@@ -482,8 +490,8 @@ does not change firewall settings. See the [Windows sandbox documentation](https
 An [optional last-resort network fallback](docs/agent-routing.md#optional-network-exception)
 can be approved per role. The launcher tries isolation first on every run and
 retains file-access limits and disabled external tools. Installation grants no
-exception. Model-unavailable errors before any work can try Luna -> Sol
-for scout/runner; builder uses Sol only. Tests, partial work and unknown
+exception. Model-unavailable errors before any work can try Luna -> 6.1 Sol -> 6 Sol
+for scout/runner; builder tries 6.1 Sol -> 6 Sol. Tests, partial work and unknown
 errors are never blindly retried. The older
 [critic-only manual workflow](docs/critic-network-fallback.md) remains available.
 

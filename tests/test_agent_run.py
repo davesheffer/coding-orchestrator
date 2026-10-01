@@ -35,6 +35,44 @@ class RoutingTests(unittest.TestCase):
                    'aggregated_output': 'model_not_found', 'exit_code': 1}}]
         self.assertFalse(agent.retryable_model_error(events, 1))
 
+    def test_startup_metadata_warnings_allow_unavailable_model_fallback(self):
+        warnings = [
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': message}}
+            for message in (
+                'Configured service tier `priority` is not advertised as supported for model '
+                '`gpt-6.1-sol` and will be omitted from requests.',
+                'Model metadata for `gpt-6.1-sol` not found. Defaulting to fallback metadata; '
+                'this can degrade performance and cause issues.')]
+        unavailable = {'type': 'error', 'message':
+                       "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}
+        self.assertTrue(agent.retryable_model_error(warnings + [{'type': 'turn.started'}, unavailable], 1))
+        self.assertFalse(agent.retryable_model_error([{'type': 'turn.started'}] + warnings + [unavailable], 1))
+        self.assertFalse(agent.retryable_model_error(warnings, 1))
+        self.assertFalse(agent.retryable_model_error(warnings + [unavailable], 0))
+        for item in ({'type': 'agent_message', 'text': 'model_not_found'},
+                     {'type': 'command_execution', 'aggregated_output': warnings[0]['item']['message']},
+                     {'type': 'error', 'message': 'Unknown startup warning'}, None):
+            events = warnings + [{'type': 'item.completed', 'item': item}, unavailable]
+            self.assertFalse(agent.retryable_model_error(events, 1))
+
+    def test_unknown_events_and_mixed_errors_never_retry(self):
+        unavailable = {'type': 'error', 'message': 'model_not_found'}
+        for event in ({'type': 'tool.started'}, {'type': 'turn.completed'},
+                      {'type': 'unknown.event'}, {'type': 'error', 'message': '401 unauthorized'},
+                      {'type': 'turn.failed', 'error': {'message': 'rate limit exceeded'}},
+                      {'type': 'error', 'message': 'model_not_found: authentication failed'},
+                      {'type': 'error', 'message': 'model_not_found status 403'},
+                      {'type': 'error', 'status': 401, 'message': 'model_not_found'},
+                      {'type': 'turn.failed', 'error': {'code': 'unauthorized', 'message': 'model_not_found'}},
+                      {'type': 'turn.failed', 'error': 'model_not_found'},
+                      {'type': 'error', 'message': {'code': 'model_not_found'}}):
+            with self.subTest(event=event):
+                events = [{'type': 'thread.started'}, {'type': 'turn.started'}, event, unavailable]
+                self.assertFalse(agent.retryable_model_error(events, 1))
+        self.assertTrue(agent.retryable_model_error([
+            {'type': 'thread.started'}, {'type': 'turn.started'}, unavailable,
+            {'type': 'turn.failed', 'error': {'message': 'model_not_found'}}], 1))
+
     def test_toml_roundtrip_quoted_paths_and_instruction_text(self):
         value = {'C:\\repo name': 'write', 'a.b': {'quote': '"\n`$()'}, 'enabled': False}
         self.assertEqual(tomllib.loads('value = ' + agent.toml(value))['value'], value)
@@ -48,6 +86,11 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(tomllib.loads('value = ' + agent.toml(value))['value'], value)
 
     def test_role_model_chains_do_not_silently_upgrade_to_astra(self):
+        self.assertEqual(agent.MODELS['scout'], [('gpt-6-luna', 'low'),
+                         ('gpt-6.1-sol', 'low'), ('gpt-6-sol', 'low')])
+        self.assertEqual(agent.MODELS['runner'], agent.MODELS['scout'])
+        self.assertEqual(agent.MODELS['builder'], [('gpt-6.1-sol', 'medium'),
+                         ('gpt-6-sol', 'medium')])
         for role in ('scout', 'runner', 'builder'):
             self.assertNotIn('gpt-6-astra', [m for m, _ in agent.MODELS[role]])
         self.assertEqual(agent.MODELS['critic'], [('gpt-6-astra', 'high')])

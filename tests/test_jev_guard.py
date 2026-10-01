@@ -1158,11 +1158,114 @@ class GateTests(unittest.TestCase):
                 ("cd a || cd b || cd c || cd d || cd e; git commit", ("a", "b", "c", "d", "e"))):
             self._assert_cwds_among(command, command[-3:] == "mit" and "commit" or "push",
                                     *[j("/repo", c) for c in cwds])
-        # With more than MAX_OR_ENUM only the two one-sided readings are kept.
+        # A longer adjacent chain must retain every possible successful cd.
         command = "cd a || cd b || cd c || cd d || cd e || cd f; git push"
         cwds = self._cwds(command)
-        self.assertEqual({j("/repo", "a"), j("/repo", "f")} - cwds, set())
-        self.assertNotIn(j("/repo", "b"), cwds)
+        self.assertTrue({j("/repo", c) for c in "abcdef"} <= cwds)
+
+    def test_issue_66_substitutions_and_static_output(self):
+        j = os.path.join
+        for command in ("git -C $(cd 'b)'; pwd) commit -am x",
+                        "git -C $(case x in x) echo .;; esac) commit -am x"):
+            self.assertIn(("commit", "/repo", True),
+                          [t[:3] for t in jev._scan_targets(command, "/repo")], command)
+        for command in ("git -C $(git push; pwd) commit -am x",
+                        'git -C "$(git push)" commit -am x'):
+            self.assertEqual({"push", "commit"},
+                             {t[0] for t in jev._scan_targets(command, "/repo")}, command)
+        for command, cwd in (("echo \"$(cd a; git push)\"", j("/repo", "a")),
+                             ("cat <<< \"$(git push)\"", "/repo"),
+                             ("echo \"$(echo 'x'; git push)\"", "/repo"),
+                             ("$(printf 'cd a\\n'); git push", j("/repo", "a")),
+                             ("$(echo $(echo cd a)); git push", j("/repo", "a")),
+                             ("eval \"$(echo cd a)\"; git push", j("/repo", "a"))):
+            self.assertIn(cwd, self._cwds(command, "push"), command)
+        self.assertEqual(self._cwds('cd a; echo "$(cd b; git push)"; git push'),
+                         {j("/repo", "a", "b"), j("/repo", "a")})
+        self.assertIn(j("/repo", "b c"), self._cwds('echo "$(git -C "b c" push)"'))
+        for command in ("echo '$(git push)'", "echo \"\\$(git push)\"",
+                        "echo \\$(git push)", "echo \"$(echo 'git push')\"",
+                        "cat <<'EOF'\n$(git push)\nEOF\n"):
+            self.assertEqual(self._ops(command), [], command)
+
+    def test_issue_66_cd_candidates_and_background(self):
+        j = os.path.join
+        for condition in ("true", "false"):
+            cwds = self._cwds(f"if {condition}; then cd a; fi || cd b; git push")
+            self.assertTrue({"/repo", j("/repo", "a"), j("/repo", "b")} <= cwds)
+        cwds = self._cwds("if false; then cd a; else cd z; fi || cd b; git push")
+        self.assertTrue({"/repo", j("/repo", "a"), j("/repo", "z"),
+                         j("/repo", "b")} <= cwds)
+        for command in ('if false; then\ncd a; fi || cd b; git push',
+                        'if false; then cd "a b"; fi || cd b; git push'):
+            self.assertIn("/repo", self._cwds(command, "push"), command)
+        self.assertIn(j("/repo", "a b"), self._cwds('if true; then cd "a b"; fi; git push'))
+        self.assertIn(j("/repo", "a"), self._cwds(
+            "true & cd a <<EOF\n$(true)\nEOF\ngit push"))
+        self.assertEqual(self._cwds("cd a & git push"), {"/repo"})
+        self.assertIn(j("/repo", "a"), self._cwds("cd a && git push"))
+        self.assertIn("/repo", self._cwds("cd a |& git push"))
+        for command in ("cd a >&2; git push", "cd a &>out; git push"):
+            self.assertIn(j("/repo", "a"), self._cwds(command), command)
+        self.assertIn(j("/repo", "a&b"), self._cwds("cd 'a&b'; git push"))
+        with self.assertRaises(jev.TooManyTargets):
+            jev._scan_targets(" || ".join("cd x" for _ in range(10)) + "; git push",
+                              "/repo", jev.MAX_TARGETS)
+        with self.assertRaises(jev.TooManyTargets):
+            jev._scan_targets("$(echo " + " " * (jev.MAX_CD_PATH_CHARS + 1)
+                              + "git push)", "/repo", jev.MAX_TARGETS)
+
+    def test_issue_66_review_nested_quotes_and_boundaries(self):
+        for command in ('git -C "$(echo "b c")" commit -am x',
+                        'git -C "$(git -C "b c" push; pwd)" commit -am x'):
+            self.assertIn(("commit", "/repo", True),
+                          [t[:3] for t in jev._scan_targets(command, "/repo")], command)
+        for command in ('echo "$(echo x # )\n git push)"',
+                        'echo "$(cat <<\'EOF\'\n)\nEOF\ngit push)"',
+                        '$(echo "$(echo git push)")'):
+            self.assertIn("/repo", self._cwds(command, "push"), command)
+        for command in ("echo 'git -C $('", "cat <<'EOF'\ngit -C $(\nEOF\n"):
+            self.assertEqual(jev._scan_targets(command, "/repo", jev.MAX_TARGETS), [], command)
+        self.assertIn(os.path.join("/repo", "a"), self._cwds(
+            "$(echo cd a); git -C $(case x in x) echo .;; esac) push", "push"))
+
+    def test_issue_66_background_lists_restore_foreground_cwd(self):
+        for command in ("true & cd a && true & git push", "cd a && true & git push",
+                        "cd a &&\ntrue & git push", "true & cd a || true & git push"):
+            self.assertIn("/repo", self._cwds(command, "push"), command)
+        command = "cd a; cd b && git push & git commit"
+        self.assertIn(os.path.join("/repo", "a", "b"), self._cwds(command, "push"))
+        self.assertEqual(self._cwds(command, "commit"), {os.path.join("/repo", "a")})
+
+    def test_issue_66_deep_substitutions_are_bounded(self):
+        command = "$(" * 8500 + "git push" + ")" * 8500
+        started = time.monotonic()
+        self.assertIn(("push", "/repo", False, None),
+                      jev._scan_targets(command, "/repo", jev.MAX_TARGETS))
+        self.assertLess(time.monotonic() - started, 2.0)
+        command = "$(echo " * 100 + "git push" + ")" * 100
+        with self.assertRaises(jev.TooManyTargets):
+            jev._scan_targets(command, "/repo", jev.MAX_TARGETS)
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.calls, [])
+        for inert in ("echo '" + command + "'", "cat <<'EOF'\n" + command + "\nEOF\n",
+                      "# " + command):
+            self.assertEqual(jev._scan_targets(inert, "/repo", jev.MAX_TARGETS), [])
+
+    def test_issue_66_branch_work_is_bounded(self):
+        chain = " || ".join("cd d" for _ in range(9))
+        command = chain + "; " + "git push; " * 3000
+        with self.assertRaises(jev.TooManyTargets):
+            jev._scan_targets(command, "/repo", jev.MAX_TARGETS)
+        self.assertEqual(jev._scan_targets(chain + " || cd end", "/repo", jev.MAX_TARGETS), [])
+        text = "if true; then cd a; fi\n" * 9
+        for inert in ("cat <<'EOF'\n" + text + "EOF\n", "echo '" + text + "'",
+                      "# if true; then cd a; fi\n" * 9):
+            self.assertEqual(jev._scan_targets(inert, "/repo", jev.MAX_TARGETS), [])
+            self.assertIsNone(self.gate(self.payload(inert), classify_fn=self.classify()))
+        option = 'git -C "' + text + '" push'
+        self.assertTrue(jev._scan_targets(option, "/repo", jev.MAX_TARGETS))
 
     def test_issue_63_case_with_or(self):
         j = os.path.join

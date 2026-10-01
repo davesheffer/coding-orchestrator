@@ -18,7 +18,7 @@ import jev_client as client  # noqa: E402
 CONFIG = HOME / "jev" / "config.json"
 STATE = HOME / "jev" / "state"
 LOG = HOME / "jev" / "jev-log.jsonl"
-MODELS = {"luna": "gpt-6-luna", "sol": "gpt-6-sol", "astra": "gpt-6-astra"}
+MODELS = {"luna": "gpt-6-luna", "sol": "gpt-6.1-sol", "astra": "gpt-6-astra"}
 RANK = {"luna": 0, "sol": 1, "astra": 2}
 INSTRUCTIONS = ("Choose the least expensive Codex model that will reliably complete this task well; "
                 "when torn between two models, choose the stronger one.")

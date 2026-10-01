@@ -1,10 +1,21 @@
 # Codex cheap-agent routing and fallbacks
 
 The orchestrator keeps design, ambiguous debugging and final verification on
-Sol/medium, escalating demanding cases to Astra. Scouts and runners start on
-Luna/low; specified implementation starts on Sol/medium. Critics remain
+GPT-6.1 Sol/medium, escalating demanding cases to Astra. Scouts and runners start on
+Luna/low; specified implementation starts on GPT-6.1 Sol/medium. Critics remain
 Astra/high. Bounded routine work should be delegated without waiting for a large
 context window or another user reminder.
+
+As checked on 2026-10-01, the [ChatGPT model guide](https://learn.chatgpt.com/docs/models)
+and [GPT-6.1 Sol API model page](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+recommend 6.1 Sol for complex coding, Luna for routine tasks and Astra for demanding
+work. The [2026-09-29 Codex changelog](https://learn.chatgpt.com/docs/changelog)
+records 6.1 Sol as the catalog default in Codex 0.159.1. Medium is retained for the
+main session and builder; 6.1 Sol supports it. Availability depends on account and
+client, and changing the configured model name does not grant access.
+The 2026-10-01 live check on the development machine rejected 6.1 Sol with
+ChatGPT sign-in. Compatibility fallback is therefore retained; this release does
+not claim that 6.1 Sol is available to every account.
 
 ## Install or upgrade
 
@@ -102,11 +113,14 @@ never grants exceptions to the other roles.
 
 | Role | Ordered model attempts |
 |---|---|
-| Scout / runner | Luna/low -> Sol/low |
-| Builder | Sol/medium |
+| Scout / runner | Luna/low -> 6.1 Sol/low -> 6 Sol/low |
+| Builder | 6.1 Sol/medium -> 6 Sol/medium |
 | Critic | Astra/high only |
 
 Only recognized model-unavailable errors before any work can advance the chain.
+The CLI's exact pre-turn model-metadata and unsupported-priority warnings are
+allowed before that error; tool calls, assistant messages, unknown warnings,
+and warnings after the turn starts still prevent a retry.
 The launcher does not retry after tool/response items, partial edits, failed tests,
 permission failures, authentication/rate-limit errors, malformed logs or unknown
 errors. Those cases return to the main session for assessment. It never silently
@@ -124,7 +138,8 @@ local evidence and should not be committed or uploaded by default.
 
 Use `python bin/agent-report.py --workspace C:/path/to/repo` to aggregate local
 reports without printing task text. For a controlled scout comparison,
-`--trial-model gpt-6-luna` or `--trial-model gpt-6-sol` selects exactly one
+`--trial-model gpt-6-luna`, `--trial-model gpt-6.1-sol` or
+`--trial-model gpt-6-sol` selects exactly one
 configured candidate and disables automatic model fallback for that run. It
 does not change the permission checks. See `benchmarks/README.md` for the
 read-only paired protocol and its limitations.

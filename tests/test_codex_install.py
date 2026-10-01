@@ -46,7 +46,7 @@ class CodexInstallTests(unittest.TestCase):
                          (ROOT / "bin/rollover-open.py").read_bytes())
         import tomllib
         config = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
-        self.assertEqual(config["model"], "gpt-6-sol")
+        self.assertEqual(config["model"], "gpt-6.1-sol")
         self.assertEqual(config["model_reasoning_effort"], "medium")
         self.assertTrue(config["agents"]["enabled"])
         self.assertEqual(config["agents"]["max_concurrent_threads_per_session"], 6)
@@ -55,6 +55,8 @@ class CodexInstallTests(unittest.TestCase):
         for role in ("scout", "runner", "builder", "critic"):
             self.assertEqual(tomllib.loads((self.home / "agents" / f"{role}.toml").read_text(encoding="utf-8"))["name"], role)
         builder = tomllib.loads((self.home / "agents" / "builder.toml").read_text(encoding="utf-8"))
+        self.assertEqual(builder["model"], "gpt-6.1-sol")
+        self.assertEqual(builder["model_reasoning_effort"], "medium")
         boundary = builder["sandbox_workspace_write"]
         self.assertEqual(builder["sandbox_mode"], "workspace-write")
         self.assertEqual(boundary["writable_roots"], [])

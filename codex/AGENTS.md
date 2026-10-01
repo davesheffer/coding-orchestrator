@@ -11,9 +11,9 @@ Own the request, design, root cause, judgment, verification, and final answer. D
 |---|---|---|
 | Locate, read, summarize | scout | gpt-6-luna / low |
 | Run an exact test/build command and report results | runner | gpt-6-luna / low |
-| Implement an already specified change | builder | gpt-6-sol / medium |
+| Implement an already specified change | builder | gpt-6.1-sol / medium |
 | Adversarial review of risky changes or claims | critic | gpt-6-astra / high |
-| Design, ambiguity, root cause, security/concurrency decisions | main session | gpt-6-sol / medium; escalate demanding cases to Astra |
+| Design, ambiguity, root cause, security/concurrency decisions | main session | gpt-6.1-sol / medium; escalate demanding cases to Astra |
 
 - Select installed native roles in `~/.codex/agents/*.toml`. If using a built-in role, explicitly supply the configured model, reasoning, role instructions, and brief through supported host parameters. Never invent parameters or silently use an expensive inherited model for easy work.
 - Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
@@ -69,7 +69,7 @@ Verify the resulting sandbox and network restrictions. If a restricted runtime i
 ### Launcher model and network fallbacks
 
 - Fresh installs default unnamed subagents to Luna/low; named roles retain their own settings. Existing configurations are preserved unless the user opts into `--configure-routing`, which fills missing subagent model/effort defaults while preserving explicit choices.
-- The Windows launcher tries scout/runner on Luna -> Sol, builder on Sol, and critic on Astra only. Only a recognized model-unavailable error before any work can advance the chain. Authentication/rate limits, failed tests, started work, malformed logs and unknown errors return to the main session without an automatic retry. Inspect partial edits and evidence before continuing. No silent Astra fallback for routine work.
+- The Windows launcher tries scout/runner on Luna -> 6.1 Sol -> 6 Sol, builder on 6.1 Sol -> 6 Sol, and critic on Astra only. Only a recognized model-unavailable error before any work can advance the chain. Authentication/rate limits, failed tests, started work, malformed logs and unknown errors return to the main session without an automatic retry. Inspect partial edits and evidence before continuing. No silent Astra fallback for routine work.
 - Network fallback is off by default for every role. If isolation fails but file limits hold, explain that the shell could access the network even with web tools disabled. Ask which roles, if any, may use that exception and whether to remember the choice. Existing session authorization is sufficient; never ask again for approval already given. Installation, `--force`, repository examples and silence do not grant consent.
 - Store remembered launcher approval only in the user-owned ~/.codex/agent-routing.json `network_fallback_roles` list. An empty list denies fallback. List only roles the user explicitly approved; removing a role revokes its exception. The installer creates an empty policy and preserves existing policies even during forced upgrades. Never copy another user's policy into this bundle. Reconcile any conflicting saved instructions with the user's latest answer before updating the policy.
 - The launcher requires that Codex home be outside the delegated workspace. It always attempts isolation first and never relaxes filesystem restrictions. Scout/critic stay read-only; runner/builder can write only in the named workspace. Effective web/MCP/apps/plugins/browser/computer/image/nested-agent tools remain disabled. Agents must make no external requests; report missing network isolation under UNVERIFIED. Config errors or failed file/tool checks never authorize a weaker launch.

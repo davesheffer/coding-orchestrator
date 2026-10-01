@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -20,9 +21,9 @@ import uuid
 
 ROOT = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')).resolve()
 MODELS = {
-    'scout': [('gpt-6-luna', 'low'), ('gpt-6-sol', 'low')],
-    'runner': [('gpt-6-luna', 'low'), ('gpt-6-sol', 'low')],
-    'builder': [('gpt-6-sol', 'medium')],
+    'scout': [('gpt-6-luna', 'low'), ('gpt-6.1-sol', 'low'), ('gpt-6-sol', 'low')],
+    'runner': [('gpt-6-luna', 'low'), ('gpt-6.1-sol', 'low'), ('gpt-6-sol', 'low')],
+    'builder': [('gpt-6.1-sol', 'medium'), ('gpt-6-sol', 'medium')],
     'critic': [('gpt-6-astra', 'high')],
 }
 DISABLED = ('apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_external',
@@ -270,21 +271,54 @@ def isolated(evidence, allow_host):
             and any(text in off_list for text in PROXY_REFUSALS))
 
 
+STARTUP_MODEL_WARNING = re.compile(
+    r"(?:Model metadata for `[A-Za-z0-9._-]+` not found\. Defaulting to fallback metadata; "
+    r"this can degrade performance and cause issues\."
+    r"|Configured service tier `priority` is not advertised as supported for model "
+    r"`[A-Za-z0-9._-]+` and will be omitted from requests\.)")
+
+
 def retryable_model_error(events, returncode):
     """Only an explicit service/model error BEFORE any work can change models."""
     if returncode == 0 or not events:
         return False
-    if any(e.get('type', '').startswith('item.') for e in events):
-        return False
+    turn_started = False
     errors = []
     for event in events:
-        if event.get('type') in ('error', 'turn.failed'):
-            errors.append(str(event.get('message', event.get('error', ''))).lower())
-    text = ' '.join(errors)
+        kind = event.get('type')
+        if kind == 'thread.started':
+            if turn_started:
+                return False
+        elif kind == 'turn.started':
+            if turn_started:
+                return False
+            turn_started = True
+        elif kind == 'item.completed':
+            item = event.get('item')
+            if (turn_started or not isinstance(item, dict)
+                    or item.get('type') != 'error' or not isinstance(item.get('message'), str)
+                    or not set(item).issubset({'id', 'type', 'message'})
+                    or not STARTUP_MODEL_WARNING.fullmatch(item['message'])):
+                return False
+        elif kind in ('error', 'turn.failed'):
+            failure = event if kind == 'error' else event.get('error')
+            if not isinstance(failure, dict) or not isinstance(failure.get('message'), str):
+                return False
+            if (set(event) != ({'type', 'message'} if kind == 'error' else {'type', 'error'})
+                    or (kind == 'turn.failed' and set(failure) != {'message'})):
+                return False
+            errors.append(failure['message'].lower())
+        else:
+            return False
     unavailable = ('model_not_found', 'model_not_available', 'model is not supported',
                    'model is unavailable', 'model is not available', 'model is not enabled',
                    'does not support the requested model')
-    return any(term in text for term in unavailable)
+    disallowed = ('unauthorized', 'forbidden', 'authentication', 'rate limit', 'rate_limit',
+                  'quota', 'permission denied', 'permission_denied', 'tests failed')
+    return bool(errors) and all(
+        any(term in text for term in unavailable)
+        and not any(term in text for term in disallowed)
+        and not re.search(r'\b(?:401|403|429)\b', text) for text in errors)
 
 
 def parse_events(text):

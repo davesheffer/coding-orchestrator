@@ -89,16 +89,16 @@ class CodexJevTests(unittest.TestCase):
 
     def test_route_weakest_model_needs_high_confidence(self):
         self.assertIsNone(self.route_with({"choice": "luna", "confidence": 0.7}))
-        self.assertEqual(self.route_with({"choice": "sol", "confidence": 0.6}), "gpt-6-sol")
+        self.assertEqual(self.route_with({"choice": "sol", "confidence": 0.6}), "gpt-6.1-sol")
 
     def test_route_escalates_when_stronger_models_are_likely(self):
         answer = {"choice": "luna", "confidence": 0.55,
                   "probabilities": {"luna": 0.55, "sol": 0.35, "astra": 0.1}}
-        self.assertEqual(self.route_with(answer), "gpt-6-sol")
+        self.assertEqual(self.route_with(answer), "gpt-6.1-sol")
         self.assertEqual((self.logged["choice"], self.logged["escalated_to"], self.logged["escalated_mass"]),
                          ("luna", "sol", 0.45))
         answer = {"choice": "sol", "confidence": 0.8, "probabilities": {"sol": 0.8, "astra": 0.2}}
-        self.assertEqual(self.route_with(answer), "gpt-6-sol")
+        self.assertEqual(self.route_with(answer), "gpt-6.1-sol")
         answer = {"choice": "luna", "confidence": 0.9, "probabilities": {"luna": 0.9, "sol": "nan"}}
         self.assertEqual(self.route_with(answer), "gpt-6-luna")
 
@@ -110,7 +110,7 @@ class CodexJevTests(unittest.TestCase):
         with patch.object(module.client, "ask", return_value={"model": answer}), \
              patch.object(module, "log") as log:
             out = module.route(payload, cfg)
-        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6.1-sol")
         self.assertNotIn("escalated_to", log.call_args[0][1])
 
     def test_route_respects_send_prompt_false(self):
@@ -121,7 +121,7 @@ class CodexJevTests(unittest.TestCase):
             return {"answers": {"model": {"choice": "sol", "confidence": 0.9}}}
         with patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"}), patch.object(module, "log"):
             out = module.route(payload, cfg, classify)
-        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6.1-sol")
 
     def route_default(self, answer, classify=None):
         cfg = module.settings() | {"enabled": True, "min_confidence": 0.5}
@@ -150,7 +150,7 @@ class CodexJevTests(unittest.TestCase):
 
     def test_route_logs_every_decision_like_jev_route(self):
         out, logs = self.route_default({"model": {"choice": "sol", "confidence": 0.9}})
-        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6.1-sol")
         entry = logs[0]
         self.assertEqual((entry["applied"], entry["reason"], entry["subagent_type"]), (True, "applied", "default"))
         self.assertIsInstance(entry["latency_ms"], int)
@@ -181,7 +181,7 @@ class CodexJevTests(unittest.TestCase):
         cfg |= {"enabled": True, "min_confidence": 0.5, "downgrade_min_confidence": 0.8,
                 "labels": {k: v for k, v in cfg["labels"].items() if k != "luna"}}
         payload = {"tool_name": "Agent", "tool_input": {"agent_type": "default", "message": "fix it"}}
-        for confidence, expected in ((0.6, None), (0.85, "gpt-6-sol")):
+        for confidence, expected in ((0.6, None), (0.85, "gpt-6.1-sol")):
             with self.subTest(confidence=confidence), \
                  patch.object(module.client, "ask", return_value={"model": {"choice": "sol", "confidence": confidence}}), \
                  patch.object(module, "log"):
@@ -192,7 +192,7 @@ class CodexJevTests(unittest.TestCase):
         with patch.object(module.client, "ask", return_value={"model": {"choice": "sol", "confidence": 0.6}}), \
              patch.object(module, "log"):
             out = module.route(payload, cfg)
-        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6.1-sol")
 
     def test_junk_max_prompt_chars_still_routes(self):
         config = Path(self.temp.name) / "config.json"
@@ -204,7 +204,7 @@ class CodexJevTests(unittest.TestCase):
         with patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"}), patch.object(module, "log"):
             out = module.route(payload, cfg, lambda body, key: {"answers": {"model": {"choice": "sol",
                                                                                       "confidence": 0.9}}})
-        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-sol")
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6.1-sol")
 
     def test_route_rejects_bool_or_string_confidence(self):
         for value in (True, "0.9"):
