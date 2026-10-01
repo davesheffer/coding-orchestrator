@@ -136,6 +136,11 @@ def validate_role(path: Path, data: bytes, name: str) -> None:
         fail(f"network must be disabled in {path}")
 
 
+def platform_python() -> str:
+    # The python.org Windows installer provides `python` but not `python3`.
+    return "python" if os.name == "nt" else "python3"
+
+
 def managed_block(data: bytes, path: Path) -> bytes:
     start, end = data.find(START), data.find(END)
     if data.count(START) != 1 or data.count(END) != 1 or start > end:
@@ -302,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
 
     here = Path(__file__).resolve().parent
     dest = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().absolute()
-    sources = {dest / "AGENTS.md": (here / "AGENTS.md").read_bytes()}
+    agents_source = (here / "AGENTS.md").read_bytes().replace(b"__PYTHON__", platform_python().encode())
+    sources = {dest / "AGENTS.md": agents_source}
     for name in ROLE_NAMES:
         source = here / "agents" / f"{name}.toml"
         data = read_regular(source)

@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import shutil
@@ -7,11 +8,16 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / "codex" / "install.py"
-SOURCE_AGENTS = (ROOT / "codex" / "AGENTS.md").read_bytes()
+PYTHON = "python" if os.name == "nt" else "python3"
+SOURCE_AGENTS = (ROOT / "codex" / "AGENTS.md").read_bytes().replace(b"__PYTHON__", PYTHON.encode())
+_SPEC = importlib.util.spec_from_file_location("codex_install_module", INSTALL)
+install_module = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(install_module)
 
 
 class CodexInstallTests(unittest.TestCase):
@@ -25,6 +31,12 @@ class CodexInstallTests(unittest.TestCase):
     def run_install(self, *args):
         env = os.environ | {"CODEX_HOME": str(self.home)}
         return subprocess.run([sys.executable, str(INSTALL), *args], env=env, text=True, capture_output=True)
+
+    def test_instruction_interpreter_follows_platform(self):
+        with mock.patch.object(install_module.os, "name", "nt"):
+            self.assertEqual(install_module.platform_python(), "python")
+        with mock.patch.object(install_module.os, "name", "posix"):
+            self.assertEqual(install_module.platform_python(), "python3")
 
     def test_fresh_install_parses_and_installs_helper(self):
         result = self.run_install()
@@ -72,6 +84,8 @@ class CodexInstallTests(unittest.TestCase):
         installed_instructions = (self.home / "AGENTS.md").read_bytes()
         self.assertIn(b'python "$env:USERPROFILE/.codex/bin/pr-status"', installed_instructions)
         self.assertNotIn(b"<!-- CODEX-CRITIC-NETWORK-FALLBACK:START -->", installed_instructions)
+        self.assertIn(f"`{PYTHON} <CODEX_HOME>/bin/rollover-open.py handoff".encode(), installed_instructions)
+        self.assertNotIn(b"__PYTHON__", installed_instructions)
         helper = self.home / "bin" / "pr-status"
         self.assertEqual(helper.read_bytes(), (ROOT / "bin" / "pr-status").read_bytes())
         self.assertEqual((self.home / "bin" / "agent-run.py").read_bytes(),
