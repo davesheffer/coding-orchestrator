@@ -102,15 +102,8 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # (`"`, `'`, anything else), so a quoted value has exactly one way to match; with a
 # plain \S+ alternative it had two, and repeated `-C "a"` options backtracked
 # exponentially. A double-quoted value honours backslash escapes (`-C "a\" b"`), and
-# its two inner branches start with different chars too. Outside quotes a backslash
-# escapes the next char, blank included (`-C a\ b`), so an escape pair is part of the
-# value; a pair and a plain char start differently, so the value still has one way to
-# match. A backslash before a newline (a line continuation) or at the end is a char of
-# its own, as before.
-_OPT_ESCAPE = r"\\(?:.|(?![^\n]))"
-_OPT_TAIL = r"(?:" + _OPT_ESCAPE + r"|[^\s\\])*"
-_OPT_ARG = (r"""(?:"(?:[^"\\]|\\[\s\S])*"|'[^']*'|""" + _OPT_ESCAPE + r"""|[^\s"'\\])"""
-            + _OPT_TAIL)
+# its two inner branches start with different chars too.
+_OPT_ARG = r"""(?:"(?:[^"\\]|\\[\s\S])*"\S*|'[^']*'\S*|[^\s"']\S*)"""
 _LONG_VALUE_OPTS = r"(?:--git-dir|--work-tree|--namespace|--super-prefix|--config-env)"
 # The value-taking names are excluded from the generic --long-option branch, and their
 # space-separated branch always takes the next token as the value (even `--git-dir -x`),
@@ -119,7 +112,7 @@ _LONG_VALUE_OPTS = r"(?:--git-dir|--work-tree|--namespace|--super-prefix|--confi
 GIT_GLOBAL_OPTS = (r"(?:\s+(?:-C\s+" + _OPT_ARG + r"|-c\s+" + _OPT_ARG + r"|"
                     + _LONG_VALUE_OPTS + r"(?:=(?:" + _OPT_ARG + r")?|\s+" + _OPT_ARG + r")|"
                     r"--(?!(?:git-dir|work-tree|namespace|super-prefix|config-env)(?![\w-]))"
-                    r"[\w-]+(?:=" + _OPT_TAIL + r")?))*")
+                    r"[\w-]+(?:=\S*)?))*")
 # What may start a command: the start, a ; & | ( operator, a newline, a `{` group or
 # a backtick substitution, or a `)` (so `X=$(date) git push`, whose value the env
 # prefix below can't span, is still seen). Only blanks follow it (_LEAD): a newline is a separator in
@@ -153,8 +146,6 @@ GIT_ADD_RE = re.compile(_SEP + _LEAD + _ENV_PREFIX + _GIT + GIT_GLOBAL_OPTS + r"
 MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(/|$)")
 # -a/--all, or a short-flag cluster containing a (e.g. -am), within the commit segment.
 ALL_FLAG_RE = re.compile(r"(?:^|\s)(--all|-[A-Za-z]*a[A-Za-z]*)(?=\s|$)")
-# The same flag right at a position (ALL_FLAG_RE's `^` on a slice starting there).
-_ALL_FLAG_AT_RE = re.compile(r"(?:--all|-[A-Za-z]*a[A-Za-z]*)(?=\s|$)")
 # `cd <dir>` as its own segment (split on &&, ;, ||, or a `(` subshell opener) before
 # the git segment.
 CD_RE = re.compile(r"^\s*cd\s+(.+?)\s*$")
@@ -220,9 +211,6 @@ _CD_SPLIT_RE = re.compile(
 # Longest directory _cd_dirs accumulates (`cd a; ` * N would otherwise grow it, and the
 # time and memory to build it, quadratically); see _cd_segment_dir.
 MAX_CD_PATH_CHARS = 4096
-# Most cwds _case_branch_dirs carries at once (the cwd before a case and its first
-# branch ends), so a cd costs at most this many joins.
-MAX_CASE_BRANCHES = 16
 # A backslash-newline inside an operator (`<\` newline `<EOF`, `$\` newline `(`) is
 # removed by bash before the operator is read, so _scan_targets also scans the
 # command with it joined; a `<<`
@@ -532,8 +520,6 @@ def _is_word(text, start, end):
 _CASE_WORD_RE = re.compile(r"\bcase\b")
 # Where a git command's own arguments end (for its -a/--all flag, in _git_target).
 _SEGMENT_END_RE = re.compile(r"[;&|\n]")
-# _git_target's default: look the cd directory up in the cd index.
-_FROM_INDEX = object()
 
 
 def _may_keep(tail):
@@ -1010,7 +996,7 @@ def _dash_c_dir(opts_segment):
     return _global_opts(opts_segment)[0]
 
 
-def _cd_dirs(command, restore=True, case_cds=True, or_cds=True, or_left_cds=True):
+def _cd_dirs(command, restore=True, case_cds=True):
     """([segment ends], [cd directory in effect after each]) for the command's
     &&/||/;/newline/`(`/`)`/`{`/backtick segments (successive cds accumulate; relative
     results stay relative to the payload cwd; None before any cd). A `(` subshell or a
@@ -1020,14 +1006,10 @@ def _cd_dirs(command, restore=True, case_cds=True, or_cds=True, or_left_cds=True
     adds when there is a `case`: restore=False, where no `)` restores the cwd and every
     `)` splits (a case pattern's `)` taken for a subshell's, or a branch's cd), and
     case_cds=False, where a cd inside a case statement (or after any `case` word, up to
-    its `esac`) is ignored. With a `||`, it adds or_cds=False, where a cd right after a
-    `||` is ignored (`cd a || cd b && git push` runs in a when a exists), and
-    or_left_cds=False, where a cd right before one is (the cd failed: `cd nope || cd b`
-    runs in b). Built once per
-    command so resolving each git match is a bisect, not a rescan of its prefix."""
+    its `esac`) is ignored. Built once per command so resolving each git match is a
+    bisect, not a rescan of its prefix."""
     ends, dirs = [], []
     result, capped, pos = None, False, 0
-    after = None  # the separator before the current segment
     saved = []  # (opener, cd result and capped at it) for each open `(` / backtick
     # Open `case` statements per frame (cases[0]: no frame), as in _strip: while the
     # innermost frame has one, a lone `)` ends a pattern, not the subshell.
@@ -1054,12 +1036,8 @@ def _cd_dirs(command, restore=True, case_cds=True, or_cds=True, or_left_cds=True
             continue  # an escape or a whole quoted string: not a separator
         if op == ")" and ((cases[-1] and restore) or (loose and loose[-1] == len(saved))):
             continue  # a case pattern's `)`
-        segment = command[pos:sep.start()]
-        if ((case_cds or not (open_cases or loose)) and (or_cds or after != "||")
-                and (or_left_cds or op != "||")):
-            result, capped = _cd_segment_dir(segment, result, capped)
-        if after != "||" or segment.strip():
-            after = op  # a blank segment (`||` newline `cd b`) keeps the `||`
+        if case_cds or not (open_cases or loose):
+            result, capped = _cd_segment_dir(command[pos:sep.start()], result, capped)
         if (op == "(" and restore) or (op == "`" and not (saved and saved[-1][0] == "`")):
             saved.append((op, result, capped))
             cases.append(0)
@@ -1086,87 +1064,13 @@ def _cd_prefix_dir(command, git_start, cd_index=None):
     return dirs[k] if k >= 0 else None
 
 
-def _merge_cands(*groups):
-    """The distinct (dir, capped) candidates of `groups` in order, at most
-    MAX_CASE_BRANCHES (the first ones)."""
-    return tuple(dict.fromkeys(c for group in groups for c in group))[:MAX_CASE_BRANCHES]
-
-
-def _case_branch_dirs(command, git_starts):
-    """For each of the (sorted) git match starts, the (cd directory, capped) candidates
-    that may be in effect there in the reading where a case statement's branches are
-    taken one at a time (subshells restore as in _cd_dirs). A pattern's `)` splits, so
-    `pattern) cd dir` moves; a `;;` ends the branch, the next one starting from the
-    candidates before the case (after a `;&` or `;;&`, also from the end of this one,
-    which may fall through); after the matching `esac` the candidates are those before
-    the case and each branch's end (`case x in x) cd a;; y) cd b;; esac` leaves a, b or
-    neither). A cd moves every candidate, and a later case starts from all of them. At
-    most MAX_CASE_BRANCHES are kept (the first, so the cwd before the first case always
-    is), keeping it linear; only the candidates at the git starts are kept, not one set
-    per segment."""
-    out, k = [], 0
-    cands, recorded, pos = ((None, False),), ((None, False),), 0
-    saved = []  # (opener, candidates at it) for each open `(` / backtick
-    # Open case statements per frame (frames[0]: no frame), innermost last: (candidates
-    # before it, {branch-end candidate: None}).
-    frames = [[]]
-    for sep in _CD_SPLIT_RE.finditer(command):
-        op = sep.group(1)
-        if sep.group(2):
-            step = _case_step(command, sep.start(), len(frames[-1]))
-            if step == 1:
-                frames[-1].append((cands, {}))
-            elif step == -1:
-                before, branch_ends = frames[-1].pop()
-                cands = _merge_cands(before, branch_ends, cands)
-            continue
-        if op is None:
-            continue  # an escape or a whole quoted string: not a separator
-        target = _cd_target(command[pos:sep.start()])
-        if target is not None:
-            cands = _merge_cands(_join_capped(r, target, c) for r, c in cands)
-        i = sep.start()
-        if (op == ";" and frames[-1] and command.startswith((";;", ";&"), i)
-                and command[i - 1:i] != ";"):
-            before, branch_ends = frames[-1][-1]
-            for cand in cands:
-                if len(branch_ends) >= MAX_CASE_BRANCHES:
-                    break
-                branch_ends.setdefault(cand)
-            falls = not command.startswith(";;", i) or command[i + 2:i + 3] == "&"
-            cands = _merge_cands(before, cands) if falls else before
-        elif op == ")" and frames[-1]:
-            pass  # a case pattern's `)`: splits, restores nothing
-        elif op == "(" or (op == "`" and not (saved and saved[-1][0] == "`")):
-            saved.append((op, cands))
-            frames.append([])
-        elif op in (")", "`") and saved and saved[-1][0] == ("(" if op == ")" else "`"):
-            cands = saved.pop()[1]
-            frames.pop()
-        while k < len(git_starts) and git_starts[k] < i:
-            out.append(recorded)
-            k += 1
-        recorded = cands
-        pos = sep.end()
-    out.extend([recorded] * (len(git_starts) - k))
-    return out
-
-
 def _cd_segment_dir(segment, result, capped=False):
     """(dir, capped): `result` joined with the directory of a `cd <dir>` segment, else
     unchanged; past MAX_CD_PATH_CHARS the cds are dropped (the payload cwd) until an
     absolute one (see _join_capped)."""
-    target = _cd_target(segment)
-    if target is None:
-        return result, capped
-    return _join_capped(result, target, capped)
-
-
-def _cd_target(segment):
-    """The directory of a `cd <dir>` segment, or None (not a cd, or no usable dir)."""
     m = CD_RE.match(segment)
     if not m:
-        return None
+        return result, capped
     try:
         tokens = shlex.split(m.group(1))
     except ValueError:
@@ -1174,8 +1078,11 @@ def _cd_target(segment):
     # Drop options (-P, --) and redirections (2>/dev/null) around the directory.
     tokens = [t for t in tokens if not t.startswith("-") and not re.match(r"^\d*[<>]", t)]
     if len(tokens) != 1:
-        return None
-    return _usable_path(tokens[0])
+        return result, capped
+    target = _usable_path(tokens[0])
+    if target is None:
+        return result, capped
+    return _join_capped(result, target, capped)
 
 
 def _join_capped(result, target, capped):
@@ -1192,17 +1099,13 @@ def _join_capped(result, target, capped):
     return joined, False
 
 
-def _git_target(command, match, cwd, add_end=-1, cd_index=None, cd_dir=_FROM_INDEX,
-                all_args=None):
+def _git_target(command, match, cwd, add_end=-1, cd_index=None):
     """(op, cwd, all_flag, git_opts) for one GIT_COMMAND_RE match in the stripped command.
     `add_end` is where the command's first `git add` match ends (None: there is none;
-    -1: search the prefix here); `cd_index` is _cd_dirs(command), if already built;
-    `cd_dir`, if given, is the cd directory in effect instead (None: no cd); `all_args`
-    is whether its own arguments hold -a/--all (see _all_args; None: search them here)."""
+    -1: search the prefix here); `cd_index` is _cd_dirs(command), if already built."""
     opts_segment, op = match.group(1), match.group(2)
     # The shell resolves -C relative to any directory an earlier cd moved to.
-    if cd_dir is _FROM_INDEX:
-        cd_dir = _cd_prefix_dir(command, match.start(), cd_index)
+    cd_dir = _cd_prefix_dir(command, match.start(), cd_index)
     if cd_dir:
         cwd = os.path.join(cwd, cd_dir)
     dash_c_dir, git_dir, work_tree = _global_opts(opts_segment)
@@ -1224,38 +1127,14 @@ def _git_target(command, match, cwd, add_end=-1, cd_index=None, cd_dir=_FROM_IND
     # with HEAD instead of the (still empty) index; likewise for commit -a/--all.
     # Searched from the match rather than split off a copy of the rest of the command,
     # which was quadratic on many git invocations.
-    if all_args is None:
-        seg_end = _SEGMENT_END_RE.search(command, match.end())
-        segment = command[match.end():seg_end.start() if seg_end else len(command)]
-        all_args = bool(ALL_FLAG_RE.search(segment))
+    seg_end = _SEGMENT_END_RE.search(command, match.end())
+    segment = command[match.end():seg_end.start() if seg_end else len(command)]
     if add_end == -1:
         add = GIT_ADD_RE.search(command[:match.start() + 1])
         add_end = add.end() if add else None
-    all_flag = op == "commit" and (all_args
+    all_flag = op == "commit" and (bool(ALL_FLAG_RE.search(segment))
                                    or (add_end is not None and add_end <= match.start() + 1))
     return op, cwd, all_flag, git_opts or None
-
-
-def _all_args(command, matches):
-    """Whether each GIT_COMMAND_RE match (in order) has -a/--all in its own arguments, as
-    ALL_FLAG_RE on command[match.end():next separator] says (see _git_target). Matches
-    with no separator between them (`git commit -a (` * N) share that segment's end, so
-    each one's segment is a suffix of the first one's and searching each was quadratic;
-    the shared segment is searched once instead: a flag in a match's segment either
-    starts after its end (blank-preceded, like the last one found from the first match)
-    or right at it (the slice's `^`)."""
-    flags, seg_end, last = [], -1, None
-    for match in matches:
-        start = match.end()
-        if start > seg_end:
-            found = _SEGMENT_END_RE.search(command, start)
-            seg_end = found.start() if found else len(command)
-            last = None
-            for flag in ALL_FLAG_RE.finditer(command, start, seg_end):
-                last = flag.start(1)
-        flags.append((last is not None and last > start)
-                     or bool(_ALL_FLAG_AT_RE.match(command, start, seg_end)))
-    return flags
 
 
 def _scan_targets(raw_command, base_cwd):
@@ -1292,26 +1171,12 @@ def _scan_targets(raw_command, base_cwd):
         # pattern `)` taken for a subshell's, restoring the cwd too early, and a cd in a
         # case branch may or may not run; so with a `case` in the command, also resolve
         # each git with no `)` restoring the cwd, and with no cd inside a case counted.
-        # Also each case branch's cd taken on its own (with subshells restoring), and,
-        # with a `||`, no cd right after one counted, or none right before one (see
-        # _cd_dirs, _case_branch_dirs).
-        matches = list(GIT_COMMAND_RE.finditer(command))
-        branch_dirs = ()
         if _CASE_WORD_RE.search(command):
             cd_indexes.append(_cd_dirs(command, restore=False))
             cd_indexes.append(_cd_dirs(command, case_cds=False))
-            branch_dirs = _case_branch_dirs(command, [m.start() for m in matches])
-        if "||" in command:
-            cd_indexes.append(_cd_dirs(command, or_cds=False))
-            cd_indexes.append(_cd_dirs(command, or_left_cds=False))
-        for i, (match, all_args) in enumerate(zip(matches, _all_args(command, matches))):
-            cd_dirs = [_cd_prefix_dir(command, match.start(), cd_index)
-                       for cd_index in cd_indexes]
-            if branch_dirs:
-                cd_dirs.extend(cd_dir for cd_dir, _ in branch_dirs[i])
-            for cd_dir in dict.fromkeys(cd_dirs):
-                target = _git_target(command, match, base_cwd, add_end, cd_dir=cd_dir,
-                                     all_args=all_args)
+        for match in GIT_COMMAND_RE.finditer(command):
+            for cd_index in cd_indexes:
+                target = _git_target(command, match, base_cwd, add_end, cd_index)
                 if target not in seen:
                     seen.add(target)
                     targets.append(target)
