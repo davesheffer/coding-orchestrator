@@ -145,6 +145,24 @@ class GateTests(unittest.TestCase):
         self.assertIsNone(out)
         self.assertEqual(self.logs[-1]["decision"], "allow")
 
+    def test_junk_max_diff_chars_falls_back_to_default(self):
+        self.stage_change()
+        for n, bad in enumerate(("abc", [1], {"a": 1}, None, True, -5, float("inf"), 1.5)):
+            with self.subTest(bad=repr(bad)):
+                self.calls.clear()
+                cfg = {**self.cfg, "max_diff_chars": bad}
+                payload = self.payload("git commit -m 'x'", session_id=f"junk{n}")
+                self.assertIsNotNone(self.gate(payload, cfg=cfg, classify_fn=self.classify()))
+                self.assertIn("diff", self.calls[0][0]["state"])
+                self.assertLessEqual(len(self.calls[0][0]["state"]["diff"]), 12000)
+
+    def test_junk_max_report_chars_falls_back_to_default(self):
+        cfg = {**jev.load_config(Path("/nonexistent/config.json")), "max_report_chars": "abc"}
+        text = "RESULT: ok\nEVIDENCE: ran tests, exit 0\nCONFIDENCE: high\nUNVERIFIED: none"
+        reasons, codes, _, _ = jev._analyze_report(
+            text, cfg, lambda body, key: None, confidence_heuristic=False)
+        self.assertNotIn("missing", codes)
+
     def test_send_diff_false_omits_diff(self):
         self.stage_change()
         cfg = {**self.cfg, "send_diff": False}
