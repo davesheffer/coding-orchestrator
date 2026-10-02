@@ -169,6 +169,12 @@ def summarize_report_check(entries, tiers):
             "per_tier": dict(sorted(per_tier.items())), "latency_ms": latency(entries)}
 
 
+# Bounds past which a usage line is corrupt rather than a real call (jev_client
+# caps token counts at 2**53 too).
+MAX_USAGE_TOKENS = 2 ** 53
+MAX_CALL_USD = 1000.0
+
+
 def summarize_spend(entries):
     """Totals and per-feature spend from usage lines; malformed counts are skipped."""
     total = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "usd": 0.0, "estimated_calls": 0}
@@ -177,7 +183,8 @@ def summarize_spend(entries):
         if entry.get("kind") != "usage":
             continue
         tokens_in, tokens_out, usd = (number(entry.get(k)) for k in ("input_tokens", "output_tokens", "usd"))
-        if tokens_in is None or tokens_out is None or usd is None or min(tokens_in, tokens_out, usd) < 0:
+        if (tokens_in is None or tokens_out is None or usd is None or min(tokens_in, tokens_out, usd) < 0
+                or max(tokens_in, tokens_out) > MAX_USAGE_TOKENS or usd > MAX_CALL_USD):
             continue
         bucket = per_feature.setdefault(str(entry.get("feature") or "unknown"), {"calls": 0, "usd": 0.0})
         for part in (total, bucket):

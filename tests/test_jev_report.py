@@ -220,7 +220,8 @@ class ReportTests(unittest.TestCase):
         self.assertIn("spend: no usage reported", report.render(report.summarize([])))
 
     def test_huge_usage_numbers_are_skipped(self):
-        entries = [self.usage("ask", 10**400, 1, 0.1), self.usage("ask", 1, 1, 10**400), self.usage("ask", 1, 2, 0.5)]
+        entries = [self.usage("ask", 10**400, 1, 0.1), self.usage("ask", 1, 1, 10**400), self.usage("ask", 1, 2, 0.5),
+                   self.usage("ask", 1e308, 1, 0.1), self.usage("ask", 10**29, 1, 0.1), self.usage("ask", 1, 1, 1e308)]
         self.assertIsNone(report.number(10**400))
         spend = report.summarize(entries)["spend"]
         self.assertEqual((spend["calls"], spend["input_tokens"], spend["output_tokens"]), (1, 1, 2))

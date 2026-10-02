@@ -28,8 +28,9 @@ Default: one call whose state is {"files": {path: text}, "text": --state,
 
 It runs only inside a git repository, and files must be inside it: a glob or
 directory whose base is outside is skipped without being walked, symlinked
-directories are not followed, and patterns that visit more than 50,000 files and
-directories are refused. Generated and dependency directories, binary files, files
+directories are not followed, a glob without `**` is walked only as deep as it
+reaches, and patterns that visit more than 50,000 files and directories are
+refused. Generated and dependency directories, binary files, files
 over 240,000 characters and secret-looking files (.env, *.pem, *secret*, ...) are
 skipped. Token-shaped secrets in the files, --state, stdin and the questions are
 scrubbed before anything is sent; a file whose path holds one is skipped, and a
@@ -211,6 +212,14 @@ class GlobPattern:
     def __init__(self, tokens):
         self.tokens = tokens
 
+    def max_depth(self):
+        """Path segments a match can have, or None when `**` (or a class that admits a
+        slash) lets it span any number; a walk needs to go no deeper."""
+        if any(kind in ("globstar", "dirstar") or (kind == "class" and arg.fullmatch("/"))
+               for kind, arg in self.tokens):
+            return None
+        return 1 + sum(1 for kind, arg in self.tokens if kind == "lit" and arg == "/")
+
     def _close(self, states, at_segment_start):
         # Wildcards may match nothing, so a position on one also stands past it; `**/`
         # only at a segment start, so it never ends inside a name.
@@ -352,9 +361,12 @@ def expand(patterns, recursive, cwd, root):
         except (OSError, RuntimeError, ValueError):
             return False
 
-    def walk(top):
+    def walk(top, max_depth=None):
+        """Files under top, at most max_depth path segments below it (None: any)."""
         for parent, dirs, files in os.walk(top, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+            depth = len(Path(parent).relative_to(top).parts) + 1  # segments of a file here
+            dirs[:] = [] if max_depth is not None and depth >= max_depth else sorted(
+                d for d in dirs if d not in SKIP_DIRS)
             count(len(dirs) + len(files))
             for name in sorted(files):
                 yield Path(parent) / name
@@ -364,7 +376,9 @@ def expand(patterns, recursive, cwd, root):
         if GLOB_CHARS & set(pattern):
             base_text, rest = split_pattern(pattern)
             base = Path(cwd) / base_text
-            if not base.is_dir():
+            # os.path.isdir/isfile, unlike Path's before Python 3.13, return False
+            # instead of raising on an unsearchable directory.
+            if not os.path.isdir(base):
                 add(pattern)
                 continue
             if not inside(base):
@@ -372,13 +386,13 @@ def expand(patterns, recursive, cwd, root):
                 continue
             regex = translate(rest)
             matched = False
-            for match in walk(base):
+            for match in walk(base, regex.max_depth()):
                 if regex.fullmatch(match.relative_to(base).as_posix()):
                     matched = True
                     add(Path(os.path.relpath(match, cwd)).as_posix())
             if not matched:
                 add(pattern)
-        elif full.is_dir():
+        elif os.path.isdir(full):
             if not inside(full):
                 skipped.append({"path": pattern, "reason": "outside the repository"})
             elif recursive:
@@ -394,7 +408,7 @@ def expand(patterns, recursive, cwd, root):
                     skipped.append({"path": pattern, "reason": f"unreadable: {exc.strerror or exc}"})
                     continue
                 for child in sorted(children):
-                    if child.is_file():
+                    if os.path.isfile(child):
                         add(Path(os.path.relpath(child, cwd)).as_posix())
         else:
             add(pattern)
@@ -422,7 +436,7 @@ def check_file(path, root, cwd, guard):
     # The path itself is sent too, so a token-shaped name skips the file.
     if guard._scrub(rel.as_posix()) != rel.as_posix():
         raise UsageError("secret-looking path; not sent")
-    if not resolved.is_file():
+    if not os.path.isfile(resolved):
         raise UsageError("not a regular file")
     if resolved.suffix.lower() in SKIP_SUFFIXES:
         raise UsageError("binary or lock file")
@@ -559,7 +573,12 @@ def run(args, cfg, classify_fn=None, cwd=None):
             state["text"] = state_text
         if args.stdin:
             limit = MAX_FILE_CHARS * 4 + 1  # UTF-8 is at most 4 bytes a character
-            data = sys.stdin.buffer.read(limit)
+            if sys.stdin is None:  # fd 0 closed
+                raise UsageError("stdin is not readable")
+            try:
+                data = sys.stdin.buffer.read(limit)
+            except (OSError, ValueError) as exc:
+                raise UsageError(f"stdin is not readable: {getattr(exc, 'strerror', None) or exc}")
             if len(data) >= limit:
                 raise UsageError(f"stdin is over {MAX_FILE_CHARS} characters")
             text = data.decode("utf-8", errors="replace")

@@ -369,21 +369,26 @@ pytest 2>&1 | python3 ~/.claude/bin/ask-jev.py --stdin -q '{"cause": {"type": "c
   Jev's token budget, it refuses and suggests how to split the files. `--each`
   makes one call per file (`{"path", "content"}`) for up to 255 files, 8 at a
   time.
-- It runs only inside a git repository and reads only files inside it. A glob
-  or directory whose base is outside the repository is skipped without being
-  walked, symlinked directories are not followed, and patterns that visit more
-  than 50,000 files are refused. It skips:
+- It runs only inside a git repository and sends only files inside it (a
+  `-q @file` of questions may sit elsewhere, e.g. a scratch directory; it is
+  capped at 64,000 bytes and refused when secret-named). A glob or directory
+  whose base is outside the repository is skipped without being walked,
+  symlinked directories are not followed, a glob without `**` is walked only as
+  deep as it reaches, and patterns that visit more than 50,000 files and
+  directories are refused. It skips:
   - dependency and build directories
   - binary and lock files
   - files over 240,000 characters
   - secret-looking file names (the same patterns as the risk gate).
 
   Token-shaped secrets in the files, `--state`, stdin and the questions are
-  scrubbed before sending. `skipped` reports the count, the count per reason
+  scrubbed before sending; a file whose path holds one is skipped, and a
+  question id or choice option holding one is refused. `skipped` reports the count, the count per reason
   and up to 10 sample paths with their reasons.
-- Exit 0 prints answers and usage. Exit 2 means bad questions or no usable
-  file. Exit 3 means Jev is off, there is no key, or every call failed, so read
-  the files instead. Unlike the hooks, `ask-jev.py` is called deliberately, so
+- Exit 0 prints answers and usage. Exit 2 means bad questions or arguments, or
+  no usable file. Exit 3 means Jev is off, there is no key, or every call failed,
+  so read the files instead; the off and no-key checks come first, so then the
+  questions are not validated. Unlike the hooks, `ask-jev.py` is called deliberately, so
   it reports failure instead of failing open silently.
 - The log records the mode and counts, never paths, questions or file text.
 

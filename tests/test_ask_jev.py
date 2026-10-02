@@ -337,6 +337,29 @@ class AskJevTests(unittest.TestCase):
         self.assertEqual(paths, [])
         self.assertTrue(skipped[0]["reason"].startswith("unreadable"))
 
+    def test_glob_without_globstar_walks_only_its_depth(self):
+        self.file("top.py")
+        self.file("src/a.py")
+        for i in range(10):
+            self.file(f"x/d{i}/f.py", "x\n")
+        cases = {"*.py": (1, ["top.py"]), "src/*.py": (1, ["src/a.py"]), "*/*.py": (2, ["src/a.py"]),
+                 "x/*/f.py": (2, [f"x/d{i}/f.py" for i in range(10)])}
+        for pattern, (depth, expected) in cases.items():
+            with self.subTest(pattern=pattern):
+                self.assertEqual(ask_jev.translate(ask_jev.split_pattern(pattern)[1]).max_depth(), depth)
+                with mock.patch.object(ask_jev, "MAX_WALK_ENTRIES", 20):
+                    paths, _ = ask_jev.expand([pattern], False, str(self.repo), self.repo.resolve())
+                self.assertEqual(sorted(paths), expected)
+        for pattern in ("**/*.py", "a/**", "[/]x"):
+            self.assertIsNone(ask_jev.translate(pattern).max_depth())
+        with mock.patch.object(ask_jev, "MAX_WALK_ENTRIES", 20), self.assertRaises(ask_jev.UsageError):
+            ask_jev.expand(["**/*.py"], False, str(self.repo), self.repo.resolve())
+
+    def test_closed_stdin_is_usage_error(self):
+        self.file("a.py")
+        with mock.patch.object(ask_jev.sys, "stdin", None), self.assertRaises(ask_jev.UsageError):
+            self.run_args(["-q", NOUL, "--stdin", "a.py"])
+
     def test_walk_cap_counts_directories(self):
         self.file("/".join(["e"] * 8) + "/.keep", "")
         with mock.patch.object(ask_jev, "MAX_WALK_ENTRIES", 5):
