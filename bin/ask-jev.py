@@ -375,7 +375,7 @@ def expand(patterns, recursive, cwd, root):
             for match in walk(base):
                 if regex.fullmatch(match.relative_to(base).as_posix()):
                     matched = True
-                    add(os.path.relpath(match, cwd))
+                    add(Path(os.path.relpath(match, cwd)).as_posix())
             if not matched:
                 add(pattern)
         elif full.is_dir():
@@ -383,7 +383,7 @@ def expand(patterns, recursive, cwd, root):
                 skipped.append({"path": pattern, "reason": "outside the repository"})
             elif recursive:
                 for match in walk(full):
-                    add(os.path.relpath(match, cwd))
+                    add(Path(os.path.relpath(match, cwd)).as_posix())
             else:
                 children = []
                 try:
@@ -395,7 +395,7 @@ def expand(patterns, recursive, cwd, root):
                     continue
                 for child in sorted(children):
                     if child.is_file():
-                        add(os.path.relpath(child, cwd))
+                        add(Path(os.path.relpath(child, cwd)).as_posix())
         else:
             add(pattern)
     return paths, skipped
