@@ -220,6 +220,104 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(handler_type().redirect_request(request, None, 302, "Found", {},
                                                           "https://untrusted.invalid/collect"))
 
+    def test_ask_is_a_feature_and_bad_prices_fall_back(self):
+        self.assertIn("ask", jev_client.FEATURES)
+        self.assertTrue(jev_client.feature_enabled(self.config({}), "ask"))
+        for bad in ("cheap", True, None, -1, [1], "nan", "inf", 10 ** 400):
+            with self.subTest(bad=repr(bad)[:20]):
+                cfg = self.config({"input_usd_per_million": bad, "output_usd_per_million": bad})
+                self.assertEqual(cfg["input_usd_per_million"], jev_client.DEFAULTS["input_usd_per_million"])
+                self.assertEqual(cfg["output_usd_per_million"], jev_client.DEFAULTS["output_usd_per_million"])
+                self.assertIsInstance(cfg["output_usd_per_million"], float)
+        cfg = self.config({"input_usd_per_million": "1.5", "output_usd_per_million": 2})
+        self.assertEqual((cfg["input_usd_per_million"], cfg["output_usd_per_million"]), (1.5, 2.0))
+
+    def test_usage_of(self):
+        cfg = {"input_usd_per_million": 2.0, "output_usd_per_million": 10.0}
+        self.assertEqual(jev_client.usage_of(cfg, {"usage": {"input_tokens": 100, "output_tokens": 3,
+                                                             "cost": 0.25}}),
+                         {"input_tokens": 100, "output_tokens": 3, "usd": 0.25, "cost_source": "reported"})
+        for cost in (None, "x", -1, float("nan"), True):
+            with self.subTest(cost=cost):
+                spent = jev_client.usage_of(cfg, {"usage": {"input_tokens": 1_000_000, "output_tokens": 100_000,
+                                                            "cost": cost}})
+                self.assertEqual(spent, {"input_tokens": 1_000_000, "output_tokens": 100_000, "usd": 3.0,
+                                         "cost_source": "estimated"})
+        missing = jev_client.usage_of({}, {"usage": {"input_tokens": 1_000_000, "output_tokens": 0}})
+        self.assertAlmostEqual(missing["usd"], jev_client.DEFAULTS["input_usd_per_million"])
+        for bad in (True, False, -1, 1.5, "10", None):
+            with self.subTest(bad=bad):
+                self.assertIsNone(jev_client.usage_of(cfg, {"usage": {"input_tokens": bad, "output_tokens": 1}}))
+                self.assertIsNone(jev_client.usage_of(cfg, {"usage": {"input_tokens": 1, "output_tokens": bad}}))
+        for response in ({}, {"usage": None}, {"usage": [1, 2]}, None, []):
+            self.assertIsNone(jev_client.usage_of(cfg, response))
+
+    def test_ask_logs_usage(self):
+        log = self.dir / "log.jsonl"
+        cfg = {**self.config({}), "log_path": str(log)}
+        questions = {"a": {"type": "noul", "instructions": "x"}, "b": {"type": "noul", "instructions": "y"}}
+        spent = {}
+        response = {"answers": {"a": {}}, "usage": {"input_tokens": 50, "output_tokens": 2, "cost": 0.001}}
+        self.assertEqual(jev_client.ask(cfg, "ask", {}, questions, lambda body, key: response, usage=spent),
+                         {"a": {}})
+        self.assertEqual(spent, {"input_tokens": 50, "output_tokens": 2, "usd": 0.001, "cost_source": "reported"})
+        lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(lines), 1)
+        entry = lines[0]
+        self.assertIn("ts", entry)
+        self.assertEqual({k: v for k, v in entry.items() if k != "ts"},
+                         {"kind": "usage", "feature": "ask", "questions": 2, "input_tokens": 50,
+                          "output_tokens": 2, "usd": 0.001, "cost_source": "reported"})
+        log.unlink()
+        spent = {}
+        self.assertEqual(jev_client.ask(cfg, "ask", {}, questions, lambda body, key: {"answers": {}},
+                                        usage=spent), {})
+        self.assertEqual(spent, {})
+        self.assertFalse(log.exists())
+
+    def test_huge_usage_counts_are_ignored_and_answers_returned(self):
+        log = self.dir / "log.jsonl"
+        cfg = {**self.config({}), "log_path": str(log)}
+        for huge in (2**53 + 1, 10**400):
+            with self.subTest(huge=len(str(huge))):
+                self.assertIsNone(jev_client.token_count(huge))
+                self.assertIsNone(jev_client.usage_of(cfg, {"usage": {"input_tokens": huge, "output_tokens": 1}}))
+        self.assertEqual(jev_client.token_count(2**53), 2**53)
+        spent = {}
+        response = {"answers": {"a": {}}, "usage": {"input_tokens": 10**400, "output_tokens": 1}}
+        self.assertEqual(jev_client.ask(cfg, "ask", {}, {}, lambda body, key: response, usage=spent), {"a": {}})
+        self.assertEqual(spent, {})
+        with mock.patch.object(jev_client, "usage_of", side_effect=OverflowError):
+            self.assertEqual(jev_client.ask(cfg, "ask", {}, {}, lambda body, key: response), {"a": {}})
+        with mock.patch.object(jev_client, "write_log", side_effect=OSError):
+            ok = {"answers": {"a": {}}, "usage": {"input_tokens": 1, "output_tokens": 1}}
+            self.assertEqual(jev_client.ask(cfg, "ask", {}, {}, lambda body, key: ok), {"a": {}})
+        self.assertFalse(log.exists())
+
+    def test_user_log_path_is_ignored(self):
+        cfg = self.config({"log_path": str(self.dir / "elsewhere.jsonl")})
+        self.assertNotIn("log_path", cfg)
+        jev_client.write_log({"log_path": 12345j}, {"x": 1})  # bad path type: no raise
+
+    def test_bad_ask_timeout_falls_back(self):
+        for bad in ("x", True, None, 0, 0.05, 61, -1, 10**400, "nan", [5]):
+            with self.subTest(bad=repr(bad)[:20]):
+                self.assertEqual(self.config({"ask_timeout_seconds": bad})["ask_timeout_seconds"], 20)
+        self.assertEqual(self.config({"ask_timeout_seconds": 45})["ask_timeout_seconds"], 45.0)
+        self.assertEqual(self.config({"ask_timeout_seconds": "0.1"})["ask_timeout_seconds"], 0.1)
+
+    def test_ask_timeout_cap(self):
+        ok = lambda body, key: {"answers": {}}  # noqa: E731
+        with mock.patch.object(jev_client, "call_with_deadline", return_value={"answers": {}}) as call:
+            cfg = self.config({"timeout_seconds": 20})
+            self.assertEqual(jev_client.ask(cfg, "ask", {}, {}, ok, timeout_cap=60), {})
+            self.assertEqual(jev_client.ask(cfg, "ask", {}, {}, ok), {})
+            cfg = self.config({"timeout_seconds": 500})
+            self.assertEqual(jev_client.ask(cfg, "ask", {}, {}, ok, timeout_cap=1000), {})
+        self.assertEqual([c.args[2] for c in call.call_args_list],
+                         [20.0, jev_client.MAX_DEADLINE_SECONDS, jev_client.MAX_ASK_DEADLINE_SECONDS])
+        self.assertEqual(jev_client.MAX_ASK_DEADLINE_SECONDS, 60.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,11 +99,13 @@ class ClaudeInstallTests(unittest.TestCase):
         python = install_module.hook_python()
         relay = shlex.quote(str(self.home / "relay/relay.py"))
         helper = shlex.quote(str(self.home / "bin/pr-status"))
+        ask_jev = shlex.quote(str(self.home / "bin/ask-jev.py"))
         instructions = self.home.joinpath("CLAUDE.md").read_text(encoding="utf-8")
         self.assertIn(f"{python} {relay} handoff --title", instructions)
         self.assertIn(f"using `{python} {helper}`", instructions)
-        leftover = instructions.replace(relay, "").replace(helper, "")
-        for placeholder in ("__PYTHON__", "__RELAY__", "__PR_STATUS__"):
+        self.assertIn(f"`{python} {ask_jev} -q", instructions)
+        leftover = instructions.replace(relay, "").replace(helper, "").replace(ask_jev, "")
+        for placeholder in ("__PYTHON__", "__RELAY__", "__PR_STATUS__", "__ASK_JEV__"):
             self.assertNotIn(placeholder, leftover)
         settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
         commands = [h["command"] for groups in settings["hooks"].values()
@@ -269,7 +271,7 @@ class ClaudeInstallTests(unittest.TestCase):
              group("SubagentHandback", "jev-guard.py", " handback")],
             [group("Agent|Task|SubagentHandback", "jev-guard.py", " agent-done")]))
         manifest = json.loads(self.home.joinpath(".coding-orchestrator-manifest.json").read_text())
-        for name in ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py"):
+        for name in ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py"):
             self.assertEqual((bin_dir / name).read_bytes(), (ROOT / "bin" / name).read_bytes())
             self.assertIn(f"bin/{name}", manifest["files"])
         before = self.snapshot()

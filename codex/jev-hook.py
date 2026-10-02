@@ -56,6 +56,8 @@ def settings():
             elif isinstance(rubric, str):
                 labels[name] = rubric
     cfg["labels"] = {k: v for k, v in labels.items() if k in MODELS}
+    # client.ask() writes its usage lines here too, not to the Claude install's log.
+    cfg["log_path"] = str(LOG)
     return cfg
 
 

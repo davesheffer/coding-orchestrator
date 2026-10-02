@@ -4,8 +4,10 @@
 Reads the rotated copy (`jev-log.jsonl.1`) first, then the current file, and
 prints a compact per-feature report: routing choices and confidence spread,
 report-check weak rates per effective model tier, and decision counts and
-latency for shift, risk_gate and handoff_grade. Entries without a "feature"
-key are legacy route entries. Malformed lines and missing fields are skipped.
+latency for shift, risk_gate, handoff_grade and ask, and Jev spend from the
+`"kind": "usage"` lines (tokens and USD per feature). Entries without a
+"feature" key are legacy route entries. Malformed lines and missing fields are
+skipped.
 
 Usage: jev-report.py [--log PATH] [--json]
 """
@@ -17,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 LOG_PATH = ROOT / "relay" / "jev-log.jsonl"
-FEATURES = ("route", "shift", "risk_gate", "report_check", "handoff_grade")
+FEATURES = ("route", "shift", "risk_gate", "report_check", "handoff_grade", "ask")
 CONF_BUCKETS = (("<0.5", 0.0, 0.5), ("0.5-0.7", 0.5, 0.7), ("0.7-0.9", 0.7, 0.9), (">=0.9", 0.9, None))
 SATURATION_SHARE = 0.9
 SATURATION_LEVEL = 0.99
@@ -49,6 +51,9 @@ def load_entries(paths):
 
 
 def feature_of(entry):
+    """The decision feature of an entry; usage lines are spend, not decisions."""
+    if entry.get("kind") == "usage":
+        return None
     feature = entry.get("feature", "route")
     return feature if feature in FEATURES else None
 
@@ -58,7 +63,7 @@ def number(value):
         return None
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return value if math.isfinite(value) else None
 
@@ -164,6 +169,30 @@ def summarize_report_check(entries, tiers):
             "per_tier": dict(sorted(per_tier.items())), "latency_ms": latency(entries)}
 
 
+def summarize_spend(entries):
+    """Totals and per-feature spend from usage lines; malformed counts are skipped."""
+    total = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "usd": 0.0, "estimated_calls": 0}
+    per_feature = {}
+    for entry in entries:
+        if entry.get("kind") != "usage":
+            continue
+        tokens_in, tokens_out, usd = (number(entry.get(k)) for k in ("input_tokens", "output_tokens", "usd"))
+        if tokens_in is None or tokens_out is None or usd is None or min(tokens_in, tokens_out, usd) < 0:
+            continue
+        bucket = per_feature.setdefault(str(entry.get("feature") or "unknown"), {"calls": 0, "usd": 0.0})
+        for part in (total, bucket):
+            part["calls"] += 1
+            part["usd"] += usd
+        total["input_tokens"] += int(tokens_in)
+        total["output_tokens"] += int(tokens_out)
+        total["estimated_calls"] += 1 if entry.get("cost_source") == "estimated" else 0
+    total["usd"] = round(total["usd"], 6)
+    for bucket in per_feature.values():
+        bucket["usd"] = round(bucket["usd"], 6)
+    total["per_feature"] = dict(sorted(per_feature.items()))
+    return total
+
+
 def summarize(entries):
     by_feature = {name: [] for name in FEATURES}
     for entry in entries:
@@ -173,7 +202,7 @@ def summarize(entries):
     summary = {"entries": sum(len(v) for v in by_feature.values()),
                "route": summarize_route(by_feature["route"]),
                "report_check": summarize_report_check(by_feature["report_check"], effective_tiers(entries))}
-    for name in ("shift", "risk_gate"):
+    for name in ("shift", "risk_gate", "ask"):
         group = by_feature[name]
         summary[name] = {"total": len(group), "decisions": counts(e.get("decision") for e in group),
                          "latency_ms": latency(group)}
@@ -184,6 +213,7 @@ def summarize(entries):
         "weak": sum(1 for e in grades if e.get("weak") is True),
         "accepted_weak": sum(1 for e in grades if e.get("accepted_weak") is True),
         "latency_ms": latency(grades)}
+    summary["spend"] = summarize_spend(entries)
     return summary
 
 
@@ -216,7 +246,7 @@ def render(summary):
                  f"{fmt_latency(check['latency_ms'])}")
     for tier, bucket in check["per_tier"].items():
         lines.append(f"  {tier}: weak {bucket['weak']}/{bucket['total']} ({fmt_rate(bucket['weak_rate'])})")
-    for name in ("shift", "risk_gate"):
+    for name in ("shift", "risk_gate", "ask"):
         part = summary[name]
         lines.append(f"{name}: {part['total']} total, {fmt_counts(part['decisions'])}, "
                      f"{fmt_latency(part['latency_ms'])}")
@@ -224,6 +254,15 @@ def render(summary):
     mean = "n/a" if grade["score_mean"] is None else f"{grade['score_mean']:.2f}"
     lines.append(f"handoff_grade: {grade['total']} total, score mean {mean}, weak {grade['weak']} "
                  f"(accepted {grade['accepted_weak']}), {fmt_latency(grade['latency_ms'])}")
+    spend = summary["spend"]
+    if spend["calls"]:
+        estimated = f", {spend['estimated_calls']} estimated" if spend["estimated_calls"] else ""
+        lines.append(f"spend: {spend['calls']} calls, {spend['input_tokens']} in / {spend['output_tokens']} out "
+                     f"tokens, ${spend['usd']:.6f}{estimated}")
+        for name, bucket in spend["per_feature"].items():
+            lines.append(f"  {name}: {bucket['calls']} calls, ${bucket['usd']:.6f}")
+    else:
+        lines.append("spend: no usage reported")
     return "\n".join(lines)
 
 
@@ -234,7 +273,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     entries = load_entries(log_paths(args.log))
     summary = summarize(entries)
-    if not summary["entries"]:
+    if not summary["entries"] and not summary["spend"]["calls"]:
         message = f"no jev log entries at {args.log}"
         print(json.dumps({"entries": 0, "message": message}) if args.json else message)
         return 0

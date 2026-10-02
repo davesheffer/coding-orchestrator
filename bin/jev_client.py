@@ -1,7 +1,7 @@
 """Shared stdlib client for the opt-in Jev integrations.
 
 Every Jev feature (model routing, task-shift detection, risk gate, subagent
-report check, handoff grading) loads its settings from the "jev" key of
+report check, handoff grading, the ask-jev CLI) loads its settings from the "jev" key of
 `<install>/relay/config.json` and asks TypeSafe's hosted classifier through
 `ask()`. The API key comes from TYPESAFE_API_KEY or `jev.api_key_file`.
 
@@ -9,7 +9,8 @@ Fail-open contract: `ask()` returns None when the feature is disabled, the key
 is missing, the endpoint is not allowed, or the call errors or outlives its
 hard deadline of min(timeout_seconds, 4) seconds. Callers treat None as "no
 opinion" and keep their pre-Jev behaviour. Nothing here logs prompt, diff or
-report text, or the key.
+report text, or the key. A successful call that reports token usage appends one
+`"kind": "usage"` line (tokens and USD, reported or estimated) to the same log.
 """
 import csv
 import ctypes
@@ -33,8 +34,10 @@ ROUTE_NUMBERS = ("min_confidence", "upgrade_min_confidence", "downgrade_min_conf
 # Every probability/confidence threshold in DEFAULTS: each must be a number in [0, 1].
 THRESHOLDS = ROUTE_NUMBERS + ("shift_low", "shift_high", "risk_min_probability",
                               "report_min_support", "report_max_gap")
-FEATURES = ("route", "shift", "risk_gate", "report_check", "handoff_grade")
+FEATURES = ("route", "shift", "risk_gate", "report_check", "handoff_grade", "ask")
 MAX_DEADLINE_SECONDS = 4.0
+# Hooks block the agent, so they keep MAX_DEADLINE_SECONDS; the ask-jev CLI may wait longer.
+MAX_ASK_DEADLINE_SECONDS = 60.0
 MAX_LOG_BYTES = 1 << 20
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 DEFAULTS = {
@@ -84,6 +87,11 @@ DEFAULTS = {
     "max_report_chars": 8000,
     # handoff_grade
     "handoff_min_score": 2,
+    # ask (bin/ask-jev.py): per-call deadline, capped at MAX_ASK_DEADLINE_SECONDS
+    "ask_timeout_seconds": 20,
+    # spend ledger: list prices used when a response reports tokens but no cost
+    "input_usd_per_million": 0.042,
+    "output_usd_per_million": 0.0,
 }
 
 
@@ -96,7 +104,8 @@ def load_config(path=CONFIG_PATH):
             user = loaded
     except Exception:
         pass
-    cfg.update({k: v for k, v in user.items() if k not in ("labels", "features")})
+    # log_path is internal (codex/jev-hook.py sets it after loading), never user-supplied.
+    cfg.update({k: v for k, v in user.items() if k not in ("labels", "features", "log_path")})
     # User labels merge over the defaults; a null value removes that tier.
     labels = dict(DEFAULTS["labels"])
     if isinstance(user.get("labels"), dict):
@@ -120,9 +129,14 @@ def load_config(path=CONFIG_PATH):
     score = config_number(cfg["handoff_min_score"], 0.0, 4.0)
     cfg["handoff_min_score"] = (DEFAULTS["handoff_min_score"] if score is None
                                 else int(score) if score.is_integer() else score)
+    for key in ("input_usd_per_million", "output_usd_per_million"):
+        price = config_number(cfg[key], 0.0, math.inf)
+        cfg[key] = float(DEFAULTS[key]) if price is None else price
     chars = config_number(cfg["max_prompt_chars"], 0.0, math.inf)
     cfg["max_prompt_chars"] = (int(chars) if chars is not None and chars.is_integer()
                                else DEFAULTS["max_prompt_chars"])
+    ask_timeout = config_number(cfg["ask_timeout_seconds"], 0.1, MAX_ASK_DEADLINE_SECONDS)
+    cfg["ask_timeout_seconds"] = DEFAULTS["ask_timeout_seconds"] if ask_timeout is None else ask_timeout
     return cfg
 
 
@@ -189,12 +203,14 @@ def endpoint_allowed(endpoint):
     return parts.scheme == "http" and parts.hostname in LOCAL_HOSTS
 
 
-def effective_timeout(cfg):
+def effective_timeout(cfg, cap=MAX_DEADLINE_SECONDS):
     try:
         timeout = float(cfg.get("timeout_seconds"))
     except (TypeError, ValueError):
-        timeout = MAX_DEADLINE_SECONDS
-    return max(0.0, min(timeout, MAX_DEADLINE_SECONDS))
+        timeout = cap
+    if not math.isfinite(timeout):
+        timeout = cap
+    return max(0.0, min(timeout, cap))
 
 
 def call_with_deadline(fn, args, timeout):
@@ -246,11 +262,14 @@ def http_classify(body, cfg, key):
         cfg["endpoint"], data=json.dumps(body).encode("utf-8"), method="POST",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     opener = urllib.request.build_opener(NoRedirect)
-    with opener.open(request, timeout=max(effective_timeout(cfg), 0.1)) as response:
+    # ask() passes a config whose timeout_seconds is already capped for its caller.
+    timeout = effective_timeout(cfg, MAX_ASK_DEADLINE_SECONDS)
+    with opener.open(request, timeout=max(timeout, 0.1)) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=None):
+def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=None,
+        usage=None, timeout_cap=MAX_DEADLINE_SECONDS):
     """Return the Jev `answers` dict, or None (disabled, no key, error, timeout).
 
     classify_fn(body, key) returns the parsed response; it defaults to the HTTP
@@ -262,6 +281,10 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=
     `deadline` (a time.monotonic() value) is the caller's overall budget: the call
     gets min(effective_timeout(cfg), what remains), and none at all once it has
     passed (records "TimeoutError" without calling the classifier).
+
+    A response with valid token usage is logged as a `"kind": "usage"` entry, and
+    copied into `usage` when that is a dict. `timeout_cap` raises the per-call
+    ceiling for callers that are not hooks (at most MAX_ASK_DEADLINE_SECONDS).
     """
     if not feature_enabled(cfg, feature) or not endpoint_allowed(cfg.get("endpoint")):
         return None
@@ -270,8 +293,7 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=
         if errors is not None:
             errors.append("NoApiKey")
         return None
-    timeout = effective_timeout(cfg)
-    run_cfg = cfg
+    timeout = effective_timeout(cfg, min(max(float(timeout_cap), 0.0), MAX_ASK_DEADLINE_SECONDS))
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -279,12 +301,13 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=
                 errors.append("TimeoutError")
             return None
         timeout = min(timeout, remaining)
-        # http_classify reads its socket timeout from the config.
-        run_cfg = dict(cfg, timeout_seconds=timeout)
+    # http_classify reads its socket timeout from the config.
+    run_cfg = dict(cfg, timeout_seconds=timeout)
     fn = classify_fn or (lambda body, k: http_classify(body, run_cfg, k))
     body = {"state": state, "model": cfg["jev_model"], "questions": questions}
     try:
-        answers = call_with_deadline(fn, (body, key), timeout)["answers"]
+        response = call_with_deadline(fn, (body, key), timeout)
+        answers = response["answers"]
     except Exception as exc:
         if errors is not None:
             errors.append(type(exc).__name__)
@@ -293,7 +316,47 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=
         if errors is not None:
             errors.append("MalformedResponse")
         return None
+    # Usage accounting is best effort: a malformed usage block never costs the answers.
+    try:
+        spent = usage_of(cfg, response)
+        if spent is not None:
+            if isinstance(usage, dict):
+                usage.update(spent)
+            write_log(cfg, {"ts": timestamp(), "kind": "usage", "feature": feature,
+                            "questions": len(questions) if isinstance(questions, dict) else None,
+                            **spent})
+    except Exception:
+        pass
     return answers
+
+
+def token_count(value):
+    """A non-negative int token count (not bool) of at most 2**53, else None."""
+    return (value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**53
+            else None)
+
+
+def usage_of(cfg, response):
+    """{input_tokens, output_tokens, usd, cost_source} from a response's `usage`, or None.
+
+    A finite non-negative `usage.cost` is "reported"; otherwise USD is "estimated"
+    from the configured per-million prices. Missing or invalid token counts give None.
+    """
+    usage = response.get("usage") if isinstance(response, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    tokens_in, tokens_out = token_count(usage.get("input_tokens")), token_count(usage.get("output_tokens"))
+    if tokens_in is None or tokens_out is None:
+        return None
+    cost = config_number(usage.get("cost"), 0.0, math.inf)
+    if cost is not None:
+        usd, source = cost, "reported"
+    else:
+        usd = (tokens_in * cfg.get("input_usd_per_million", DEFAULTS["input_usd_per_million"])
+               + tokens_out * cfg.get("output_usd_per_million", DEFAULTS["output_usd_per_million"])) / 1e6
+        source = "estimated"
+    return {"input_tokens": tokens_in, "output_tokens": tokens_out,
+            "usd": round(usd, 9), "cost_source": source}
 
 
 def safe_repr(value, limit=80):
@@ -346,18 +409,24 @@ def _restrict_windows_file(path):
                    capture_output=True, text=True, check=True, timeout=MAX_DEADLINE_SECONDS)
 
 
+_LOG_ROTATE_LOCK = threading.Lock()
+
+
 def write_log(cfg, entry, path=None):
     if not cfg.get("log", True):
         return
-    path = Path(path or LOG_PATH)
     try:
-        if path.is_file() and path.stat().st_size > MAX_LOG_BYTES:
-            try:
-                os.replace(path, path.with_name(path.name + ".1"))
-            except OSError:
-                # e.g. Windows while another hook holds the log open: skip rotation
-                # this time and still append the entry.
-                pass
+        path = Path(path or cfg.get("log_path") or LOG_PATH)
+        # ask-jev --each logs from several threads: check and rotate under one lock so
+        # a second thread can't rotate the fresh log over the rotated history.
+        with _LOG_ROTATE_LOCK:
+            if path.is_file() and path.stat().st_size > MAX_LOG_BYTES:
+                try:
+                    os.replace(path, path.with_name(path.name + ".1"))
+                except OSError:
+                    # e.g. Windows while another hook holds the log open: skip rotation
+                    # this time and still append the entry.
+                    pass
         try:
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
             created = True
