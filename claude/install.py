@@ -53,7 +53,7 @@ LEGACY_MANAGED_HASHES = {
     },
 }
 MANIFEST = ".coding-orchestrator-manifest.json"
-JEV_SCRIPTS = ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py")
+JEV_SCRIPTS = ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py")
 
 
 def fail(message: str) -> None:
@@ -327,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         "__PYTHON__": hook_python(),
         "__RELAY__": shlex.quote(str(dest / "relay/relay.py")),
         "__PR_STATUS__": f"{hook_python()} {shlex.quote(str(dest / 'bin/pr-status'))}",
+        "__ASK_JEV__": f"{hook_python()} {shlex.quote(str(dest / 'bin/ask-jev.py'))}",
     }).encode("utf-8")
     managed_block(source_claude, root / "CLAUDE.md")
     hook_template = parse_json(root / "hooks.json", (root / "hooks.json").read_bytes())
@@ -454,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     for directory in directories:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     executable = {dest / "bin" / name
-                  for name in ("pr-status", "jev-route.py", "jev-guard.py", "jev-report.py")}
+                  for name in ("pr-status", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py")}
     for path, data, prior in changes:
         if prior is not None:
             backup = create_backup(path, prior)

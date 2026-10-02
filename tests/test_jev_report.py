@@ -183,6 +183,64 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(data["route"]["total"], 1)
         self.assertEqual(data["report_check"]["per_tier"]["sonnet"]["weak"], 1)
 
+    def usage(self, feature, tokens_in, tokens_out, usd, source="reported"):
+        return {"ts": "2026-09-24T10:10:00+0000", "kind": "usage", "feature": feature, "questions": 1,
+                "input_tokens": tokens_in, "output_tokens": tokens_out, "usd": usd, "cost_source": source}
+
+    def test_usage_lines_are_spend_not_decisions(self):
+        entries = [
+            {"feature": "shift", "decision": "shift"},
+            {"feature": "ask", "decision": "answered", "latency_ms": 900},
+            {"feature": "ask", "decision": "unavailable"},
+            self.usage("shift", 100, 5, 0.001),
+            self.usage("ask", 2000, 10, 0.0001, source="estimated"),
+            self.usage("ask", 1000, 0, 0.002),
+            self.usage("ask", True, 0, 0.1),          # malformed: skipped
+            self.usage("ask", 10, 10, -1),            # negative usd: skipped
+            self.usage("ask", "x", 10, 0.1),          # non-numeric: skipped
+            {"kind": "usage", "feature": "ask"},      # missing fields: skipped
+        ]
+        summary = report.summarize(entries)
+        self.assertEqual(summary["entries"], 3)
+        self.assertEqual(summary["shift"]["total"], 1)
+        self.assertEqual(summary["ask"]["total"], 2)
+        self.assertEqual(summary["ask"]["decisions"], {"answered": 1, "unavailable": 1})
+        spend = summary["spend"]
+        self.assertEqual((spend["calls"], spend["input_tokens"], spend["output_tokens"], spend["estimated_calls"]),
+                         (3, 3100, 15, 1))
+        self.assertAlmostEqual(spend["usd"], 0.0031)
+        self.assertEqual(list(spend["per_feature"]), ["ask", "shift"])
+        self.assertEqual(spend["per_feature"]["ask"]["calls"], 2)
+        self.assertAlmostEqual(spend["per_feature"]["ask"]["usd"], 0.0021)
+        self.assertEqual(spend["per_feature"]["shift"], {"calls": 1, "usd": 0.001})
+        text = report.render(summary)
+        self.assertIn("spend: 3 calls, 3100 in / 15 out tokens, $0.003100, 1 estimated", text)
+        self.assertIn("  ask: 2 calls, $0.002100", text)
+        self.assertIn("ask: 2 total", text)
+        self.assertIn("spend: no usage reported", report.render(report.summarize([])))
+
+    def test_huge_usage_numbers_are_skipped(self):
+        entries = [self.usage("ask", 10**400, 1, 0.1), self.usage("ask", 1, 1, 10**400), self.usage("ask", 1, 2, 0.5),
+                   self.usage("ask", 1e308, 1, 0.1), self.usage("ask", 10**29, 1, 0.1), self.usage("ask", 1, 1, 1e308)]
+        self.assertIsNone(report.number(10**400))
+        spend = report.summarize(entries)["spend"]
+        self.assertEqual((spend["calls"], spend["input_tokens"], spend["output_tokens"]), (1, 1, 2))
+        self.write(self.log, entries)
+        result = run(REPORT, "--log", str(self.log), "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["spend"]["calls"], 1)
+
+    def test_log_with_only_usage_lines_reports_spend(self):
+        self.write(self.log, [self.usage("ask", 10, 2, 0.5)])
+        result = run(REPORT, "--log", str(self.log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("no jev log entries", result.stdout)
+        self.assertIn("spend: 1 calls", result.stdout)
+        result = run(REPORT, "--log", str(self.log), "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual((data["entries"], data["spend"]["calls"]), (0, 1))
+
 
 def answers(choice, conf):
     return {"model": {"type": "choice", "choice": choice, "confidence": conf,

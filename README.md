@@ -181,7 +181,7 @@ that it needs conversion instead of silently discarding its contents.
 
 #### Optional: Jev integrations
 
-`./install.sh --jev` turns on five opt-in hooks. They use TypeSafe's hosted Jev
+`./install.sh --jev` turns on five opt-in hooks and the `ask-jev.py` command. They use TypeSafe's hosted Jev
 classifier (`POST https://api.typesafe.ai/v1/systemone`) to route subagents, spot
 task changes, gate risky commits, check subagent reports, and grade handoffs.
 The scripts are always installed. Only `--jev` registers the hooks and sets
@@ -286,7 +286,7 @@ installed `relay/config.json`:
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` (`true` after `--jev`) | Set `false` to turn every feature off without reinstalling |
-| `features` | all `true` | Per-feature switches: `route`, `shift`, `risk_gate`, `report_check`, `handoff_grade` |
+| `features` | all `true` | Per-feature switches: `route`, `shift`, `risk_gate`, `report_check`, `handoff_grade`, `ask` |
 | `api_key_file` | unset | File containing the key when `TYPESAFE_API_KEY` is not set (`~` is expanded) |
 | `endpoint`, `jev_model` | TypeSafe endpoint, `"jev-latest"` | Classifier API and model. The endpoint must be `https`, or `http` only to `localhost`, `127.0.0.1`, or `::1` |
 | `timeout_seconds` | `3` | Classifier deadline, capped at 4 s |
@@ -305,6 +305,8 @@ installed `relay/config.json`:
 | `report_min_support`, `report_max_gap` | `0.5`, `0.5` | report_check: evidence-support floor and material-gap ceiling |
 | `max_report_chars` | `8000` | report_check: report text considered |
 | `handoff_min_score` | `2` | handoff_grade: minimum score (0–4) to save without `--accept-weak` |
+| `ask_timeout_seconds` | `20` | ask: per-call deadline for `ask-jev.py`, 0.1–60 s (it is not a hook); an invalid value falls back to 20 |
+| `input_usd_per_million`, `output_usd_per_million` | `0.042`, `0` | Spend: list prices used when a response reports tokens but no cost |
 
 Each line of `relay/jev-log.jsonl` (mode 0600; on Windows, a new log's ACL is
 limited to the current user; rotated to `jev-log.jsonl.1` past 1 MiB) records the feature, the decision, the classifier's numbers, and the
@@ -316,14 +318,18 @@ whatever ACL it already had. `route` records `desc_hash`, a short hash of the ta
 answer), its line adds `"reason": "unavailable"` and `error`, the exception
 class name (e.g. `HTTPError`, `TimeoutError`, `NoApiKey`). Log lines never
 contain prompt, diff or report text, task descriptions, file names, commands,
-or the key. Summarize the log with:
+or the key. A successful call whose response reports token usage adds a
+`"kind": "usage"` line with the feature, question count, input and output
+tokens, and USD (`cost_source` is `reported`, or `estimated` from the prices
+above). Summarize the log with:
 
 ```sh
 python3 ~/.claude/bin/jev-report.py          # or --json
 ```
 
 It shows routing choices per role, the confidence histogram, applied rate,
-latency, and decision counts per feature. It also shows the weak-report rate
+latency, decision counts per feature, and spend (calls, tokens and USD in
+total and per feature). It also shows the weak-report rate
 per model tier: a tier whose reports are often weak may be too small for the
 tasks it gets. From the repository, `python3 bin/eval-jev-routing.py` scores
 routing against the 30 labelled tasks in `benchmarks/jev-routing.json`: it
@@ -336,9 +342,61 @@ default rubrics (2026-10-01) scored 30/30, with applied accuracy 30/30 (21 of
 the 30 decisions changed the model) and confidence 0.92 to 0.98. The rubrics
 were tuned on this benchmark, so check your own log with `jev-report.py` too.
 
+##### Asking Jev about files: `ask-jev.py`
+
+`ask-jev.py` lets the orchestrator or a subagent ask Jev a typed question
+about files without reading them into its own context. The script reads the
+files, sends their text as Jev `state`, and prints only the answers as JSON.
+Use it for judgements ("which of these modules handle auth?", "how risky is
+this file to change?"). Use Read when you need the code itself, and grep for
+exact lookups:
+
+```sh
+python3 ~/.claude/bin/ask-jev.py -q '{"auth": {"type": "noul",
+  "instructions": "Does a file in `files` validate auth tokens?"}}' src/auth/*.py
+python3 ~/.claude/bin/ask-jev.py --each -q @questions.json 'src/**/*.ts'
+pytest 2>&1 | python3 ~/.claude/bin/ask-jev.py --stdin -q '{"cause": {"type": "choice",
+  "instructions": "What caused the failures in `input`?",
+  "criteria": {"product_bug": null, "test_bug": null, "environment": null}}}'
+```
+
+- Questions use Jev's three types: `noul` (a 0–1 probability), `choice`
+  (options mapped to descriptions; an `other` option is added unless one
+  exists) and `score` (2–10 level descriptions). `--help-questions` prints the
+  format.
+- By default the script makes one call with state `{"files": {path: text},
+  "text": --state, "input": stdin}`, for up to 20 files. When that is over
+  Jev's token budget, it refuses and suggests how to split the files. `--each`
+  makes one call per file (`{"path", "content"}`) for up to 255 files, 8 at a
+  time.
+- It runs only inside a git repository and sends only files inside it (a
+  `-q @file` of questions may sit elsewhere, e.g. a scratch directory; it is
+  capped at 64,000 bytes and refused when secret-named). A glob or directory
+  whose base is outside the repository is skipped without being walked,
+  symlinked directories are not followed, a glob without `**` is walked only as
+  deep as it reaches, and patterns that visit more than 50,000 files and
+  directories are refused. It skips:
+  - dependency and build directories
+  - binary and lock files
+  - files over 240,000 characters
+  - secret-looking file names (the same patterns as the risk gate).
+
+  Token-shaped secrets in the files, `--state`, stdin and the questions are
+  scrubbed before sending; a file whose path holds one is skipped, and a
+  question id or choice option holding one is refused. `skipped` reports the count, the count per reason
+  and up to 10 sample paths with their reasons.
+- Exit 0 prints answers and usage. Exit 2 means bad questions or arguments, or
+  no usable file. Exit 3 means Jev is off, there is no key, or every call failed,
+  so read the files instead; the off and no-key checks come first, so then the
+  questions are not validated. Unlike the hooks, `ask-jev.py` is called deliberately, so
+  it reports failure instead of failing open silently.
+- The log records the mode and counts, never paths, questions or file text.
+
 **Privacy:** with `--jev`, the text listed under "Sent to TypeSafe" goes to
 TypeSafe's paid third-party API. Turn off a feature under `jev.features`, or use
-`send_prompt: false` and `send_diff: false` to send less. Only while `shift` is
+`send_prompt: false` and `send_diff: false` to send less. `ask-jev.py` sends
+the text of the files and input it is given; turn it off with
+`jev.features.ask: false`. Only while `shift` is
 on, the relay keeps your last five prompts (500 chars each) and the handoff GOAL
 line in its per-session state file `relay/state/<session>.json` (mode 0600),
 which is removed after `handoff_ttl_hours`. Independently of Jev, a handoff
@@ -565,7 +623,7 @@ runner. No credentials are included.
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
 | `bin/pr-status` | Shared PR/CI helper |
 | `bin/rollover-open.py`, `vscode/handoff-bridge/` | Shared handoff protocol and VS Code tab bridge |
-| `bin/jev_client.py`, `bin/jev-route.py`, `bin/jev-guard.py`, `bin/jev-report.py`, `bin/eval-jev-routing.py` | Opt-in TypeSafe Jev hooks (routing, risk gate, report check), log report and routing eval |
+| `bin/jev_client.py`, `bin/jev-route.py`, `bin/jev-guard.py`, `bin/jev-report.py`, `bin/ask-jev.py`, `bin/eval-jev-routing.py` | Opt-in TypeSafe Jev hooks (routing, risk gate, report check), ask-about-files command, log and spend report, routing eval |
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
 | `tests/` | Bundle contracts, both installers, and relay behavior |
