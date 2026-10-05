@@ -1427,6 +1427,65 @@ class GateTests(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertIn("+unpushed", self.calls[0][0]["state"]["diff"])
 
+    def test_push_with_unavailable_classifier_fails_closed(self):
+        self.add_remote()
+
+        def boom(body, key):
+            raise TimeoutError("slow")
+        for session in ("s1", "s1"):  # an identical retry is still denied
+            out = self.gate(self.payload("git push", session_id=session), classify_fn=boom)
+            hook = out["hookSpecificOutput"]
+            self.assertEqual(hook["permissionDecision"], "deny")
+            self.assertIn("fail-closed", hook["permissionDecisionReason"])
+        entry = self.logs[-1]
+        self.assertEqual((entry["decision"], entry["reason"], entry["error"], entry["fail_closed"]),
+                         ("deny", "unavailable", "TimeoutError", True))
+
+    def test_push_without_key_fails_closed(self):
+        self.add_remote()
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
+            out = self.gate(self.payload("git push"), classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.logs[-1]["error"], "NoApiKey")
+
+    def test_push_with_malformed_answer_fails_closed(self):
+        self.add_remote()
+        out = self.gate(self.payload("git push"),
+                        classify_fn=lambda body, key: {"answers": {"risk": {"choice": None}}})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("fail-closed", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_push_with_disallowed_endpoint_fails_closed(self):
+        self.add_remote()
+        cfg = dict(self.cfg, endpoint="http://jev.internal.example/v1")
+        out = self.gate(self.payload("git push"), cfg=cfg, classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.logs[-1]["error"], "EndpointDisallowed")
+
+    def test_push_with_missing_or_bad_needs_review_fails_closed(self):
+        self.add_remote()
+        for i, needs_review in enumerate(({"noul": "oops"}, None)):
+            answers = {"risk": {"choice": "data_loss", "confidence": 0.9}}
+            if needs_review is not None:
+                answers["needs_review"] = needs_review
+            out = self.gate(self.payload("git push", session_id=f"nr{i}"),
+                            classify_fn=lambda body, key, a=answers: {"answers": a})
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", needs_review)
+            self.assertEqual(self.logs[-1]["reason"], "malformed")
+
+    def test_commit_with_missing_needs_review_stays_open(self):
+        self.stage_change()
+        out = self.gate(self.payload("git commit -m x"), classify_fn=lambda body, key: {
+            "answers": {"risk": {"choice": "data_loss", "confidence": 0.9}}})
+        self.assertIsNone(out)
+
+    def test_push_with_disabled_feature_stays_open(self):
+        self.add_remote()
+        cfg = dict(self.cfg, enabled=False)
+        self.assertIsNone(self.gate(self.payload("git push"), cfg=cfg, classify_fn=self.classify()))
+
+
     def test_push_base_falls_back_to_origin_master(self):
         self.add_remote(branch="master", upstream=False)
         run_git(["fetch", "origin"], self.repo)
@@ -2646,6 +2705,40 @@ class SubprocessTests(unittest.TestCase):
                                 capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["echo"], message)
+
+
+class MainFailClosedTests(unittest.TestCase):
+    def run_main(self, payload_text):
+        with mock.patch.object(sys, "argv", ["jev-guard.py", "gate"]), \
+                mock.patch.object(sys, "stdin", mock.Mock(buffer=mock.Mock(
+                    read=lambda: payload_text.encode("utf-8")))), \
+                mock.patch.object(jev, "gate", side_effect=RuntimeError("boom")), \
+                mock.patch.object(sys, "stdout", new_callable=mock.Mock) as out:
+            self.assertEqual(jev.main(), 0)
+        return "".join(call.args[0] for call in out.write.call_args_list)
+
+    def test_crash_denies_push_and_deploy(self):
+        for command in ("git push origin main", "git -C x push -f", "npx heroku releases",
+                        "npm run deploy"):
+            written = self.run_main(json.dumps(
+                {"tool_name": "Bash", "tool_input": {"command": command}}))
+            self.assertEqual(json.loads(written)["hookSpecificOutput"]["permissionDecision"],
+                             "deny", command)
+
+    def test_crash_on_unparseable_push_payload_denies(self):
+        written = self.run_main('{"tool_input": {"command": "git push"')
+        self.assertEqual(json.loads(written)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_crash_on_other_commands_stays_open(self):
+        for command in ("git commit -m x", "ls -la", "git status"):
+            self.assertEqual(self.run_main(json.dumps(
+                {"tool_name": "Bash", "tool_input": {"command": command}})), "", command)
+
+    def test_crash_ignores_deploy_words_outside_the_command(self):
+        written = self.run_main(json.dumps({
+            "tool_name": "Bash", "tool_input": {"command": "ls"},
+            "cwd": "C:/work/deploy-tools", "transcript_path": "/x/heroku-notes/t.jsonl"}))
+        self.assertEqual(written, "")
 
 
 if __name__ == "__main__":
