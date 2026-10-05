@@ -31,7 +31,11 @@ updated under a `<state>.lock` file lock (see `update_state`) so concurrent
 hook invocations don't clobber each other's keys.
 
 Fail-open: any missing key, disabled config, error or timeout leaves the
-call unchanged. All Jev calls run under a hard wall-clock deadline of
+call unchanged, except that git pushes fail closed: a git push the classifier
+could not judge (no key, disallowed endpoint, error, timeout, malformed answer)
+is denied, and under Claude Code (this script's main(), not the Codex adapter)
+a gate crash denies any command that looks like a git push, heroku or deploy
+command. All Jev calls run under a hard wall-clock deadline of
 min(timeout_seconds, 4) seconds. Each hook invocation also shares one
 monotonic deadline (GATE_BUDGET_SECONDS for `gate`, SHORT_HOOK_BUDGET_SECONDS
 for `handback`/`agent-done`) across its git subprocesses, classifier call and
@@ -331,6 +335,24 @@ DIFF_HEADER_RE = re.compile(r"^diff --git (?:\"?a/(.*?)\"?) (?:\"?b/(.*?)\"?)$")
 DIFF_FORMAT_ARGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--no-relative",
                     "--src-prefix=a/", "--dst-prefix=b/"]
 GIT_SUBPROCESS_BUDGET_SECONDS = 4.0
+# Pushes and deploys leave the machine, so they fail closed: when the classifier is
+# unavailable or the gate itself crashes, they are denied instead of let through.
+# Matched against the raw command (or raw payload) only on those error paths.
+OUTWARD_COMMAND_RE = re.compile(
+    r"\bgit\b[^;&|\n]*\bpush\b|\bheroku\b|\bdeploy\b", re.IGNORECASE)
+FAIL_CLOSED_REASON = (
+    "[jev risk gate] The risk classifier {problem}, so this push/deploy is blocked "
+    "(fail-closed). Do not retry or work around it: ask the user to run it manually or "
+    "retry once Jev answers normally.")
+
+
+def fail_closed_output(problem="is unavailable"):
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": FAIL_CLOSED_REASON.format(problem=problem),
+    }}
+
 
 RISK_CRITERIA = {
     "none": ("Routine change: docs, tests, formatting, small local logic with no security, "
@@ -2088,6 +2110,12 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     answers = ask(cfg, "risk_gate", ask_state, questions, classify_fn, errors=errs,
                   deadline=deadline)
     if answers is None:
+        # Features were checked above, so None here means an error or a disallowed
+        # endpoint (which records no error); either way nobody judged the push.
+        if op == "push":
+            log("deny", reason="unavailable", error=errs[0] if errs else "EndpointDisallowed",
+                fail_closed=True)
+            return fail_closed_output()
         if errs:
             log("allow", reason="unavailable", error=errs[0])
         else:
@@ -2098,6 +2126,9 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     except Exception:
         choice = None
     if not isinstance(choice, str):
+        if op == "push":
+            log("deny", reason="malformed", fail_closed=True)
+            return fail_closed_output("returned an unusable answer")
         log("allow")
         return None
     # Confidence is only logged, so an invalid one (missing, null, str, bool, out of
@@ -2105,6 +2136,9 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     risk = answers["risk"]
     confidence = coerce_confidence(risk.get("confidence") if isinstance(risk, dict) else None)
     needs_review_p = noul(answers, "needs_review")
+    if op == "push" and choice != "none" and needs_review_p is None:
+        log("deny", choice, confidence, None, reason="malformed", fail_closed=True)
+        return fail_closed_output("returned an unusable answer")
 
     risky = (choice != "none" and needs_review_p is not None
              and needs_review_p >= cfg["risk_min_probability"])
@@ -2464,10 +2498,17 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
 
 
 def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    # What the crash path matches: the command once the payload parses (not cwd or
+    # transcript paths), the raw text only when it does not.
+    command_text = ""
     try:
-        mode = sys.argv[1] if len(sys.argv) > 1 else ""
         # Hook payloads are UTF-8 whatever the locale (e.g. cp1255 on Windows).
-        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
+        command_text = sys.stdin.buffer.read().decode("utf-8", "replace")
+        payload = json.loads(command_text or "{}")
+        tool_input = payload.get("tool_input") if isinstance(payload, dict) else None
+        command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        command_text = command if isinstance(command, str) else ""
         cfg = load_config()
         if mode == "gate":
             output = gate(payload, cfg, log_fn=lambda entry: write_log(cfg, entry))
@@ -2480,7 +2521,12 @@ def main():
         if output is not None:
             sys.stdout.write(json.dumps(output))
     except Exception:
-        pass
+        # A crashed gate must not wave through a push or deploy (see OUTWARD_COMMAND_RE).
+        try:
+            if mode == "gate" and OUTWARD_COMMAND_RE.search(command_text):
+                sys.stdout.write(json.dumps(fail_closed_output()))
+        except Exception:
+            pass
     return 0
 
 
