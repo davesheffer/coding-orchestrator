@@ -1,4 +1,4 @@
-import type { Confidence, JevEntry, JevStatus, Zone } from '../types'
+import type { Confidence, HunchConstraint, HunchLevel, JevEntry, JevStatus, Zone } from '../types'
 
 // Pure helpers: no `$`, so the tests exercise them directly.
 
@@ -236,4 +236,195 @@ export function seconds(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
 
   return s < 90 ? `${s}s` : `${Math.round(s / 60)}m`
+}
+
+/** `14:05` for a clock reading, local time. */
+export function clockTime(ms: number): string {
+  const date = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+// Hunch: calls through its MCP server (`mcp__hunch__hunch_context`) or its CLI through Bash.
+
+const HUNCH_MCP = /^mcp__hunch__(?:hunch_)?(.+)$/
+
+const TASK_ID = /\bhtask_[a-f0-9]{24}\b/
+
+const TARGET_KEYS = ['target', 'scope', 'topic', 'symbol', 'symptom_or_symbol', 'query', 'id', 'title'] as const
+
+// The CLI as the prompt hook prints it (`node .../@davesheffer/hunch/dist/cli/index.js task verify ...`),
+// or `hunch <sub>` / `npx @davesheffer/hunch <sub>` starting a command (matched with quoted text blanked,
+// so `git commit -m "hunch update"` is not a call).
+const HUNCH_LAUNCHER = /@davesheffer[\\/]+hunch[\\/]+dist[\\/]+cli[\\/]+index\.js['"]?\s+([a-z][\w-]*)(?:\s+([a-z][\w-]*))?/i
+
+const HUNCH_BARE = /(?:^|[;&|(]\s*)(?:npx\s+(?:-y\s+)?)?(?:@davesheffer\/)?hunch\s+([a-z][\w-]*)(?:\s+([a-z][\w-]*))?/i
+
+const LEVEL_RANK: Record<HunchLevel, number> = { info: 0, warn: 1, alert: 2 }
+
+const BLOCKING = /^(blocking|block|error|critical|must)$/i
+
+export type HunchInvocation = {
+  name: string
+  target: string
+  taskId?: string
+}
+
+export type HunchOutcome = {
+  summary: string
+  level: HunchLevel
+  constraints: HunchConstraint[]
+  verdict?: 'BLOCK' | 'WARN' | 'PASS'
+  exitCode?: number
+  taskId?: string
+}
+
+export function maxLevel(a: HunchLevel, b: HunchLevel): HunchLevel {
+  return LEVEL_RANK[a] >= LEVEL_RANK[b] ? a : b
+}
+
+/** `context` for `mcp__hunch__hunch_context`; undefined for any other tool. */
+export function hunchName(tool: string): string | undefined {
+  return HUNCH_MCP.exec(tool)?.[1]
+}
+
+/** What an MCP Hunch call is about, read from its arguments. */
+export function hunchInvocation(name: string, args: Record<string, unknown>): HunchInvocation {
+  const taskId = text(args.task_id) || undefined
+  let target: string
+
+  if (name === 'task') {
+    target = [text(args.action), text(args.title)].filter(Boolean).join(' ')
+  } else if (name === 'merge_verdict' || name === 'pr_impact') {
+    target = text(args.base) || text(args.commit) || (args.working === true ? 'working tree' : 'staged')
+  } else if (name === 'compare' && Array.isArray(args.candidates)) {
+    target = args.candidates.map(text).filter(Boolean).join(' vs ')
+  } else {
+    target = TARGET_KEYS.map(key => text(args[key])).find(Boolean) ?? ''
+  }
+
+  return { name, target: oneLine(target), taskId }
+}
+
+/** The hunch CLI call a Bash command makes, or undefined when it makes none. */
+export function hunchCli(command: string): HunchInvocation | undefined {
+  const match = HUNCH_LAUNCHER.exec(command) ?? HUNCH_BARE.exec(command.replace(/"[^"]*"|'[^']*'/g, '""'))
+  if (match === null) return undefined
+
+  const [, sub = '', action = ''] = match
+  const taskId = TASK_ID.exec(command)?.[0]
+
+  if (sub === 'task' && action === 'verify') {
+    const separator = command.indexOf(' -- ')
+    const checked = separator >= 0 ? command.slice(separator + 4) : ''
+
+    return { name: 'verify', target: oneLine(checked.replace(/\s*2>&1.*$/, '')), taskId }
+  }
+
+  return { name: `cli ${sub}`, target: action, taskId }
+}
+
+/** Grades what a Hunch call returned: a summary line, how loud, and what to toast about. */
+export function hunchOutcome(name: string, output: string, isError: boolean): HunchOutcome {
+  const taskId = TASK_ID.exec(output)?.[0]
+
+  if (name === 'verify') return verifyOutcome(output, isError)
+  if (isError) {
+    return { summary: firstLine(output) || 'failed', level: 'alert', constraints: [], taskId }
+  }
+
+  switch (name) {
+    case 'check_constraints': {
+      const constraints = [...output.matchAll(/^\s*[•*-]\s*(con_\w+)\s*\[([\w-]+)[^\]]*\]\s*(.*)$/gm)].map(match => ({
+        id: match[1] ?? '',
+        severity: (match[2] ?? '').toLowerCase(),
+        statement: oneLine(match[3] ?? ''),
+      }))
+      const blocking = constraints.filter(one => BLOCKING.test(one.severity)).length
+      const warnings = constraints.filter(one => one.severity === 'warning').length
+      const parts = [blocking > 0 ? `${blocking} blocking` : '', warnings > 0 ? `${warnings} warning` : ''].filter(Boolean)
+
+      return {
+        summary:
+          constraints.length === 0
+            ? 'no constraints in scope'
+            : `${constraints.length} constraint${constraints.length === 1 ? '' : 's'}${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`,
+        level: blocking > 0 ? 'alert' : warnings > 0 ? 'warn' : 'info',
+        constraints,
+        taskId,
+      }
+    }
+    case 'merge_verdict': {
+      const verdict = /VERDICT:\W*(BLOCK|WARN|PASS)/i.exec(output)?.[1]?.toUpperCase() as HunchOutcome['verdict']
+      const scope = /\(scope:\s*(.+?)\)\s*$/m.exec(output)?.[1]
+
+      return {
+        summary: `verdict ${verdict ?? '?'}${scope !== undefined ? ` · ${scope}` : ''}`,
+        level: verdict === 'BLOCK' ? 'alert' : verdict === 'WARN' ? 'warn' : 'info',
+        constraints: [],
+        verdict,
+        taskId,
+      }
+    }
+    case 'escalations': {
+      if (/nothing needs/i.test(output) || output.trim() === '') {
+        return { summary: 'none', level: 'info', constraints: [], taskId }
+      }
+      const headline = /(\d+)\s+decisions?\s+needs?\b/i.exec(output)?.[1]
+      const items = output.split(/\r?\n/).filter(line => /^\s*(?:[-*•⚖·]|\d+[.)])\s+/.test(line)).length
+      const count = headline !== undefined ? Number(headline) : Math.max(1, items)
+
+      return { summary: `${count} need your decision`, level: 'alert', constraints: [], taskId }
+    }
+    default:
+      return { summary: firstLine(output), level: 'info', constraints: [], taskId }
+  }
+}
+
+/**
+ * `task verify` streams the checked command's output, then its result JSON last: the last
+ * `"exit_code"` is the launcher's. Piped through `tail` or cut by the Bash output cap the JSON
+ * can be gone; then the Bash call's own exit (`Exit code N`, isError) is the evidence.
+ */
+function verifyOutcome(output: string, isError: boolean): HunchOutcome {
+  const taskId = TASK_ID.exec(output)?.[0]
+  const codes = [...output.matchAll(/"exit_code"\s*:\s*(-?\d+)/g)]
+  const jsonCode = codes.at(-1)?.[1]
+  const bashCode = /^Exit code (-?\d+)/m.exec(output)?.[1]
+  const code = jsonCode ?? bashCode
+  const isTimedOut = /"timed_out"\s*:\s*true/.test(output)
+
+  if (code === undefined) {
+    return isError
+      ? { summary: `failed: ${firstLine(output) || 'no exit code'}`, level: 'alert', constraints: [], taskId }
+      : { summary: 'exit code not in output (piped or truncated?)', level: 'warn', constraints: [], taskId }
+  }
+  const exitCode = Number(code)
+
+  return {
+    summary: `exit ${exitCode}${isTimedOut ? ' (timed out)' : ''}`,
+    level: exitCode === 0 && !isTimedOut && !isError ? 'info' : 'alert',
+    constraints: [],
+    exitCode,
+    taskId,
+  }
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, 120)
+}
+
+/** The first line that says something: no rule, bare heading mark or footer. */
+function firstLine(output: string): string {
+  for (const raw of output.split(/\r?\n/)) {
+    const line = raw
+      .replace(/<[^>]+>/g, '')
+      .replace(/^[\s#>*_`•-]+/, '')
+      .replace(/\*\*/g, '')
+      .trim()
+    if (line !== '' && !/^[-=_─]{3,}$/.test(line) && line !== '{') return oneLine(line)
+  }
+
+  return ''
 }

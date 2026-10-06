@@ -61,6 +61,43 @@ export type JevStatus = {
   note?: string
 }
 
+export type HunchLevel = 'info' | 'warn' | 'alert'
+
+export type HunchCallStatus = 'running' | 'ok' | 'error' | 'denied'
+
+/** One Hunch call: an `mcp__hunch__*` tool, or the hunch CLI run through Bash (`task verify`). */
+export type HunchCall = {
+  /** The tool_use_id. */
+  id: string
+  /** `context`, `check_constraints`, `verify`, `cli update`, ... */
+  name: string
+  target: string
+  taskId?: string
+  /** `main`, or the subagent role that made the call. */
+  role: string
+  startedAt: number
+  durationMs?: number
+  status: HunchCallStatus
+  summary: string
+  level: HunchLevel
+}
+
+/** Constraint lines `hunch_check_constraints` returned. */
+export type HunchConstraint = {
+  id: string
+  severity: string
+  statement: string
+}
+
+export type HunchLog = {
+  /** The newest htask_ id seen in a call's arguments or result. */
+  taskId?: string
+  calls: HunchCall[]
+  total: number
+  /** Constraint ids already toasted this session, so a `**` invariant toasts once. */
+  seenConstraints: string[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'mission-control': {
@@ -68,6 +105,7 @@ declare module 'claude-code' {
       reports: ReportCard[]
       gauge: Gauge | null
       jev: JevStatus | null
+      hunch: HunchLog
       isBandHidden: boolean
       tick: number
     }

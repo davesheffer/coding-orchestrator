@@ -1,13 +1,19 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
-import type { AgentRun, Gauge, JevStatus, ReportCard, Zone } from '../types'
+import type { AgentRun, Gauge, HunchCall, HunchConstraint, HunchLevel, HunchLog, JevStatus, ReportCard, Zone } from '../types'
 import {
   bar,
+  clockTime,
+  hunchCli,
+  hunchInvocation,
+  hunchName,
+  hunchOutcome,
   isRole,
   jevStatus,
   kTokens,
   localDay,
+  maxLevel,
   parseCard,
   parseLines,
   roleOf,
@@ -23,8 +29,15 @@ const agents = atom({ plugin: 'mission-control', key: 'agents' } as const, [])
 const reports = atom({ plugin: 'mission-control', key: 'reports' } as const, [])
 const gauge = atom({ plugin: 'mission-control', key: 'gauge' } as const, null)
 const jev = atom({ plugin: 'mission-control', key: 'jev' } as const, null)
+const hunch = atom({ plugin: 'mission-control', key: 'hunch' } as const, { calls: [], total: 0, seenConstraints: [] })
 const isBandHidden = atom({ plugin: 'mission-control', key: 'isBandHidden' } as const, false)
 const tick = atom({ plugin: 'mission-control', key: 'tick' } as const, 0)
+
+const HUNCH_KEEP = 40
+
+const HUNCH_COLOR: Record<HunchLevel, string | undefined> = { info: undefined, warn: 'yellow', alert: 'red' }
+
+const HUNCH_MARK: Record<HunchCall['status'], string> = { running: '…', ok: '✔', error: '✖', denied: '⛔' }
 
 const ZONE_COLOR: Record<Zone, string> = { green: 'green', amber: 'yellow', red: 'red', unknown: 'gray' }
 
@@ -126,6 +139,131 @@ async function pollJev($: EngineInterface) {
   await refreshStatus($)
 }
 
+/** The calls that belong to the current task, or every call while no task id has been seen. */
+function taskCalls(log: HunchLog): HunchCall[] {
+  return log.taskId === undefined ? log.calls : log.calls.filter(call => call.taskId === undefined || call.taskId === log.taskId)
+}
+
+function loudest(calls: HunchCall[]): HunchLevel {
+  return calls.reduce<HunchLevel>((level, call) => maxLevel(level, call.level), 'info')
+}
+
+function resultText(result: ToolCallResult): string {
+  if (result.deny !== undefined) return result.deny
+  if (result.text !== undefined) return result.text
+  if (typeof result.result === 'string') return result.result
+
+  return result.result === undefined ? '' : JSON.stringify(result.result)
+}
+
+async function startHunchCall(
+  $: EngineInterface,
+  id: string,
+  agentId: string | undefined,
+  invocation: { name: string; target: string; taskId?: string },
+) {
+  const caller = agentId === undefined ? undefined : (await read($, agents)).find(agent => agent.id === agentId)
+  const call: HunchCall = {
+    id,
+    name: invocation.name,
+    target: invocation.target,
+    taskId: invocation.taskId,
+    role: agentId === undefined ? 'main' : roleOf(caller?.type ?? 'subagent'),
+    startedAt: await $.clock.now(),
+    status: 'running',
+    summary: '',
+    level: 'info',
+  }
+  await update($, hunch, log => ({
+    ...log,
+    taskId: agentId === undefined ? (invocation.taskId ?? log.taskId) : log.taskId,
+    total: log.total + 1,
+    calls: [...log.calls.filter(one => one.id !== id), call].slice(-HUNCH_KEEP),
+  }))
+  await refreshStatus($)
+}
+
+async function finishHunchCall($: EngineInterface, id: string, result: ToolCallResult) {
+  const log = await read($, hunch)
+  const call = log.calls.find(one => one.id === id)
+  if (call === undefined) return
+
+  const now = await $.clock.now()
+  const isDenied = result.deny !== undefined
+  const isError = isDenied || result.isError === true
+  const outcome = hunchOutcome(call.name, resultText(result), isError)
+  const taskId = call.taskId ?? outcome.taskId
+  let { level, summary } = outcome
+
+  // A task closed through the tool without the brief Hunch says to read first.
+  const isFinish = call.name === 'task' && call.target.startsWith('finish')
+  const hadContext = log.calls.some(
+    one => one.name === 'context' && (taskId === undefined || one.taskId === undefined || one.taskId === taskId),
+  )
+  if (isFinish && !isError && !hadContext) {
+    level = maxLevel(level, 'warn')
+    summary = `no hunch_context this task · ${summary}`
+  }
+
+  let fresh: HunchConstraint[] = []
+  const done: HunchCall = {
+    ...call,
+    taskId,
+    status: isDenied ? 'denied' : isError ? 'error' : 'ok',
+    durationMs: now - call.startedAt,
+    summary,
+    level,
+  }
+  // Read seenConstraints inside the write, so parallel checks of one invariant toast it once.
+  // 5: a task id in an output only moves the current task when the main loop started it.
+  const isMainStart = call.role === 'main' && call.name === 'task' && call.target.startsWith('start')
+  await update($, hunch, current => {
+    fresh = outcome.constraints.filter(one => one.severity !== 'advisory' && !current.seenConstraints.includes(one.id))
+
+    return {
+      ...current,
+      taskId: isMainStart ? (outcome.taskId ?? current.taskId) : current.taskId,
+      seenConstraints: [...current.seenConstraints, ...fresh.map(one => one.id)].slice(-200),
+      calls: current.calls.map(one => (one.id === id ? done : one)),
+    }
+  })
+
+  const where = call.target === '' ? '' : ` (${call.target})`
+  const first = fresh[0]
+  if (first !== undefined) {
+    const more = fresh.length > 1 ? ` +${fresh.length - 1} more` : ''
+    $.ui.toast(`🧠 Hunch invariant [${first.severity}]${where}: ${first.statement}${more}`, { timeoutMs: 10000 })
+  }
+  if (outcome.verdict === 'BLOCK') {
+    $.ui.toast(`⛔ Hunch merge verdict BLOCK${where}: fix the cited invariant before merging`, { timeoutMs: 12000 })
+  }
+  if (call.name === 'escalations' && level === 'alert' && !isError) {
+    $.ui.toast(`🧠 Hunch escalations: ${summary}; ask the user, silence is never approval`, { timeoutMs: 10000 })
+  }
+  if (call.name === 'verify' && level === 'alert') {
+    $.ui.toast(`✖ Hunch verify ${summary}${where}`, { timeoutMs: 10000 })
+  }
+  if (isError && call.name !== 'verify') {
+    $.ui.toast(`✖ Hunch ${call.name} ${isDenied ? 'denied' : 'failed'}: ${summary}`, { timeoutMs: 8000 })
+  }
+  if (isFinish && !hadContext && !isError) {
+    $.ui.toast('⚠ Hunch task finished without a hunch_context brief', { timeoutMs: 8000 })
+  }
+  await refreshStatus($)
+}
+
+async function settleHunchCall($: EngineInterface, id: string) {
+  const now = await $.clock.now()
+  await update($, hunch, log => ({
+    ...log,
+    calls: log.calls.map(one =>
+      one.id === id && one.status === 'running'
+        ? { ...one, status: 'error' as const, level: 'alert' as const, durationMs: now - one.startedAt, summary: 'aborted or not recorded' }
+        : one,
+    ),
+  }))
+}
+
 async function refreshStatus($: EngineInterface) {
   if (!(await read($, isBandHidden))) {
     $.ui.status(undefined)
@@ -136,7 +274,8 @@ async function refreshStatus($: EngineInterface) {
   const running = (await read($, agents)).filter(agent => agent.status === 'running').length
   const zone = g === null ? '?' : g.zone.toUpperCase()
   const jevMark = j?.isOnline === false ? 'Jev off' : j?.isOnline === true ? 'Jev on' : 'Jev ?'
-  $.ui.status(`${zone} ${kTokens(g?.tokens)} · ${running} agents · ${jevMark}`)
+  const hunchCount = taskCalls(await read($, hunch)).length
+  $.ui.status(`${zone} ${kTokens(g?.tokens)} · ${running} agents · ${jevMark} · hunch ${hunchCount}`)
 }
 
 function openPane($: EngineInterface) {
@@ -212,7 +351,7 @@ export const register: Register = on => {
     }
 
     return spawned
-  })
+  }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const agentId = e.agentId
@@ -259,6 +398,40 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('tool.call', { tool: /^mcp__hunch__/ }, async ($, e, next) => {
+    const name = hunchName(e.tool)
+    if (name === undefined) return next(e)
+
+    await startHunchCall($, e.tool_use_id, e.agentId, hunchInvocation(name, e as unknown as Record<string, unknown>))
+    const result = await next(e)
+    await finishHunchCall($, e.tool_use_id, result)
+
+    return result
+  }).catch(async ($, e, next) => {
+    try {
+      return await next(e)
+    } finally {
+      await settleHunchCall($, e.tool_use_id).catch(() => undefined)
+    }
+  })
+
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const invocation = e.tool === 'Bash' ? hunchCli(e.command) : undefined
+    if (invocation === undefined) return next(e)
+
+    await startHunchCall($, e.tool_use_id, e.agentId, invocation)
+    const result = await next(e)
+    await finishHunchCall($, e.tool_use_id, result)
+
+    return result
+  }).catch(async ($, e, next) => {
+    try {
+      return await next(e)
+    } finally {
+      await settleHunchCall($, e.tool_use_id).catch(() => undefined)
+    }
+  })
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || (await read($, isBandHidden))) return next(e)
 
@@ -267,6 +440,8 @@ export const register: Register = on => {
     const j = await read($, jev)
     const running = (await read($, agents)).filter(agent => agent.status === 'running')
     const last = (await read($, reports)).at(-1)
+    const hunchNow = taskCalls(await read($, hunch))
+    const hunchLevel = loudest(hunchNow)
     const isWide = e.props.bodyColumns >= 100
 
     const zone: Zone = g?.zone ?? 'unknown'
@@ -285,6 +460,11 @@ export const register: Register = on => {
         </Text>
         {isWide && <Text color={ZONE_COLOR[zone]}>{bar(fill, 10)}</Text>}
         <Text color={jevColor}>{jevText}</Text>
+        <Text color={HUNCH_COLOR[hunchLevel] ?? (hunchNow.length === 0 ? 'gray' : 'cyan')}>
+          {'🧠'} hunch {hunchNow.length}
+          {hunchNow.some(call => call.status === 'running') ? '…' : ''}
+          {hunchLevel !== 'info' ? ` ⚠${hunchNow.filter(call => call.level !== 'info').length}` : ''}
+        </Text>
         <Text wrap="truncate">
           {'⚙'} {crew}
         </Text>
@@ -306,6 +486,10 @@ export const register: Register = on => {
     const j = await read($, jev)
     const list = await read($, agents)
     const cards = await read($, reports)
+    const hunchLog = await read($, hunch)
+    const hunchNow = taskCalls(hunchLog)
+    const counts = new Map<string, number>()
+    for (const call of hunchNow) counts.set(call.name, (counts.get(call.name) ?? 0) + 1)
     const now = Math.max(await read($, tick), ...list.map(agent => agent.startedAt))
     const width = Math.max(20, e.props.bodyColumns)
     const zone: Zone = g?.zone ?? 'unknown'
@@ -358,6 +542,37 @@ export const register: Register = on => {
           ))}
 
         <Text bold>
+          Hunch{' '}
+          <Text color={HUNCH_COLOR[loudest(hunchNow)]}>
+            {hunchLog.taskId ?? 'no task id yet'} · {hunchNow.length} call{hunchNow.length === 1 ? '' : 's'}
+          </Text>
+        </Text>
+        {hunchNow.length === 0 && <Text dimColor>No Hunch calls yet this task.</Text>}
+        {counts.size > 0 && (
+          <Text dimColor wrap="truncate">
+            {[...counts].map(([name, count]) => `${name} ${count}`).join(' · ')}
+          </Text>
+        )}
+        {hunchNow
+          .slice(-8)
+          .reverse()
+          .map(call => (
+            <Box flexDirection="column">
+              <Text wrap="truncate" color={HUNCH_COLOR[call.level]}>
+                {clockTime(call.startedAt)} {HUNCH_MARK[call.status]} {call.role.padEnd(7)} {call.name.padEnd(17)}{' '}
+                {call.durationMs === undefined ? '' : `${seconds(call.durationMs).padStart(4)} `}
+                {call.target}
+              </Text>
+              {call.summary !== '' && (
+                <Text dimColor wrap="truncate">
+                  {'      '}
+                  {call.summary}
+                </Text>
+              )}
+            </Box>
+          ))}
+
+        <Text bold>
           Jev{' '}
           <Text color={j?.isOnline === true ? 'green' : j?.isOnline === false ? 'red' : 'gray'}>
             {j?.isOnline === true ? 'online' : j?.isOnline === false ? `offline (${j.lastError ?? 'unavailable'})` : 'unknown'}
@@ -384,7 +599,10 @@ export const register: Register = on => {
           <Button
             key="clear"
             label="clear done"
-            onPress={() => update($, agents, all => all.filter(agent => agent.status === 'running'))}
+            onPress={async () => {
+              await update($, agents, all => all.filter(agent => agent.status === 'running'))
+              await update($, hunch, log => ({ ...log, calls: log.calls.filter(call => call.status === 'running') }))
+            }}
           />
         </Box>
       </Box>
