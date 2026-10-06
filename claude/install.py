@@ -344,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     managed_sources[dest / "relay" / "relay.py"] = (root / "relay" / "relay.py").read_bytes()
     managed_sources[dest / "bin" / "pr-status"] = (root / "bin" / "pr-status").read_bytes()
     managed_sources[dest / "bin" / "rollover-open.py"] = (root / "bin" / "rollover-open.py").read_bytes()
+    managed_sources[dest / "bin" / "session-focus.py"] = (root / "bin" / "session-focus.py").read_bytes()
     for name in JEV_SCRIPTS:
         managed_sources[dest / "bin" / name] = (root / "bin" / name).read_bytes()
 

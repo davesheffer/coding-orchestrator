@@ -1,8 +1,8 @@
 {
   "name": "handoff-bridge",
   "displayName": "Coding Orchestrator Handoff Bridge",
-  "description": "Open saved Claude or Codex handoffs in fresh VS Code agent tabs.",
-  "version": "0.5.0",
+  "description": "Open saved Claude or Codex handoffs in fresh VS Code agent tabs, and focus running Claude sessions in the window that owns them.",
+  "version": "0.6.0",
   "publisher": "coding-orchestrator",
   "repository": {"type": "git", "url": "https://github.com/davesheffer/coding-orchestrator"},
   "engines": {"vscode": "^1.95.0"},

@@ -107,6 +107,21 @@ function readRequest(root, id) {
   catch { return null; }
 }
 
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Focus reveals a Claude session already open in this window. The Claude command resumes
+// the session in a new tab when it is not open here, so a focus request must name this
+// window's extension host; an untargeted one never falls through to the last active window.
+async function focusSession(request) {
+  if (!targetsThisWindow(request)) throw new Error('focus requests must target a window');
+  if (typeof request.session !== 'string' || !SESSION_ID.test(request.session) ||
+      !Number.isFinite(request.created_at) ||
+      Math.abs(Date.now() / 1000 - request.created_at) > 300) {
+    throw new Error('invalid or expired focus request');
+  }
+  await vscode.commands.executeCommand('claude-vscode.primaryEditor.open', request.session);
+}
+
 async function handleUri(uri) {
   if (uri.path !== '/open') return;
   const id = new URLSearchParams(uri.query).get('id');
@@ -153,6 +168,11 @@ async function openRequest(root, id, viaUri) {
     return;
   }
   try {
+    if (request?.action === 'focus') {
+      await focusSession(request);
+      writeAck(root, id, { status: 'focused', session: request.session });
+      return;
+    }
     const isCodex = request.client === 'codex';
     const folder = isCodex ? handoffsFolder(root) : null;
     const resolvedHandoff = isCodex && typeof request.handoff === 'string'

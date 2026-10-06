@@ -331,6 +331,65 @@ Module._load = originalLoad;
                      [['claude-vscode.primaryEditor.open', 'relay:via continue']]);
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${viaId}.json`))).status, 'opened');
     assert.equal(fs.existsSync(path.join(root, 'launches', `${viaId}.json`)), false);
+
+    // The scan focuses a Claude session open in this window.
+    const session = '366f2731-1b7b-4099-9607-d8e06526a63e';
+    const focusId = '1a'.repeat(16);
+    fs.writeFileSync(path.join(root, 'launches', `${focusId}.json`), JSON.stringify({
+      action: 'focus', session, hosts: [otherPid, process.pid], created_at: Date.now() / 1000,
+    }));
+    calls.length = 0;
+    await bridge.scanPending();
+    assert.deepEqual(calls, [['claude-vscode.primaryEditor.open', session]]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${focusId}.json`))),
+                     { status: 'focused', session });
+    assert.equal(fs.existsSync(path.join(root, 'launches', `${focusId}.json`)), false);
+
+    // A focus request without a target window is never run, not even by the URL's window.
+    for (const [index, hosts] of [[], undefined].entries()) {
+      const noHostId = String(index + 2).repeat(16) + 'f'.repeat(16);
+      fs.writeFileSync(path.join(root, 'launches', `${noHostId}.json`), JSON.stringify({
+        action: 'focus', session, hosts, created_at: Date.now() / 1000,
+      }));
+      calls.length = 0;
+      await bridge.handleUri({ path: '/open', query: `id=${noHostId}` });
+      assert.equal(calls.length, 0);
+      const noHostAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${noHostId}.json`)));
+      assert.equal(noHostAck.status, 'error');
+      assert.match(noHostAck.error, /focus requests must target a window/);
+    }
+
+    // The URL's window leaves a focus request for another window alone.
+    const otherFocusId = '3c'.repeat(16);
+    const otherFocus = path.join(root, 'launches', `${otherFocusId}.json`);
+    fs.writeFileSync(otherFocus, JSON.stringify({
+      action: 'focus', session, hosts: [otherPid], created_at: Date.now() / 1000,
+    }));
+    calls.length = 0;
+    await bridge.handleUri({ path: '/open', query: `id=${otherFocusId}` });
+    await bridge.scanPending();
+    assert.equal(calls.length, 0);
+    assert.equal(fs.existsSync(otherFocus), true);
+    assert.equal(fs.existsSync(path.join(root, 'acks', `${otherFocusId}.json`)), false);
+    fs.unlinkSync(otherFocus);
+
+    // Invalid session IDs and expired focus requests are refused.
+    for (const [badId, bad] of [
+      ['4d'.repeat(16), { session: 'not-a-session', created_at: Date.now() / 1000 }],
+      ['5e'.repeat(16), { session: `${session}x`, created_at: Date.now() / 1000 }],
+      ['6f'.repeat(16), { session, created_at: Date.now() / 1000 - 301 }],
+    ]) {
+      fs.writeFileSync(path.join(root, 'launches', `${badId}.json`), JSON.stringify({
+        action: 'focus', hosts: [process.pid], ...bad,
+      }));
+      calls.length = 0;
+      await bridge.handleUri({ path: '/open', query: `id=${badId}` });
+      assert.equal(calls.length, 0);
+      const badAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${badId}.json`)));
+      assert.equal(badAck.status, 'error');
+      assert.match(badAck.error, /invalid or expired focus request/);
+      assert.equal(fs.existsSync(path.join(root, 'launches', `${badId}.json`)), false);
+    }
     console.log('handoff bridge tests passed');
   } finally {
     if (path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep) &&
