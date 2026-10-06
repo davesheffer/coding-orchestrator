@@ -1,4 +1,4 @@
-import type { Confidence, HunchCall, HunchConstraint, HunchLevel, JevEntry, JevStatus, Zone } from '../types'
+import type { Confidence, HunchCall, HunchConstraint, HunchLevel, JevEntry, JevStatus, SessionRow, Zone } from '../types'
 
 // Pure helpers: no `$`, so the tests exercise them directly.
 
@@ -455,4 +455,61 @@ function firstLine(output: string): string {
   }
 
   return ''
+}
+
+// Sessions: the registry Claude Code keeps at `~/.claude/sessions/<pid>.json`, one file per live process.
+
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** The last path segment of a Windows or POSIX path. */
+export function repoName(cwd: string): string {
+  return cwd.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) ?? ''
+}
+
+/** One registry file as a row; undefined for anything that is not a session entry. */
+export function sessionRow(raw: string): SessionRow | undefined {
+  let entry: unknown
+  try {
+    entry = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  if (typeof entry !== 'object' || entry === null) return undefined
+
+  const { pid, sessionId, cwd, name, entrypoint, status, updatedAt, startedAt } = entry as Record<string, unknown>
+  if (typeof pid !== 'number' || typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) return undefined
+
+  const folder = typeof cwd === 'string' ? cwd : ''
+  const id = sessionId.toLowerCase()
+
+  return {
+    pid,
+    sessionId: id,
+    name: typeof name === 'string' && name.trim() !== '' ? oneLine(name) : repoName(folder) || id.slice(0, 8),
+    cwd: folder,
+    entrypoint: typeof entrypoint === 'string' ? entrypoint : 'unknown',
+    status: status === 'idle' || status === 'busy' ? status : 'unknown',
+    updatedAt: typeof updatedAt === 'number' ? updatedAt : typeof startedAt === 'number' ? startedAt : 0,
+  }
+}
+
+/** Newest first, one row per session: a crashed process can leave an older file for the same id. */
+export function sessionRows(rows: readonly SessionRow[]): SessionRow[] {
+  const newest = new Map<string, SessionRow>()
+  for (const row of rows) {
+    const seen = newest.get(row.sessionId)
+    if (seen === undefined || row.updatedAt > seen.updatedAt) newest.set(row.sessionId, row)
+  }
+
+  return [...newest.values()].sort((a, b) => b.updatedAt - a.updatedAt || a.name.localeCompare(b.name))
+}
+
+/** `45s`, `12m`, `3h`, `2d`: how long ago, coarsely. */
+export function ago(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000))
+  if (s < 90) return `${s}s`
+  if (s < 90 * 60) return `${Math.round(s / 60)}m`
+  if (s < 36 * 3600) return `${Math.round(s / 3600)}h`
+
+  return `${Math.round(s / 86400)}d`
 }

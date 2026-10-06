@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
-import type { AgentRun, Gauge, HunchCall, HunchConstraint, HunchLevel, HunchLog, JevStatus, ReportCard, Zone } from '../types'
+import type { AgentRun, Gauge, HunchCall, HunchConstraint, HunchLevel, HunchLog, JevStatus, ReportCard, SessionRow, Zone } from '../types'
 import {
+  ago,
   bar,
   clockTime,
   hunchCli,
@@ -17,14 +18,18 @@ import {
   parseCard,
   parseLines,
   reapStale,
+  repoName,
   roleOf,
   seconds,
+  sessionRow,
+  sessionRows,
   shortModel,
   wasInterrupted,
   zoneOf,
 } from './parse'
 
 const PANE = 'mission-control'
+const SESSIONS_PANE = 'mission-control-sessions'
 const POLL_MS = 5000
 
 const agents = atom({ plugin: 'mission-control', key: 'agents' } as const, [])
@@ -34,6 +39,8 @@ const jev = atom({ plugin: 'mission-control', key: 'jev' } as const, null)
 const hunch = atom({ plugin: 'mission-control', key: 'hunch' } as const, { calls: [], total: 0, seenConstraints: [] })
 const isBandHidden = atom({ plugin: 'mission-control', key: 'isBandHidden' } as const, false)
 const tick = atom({ plugin: 'mission-control', key: 'tick' } as const, 0)
+const sessions = atom({ plugin: 'mission-control', key: 'sessions' } as const, [])
+const sessionsCheckedAt = atom({ plugin: 'mission-control', key: 'sessionsCheckedAt' } as const, 0)
 
 const HUNCH_KEEP = 40
 
@@ -58,6 +65,7 @@ const CONFIDENCE_COLOR: Record<ReportCard['confidence'], string> = {
 }
 
 // A hot reload evaluates this module afresh, so these start over; everything drawn lives in $.state.
+let homeDir = ''
 let relayDir = ''
 let soft = 150_000
 let hard = 250_000
@@ -67,7 +75,8 @@ let alertCursor = -1
 
 async function loadRelay($: EngineInterface) {
   const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
-  relayDir = `${home.replace(/\\/g, '/')}/.claude/relay`
+  homeDir = home.replace(/\\/g, '/')
+  relayDir = `${homeDir}/.claude/relay`
 
   try {
     const config = JSON.parse(await $.fs.read(`${relayDir}/config.json`)) as {
@@ -295,6 +304,46 @@ function openPane($: EngineInterface) {
 return $.ui.open({ id: PANE, title: 'Mission Control' })
 }
 
+/** Rereads the session registry; writes the atom only when a row changed, so idle polls draw nothing. */
+async function pollSessions($: EngineInterface) {
+  if (homeDir === '') await loadRelay($)
+  const dir = `${homeDir}/.claude/sessions`
+  const entries = await $.fs.list(dir).catch(() => [])
+  const files = entries.filter(entry => entry.kind === 'file' && entry.name.endsWith('.json'))
+  const raws = await Promise.all(files.map(entry => $.fs.read(`${dir}/${entry.name}`).catch(() => '')))
+  const rows = sessionRows(raws.flatMap(raw => sessionRow(typeof raw === 'string' ? raw : '') ?? []))
+
+  if (JSON.stringify(rows) !== JSON.stringify(await read($, sessions))) await update($, sessions, () => rows)
+
+  // Ages are drawn from the clock: bump this at most every 30 s so the pane redraws without a row change.
+  const checkedAt = Math.floor((await $.clock.now()) / 30_000) * 30_000
+  if (checkedAt !== (await read($, sessionsCheckedAt))) await update($, sessionsCheckedAt, () => checkedAt)
+}
+
+/** Asks the handoff bridge in the session's own VS Code window to bring its tab forward. */
+async function focusSession($: EngineInterface, row: SessionRow) {
+  $.ui.toast(`Switching to ${row.name}…`, { timeoutMs: 3000 })
+  let message: string
+  try {
+    const helper = `${homeDir}/.claude/bin/session-focus.py`
+    const { exitCode, stdout, stderr } = await $.process.run(['python', helper, '--session', row.sessionId], {
+      timeoutMs: 20_000,
+    })
+    const last = (text: string) => text.trim().split(/\r?\n/).at(-1) ?? ''
+    const line = last(stdout) || last(stderr) || `session-focus exited ${exitCode}`
+    message = exitCode === 0 ? `🗂 ${line}` : `✖ ${line}`
+  } catch (error) {
+    message = `✖ session-focus could not run: ${error instanceof Error ? error.message : String(error)}`
+  }
+  $.ui.toast(message, { timeoutMs: 8000 })
+}
+
+async function openSessions($: EngineInterface) {
+  await pollSessions($)
+
+  return $.ui.open({ id: SESSIONS_PANE, title: 'Sessions' })
+}
+
 async function setBandHidden($: EngineInterface, isHidden: boolean) {
   await update($, isBandHidden, () => isHidden)
   await refreshStatus($)
@@ -307,14 +356,20 @@ export const register: Register = on => {
       name: 'orch',
       description: 'Mission Control: open the orchestrator pane (`/orch band` toggles the band)',
     })
+    await $.command.register({
+      name: 'sessions',
+      description: 'Mission Control: list open Claude Code sessions and switch VS Code to one',
+    })
 
     const usage = await $.session.usage()
     await measure($, usage.context.tokens, usage.context.window, usage.context.percent, usage.cost?.usd)
     await pollJev($)
+    await pollSessions($)
 
     $.clock.every(POLL_MS, () => {
       void (async () => {
         await pollJev($)
+        await pollSessions($)
         const list = await read($, agents)
         if (list.some(agent => agent.status === 'running')) {
           const now = await $.clock.now()
@@ -336,6 +391,13 @@ export const register: Register = on => {
     await openPane($)
 
     return { text: 'Mission Control opened.' }
+  })
+
+  on('command.run', { command: 'sessions' }, async ($) => {
+    await openSessions($)
+    const count = (await read($, sessions)).length
+
+    return { text: `Sessions opened: ${count} registered.` }
   })
 
   on('session.measure', async ($, e, next) => {
@@ -467,6 +529,7 @@ export const register: Register = on => {
     const last = (await read($, reports)).at(-1)
     const hunchNow = taskCalls(await read($, hunch))
     const hunchLevel = loudest(hunchNow)
+    const sessionCount = (await read($, sessions)).length
     const isWide = e.props.bodyColumns >= 100
 
     const zone: Zone = g?.zone ?? 'unknown'
@@ -500,6 +563,7 @@ export const register: Register = on => {
           </Text>
         )}
         <Button key="open" label="orch" onPress={() => openPane($)} />
+        <Button key="sessions" label={`🗂 ${sessionCount}`} onPress={() => openSessions($)} />
         <Button key="hide" label="hide" onPress={() => setBandHidden($, true)} />
       </Box>
     )
@@ -630,6 +694,52 @@ export const register: Register = on => {
               await update($, hunch, log => ({ ...log, calls: reapStale(log.calls, now).filter(call => call.status === 'running') }))
             }}
           />
+        </Box>
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: SESSIONS_PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const rows = await read($, sessions)
+    await read($, sessionsCheckedAt) // read so the pane redraws as ages advance
+    const self = await $.session.id()
+    const now = await $.clock.now()
+    const width = Math.max(20, e.props.bodyColumns)
+    const nameWidth = Math.min(22, Math.max(8, ...rows.map(row => row.name.length)))
+
+    return (
+      <Box flexDirection="column" width={width}>
+        <Text bold>Open sessions ({rows.length})</Text>
+        {rows.length === 0 && <Text dimColor>No Claude Code sessions registered.</Text>}
+        {rows.map(row => {
+          const isSelf = row.sessionId === self
+          const isEditor = row.entrypoint === 'claude-vscode'
+
+          return (
+            <Box key={`row-${row.sessionId}`} flexDirection="row" columnGap={1}>
+              <Text wrap="truncate" color={isSelf ? 'cyan' : undefined}>
+                <Text color={row.status === 'busy' ? 'yellow' : row.status === 'idle' ? 'green' : 'gray'}>
+                  {row.status === 'busy' ? '◐' : '●'}
+                </Text>{' '}
+                {row.name.slice(0, nameWidth).padEnd(nameWidth)} {repoName(row.cwd).slice(0, 18).padEnd(18)}{' '}
+                {row.status.padEnd(4)} {ago(now - row.updatedAt).padStart(4)}
+              </Text>
+              {isSelf ? (
+                <Text dimColor>this session</Text>
+              ) : isEditor ? (
+                <Button key={`focus-${row.sessionId}`} label="switch" onPress={() => focusSession($, row)} />
+              ) : (
+                <Text dimColor>terminal</Text>
+              )}
+            </Box>
+          )
+        })}
+        <Text dimColor wrap="truncate">
+          switch asks the handoff bridge in the session's VS Code window to show its tab
+        </Text>
+        <Box flexDirection="row" columnGap={1}>
+          <Button key="refresh" label="refresh" onPress={() => pollSessions($)} />
         </Box>
       </Box>
     )

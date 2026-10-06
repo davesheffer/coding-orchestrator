@@ -98,6 +98,19 @@ export type HunchLog = {
   seenConstraints: string[]
 }
 
+/** One open Claude Code session, from its `~/.claude/sessions/<pid>.json` registry file. */
+export type SessionRow = {
+  pid: number
+  sessionId: string
+  name: string
+  cwd: string
+  /** `claude-vscode` (a VS Code tab the bridge can switch to) or `cli` (a terminal). */
+  entrypoint: string
+  /** `idle` or `busy`, as the session last wrote it; anything else is `unknown`. */
+  status: 'idle' | 'busy' | 'unknown'
+  updatedAt: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'mission-control': {
@@ -108,6 +121,9 @@ declare module 'claude-code' {
       hunch: HunchLog
       isBandHidden: boolean
       tick: number
+      sessions: SessionRow[]
+      /** When the session registry was last polled, rounded down to 30 s so the pane's ages redraw. */
+      sessionsCheckedAt: number
     }
   }
 }
