@@ -319,6 +319,36 @@ class CodexJevTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertTrue(all(isinstance(d, float) for d in calls), calls)
 
+    def run_main(self, payload, raw=None):
+        import io
+        from contextlib import redirect_stdout
+        data = (raw if raw is not None else json.dumps(payload)).encode("utf-8")
+        stdin = type("S", (), {"buffer": io.BytesIO(data)})()
+        out = io.StringIO()
+        with patch.object(module.sys, "stdin", stdin), redirect_stdout(out):
+            code = module.main()
+        return code, out.getvalue()
+
+    def test_crash_fails_closed_for_push_only(self):
+        def bash(command):
+            return {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
+
+        with patch.object(module, "guard_module", side_effect=RuntimeError("guard missing")):
+            code, out = self.run_main(bash("git push origin main"))
+            self.assertEqual(code, 0)
+            decision = json.loads(out)["hookSpecificOutput"]
+            self.assertEqual(decision["permissionDecision"], "deny")
+            self.assertIn("fail-closed", decision["permissionDecisionReason"])
+            self.assertEqual(self.run_main(bash("ls -la")), (0, ""))
+            # unparsable payload: match the raw text
+            code, out = self.run_main(None, raw="{not json git push")
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertEqual(self.run_main(None, raw="{not json"), (0, ""))
+            # non-Bash tools are not gated
+            self.assertEqual(self.run_main({"hook_event_name": "PreToolUse", "tool_name": "Agent",
+                                            "tool_input": {"command": "git push"}}), (0, ""))
+
     def test_handoff_grade_is_optional_and_blocks_weak_handoff(self):
         cfg = module.settings() | {"enabled": True}
         with patch.object(module.client, "ask", return_value={"actionable": {"score": 1}}), \

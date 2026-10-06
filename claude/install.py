@@ -153,9 +153,11 @@ def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
 
 
 # (event, matcher, script, subcommand) for every opt-in Jev hook this installer owns.
+# Ownership is matched by command (is_jev_hook), never by matcher, so an upgrade from an
+# older matcher (the gate's was "Bash" before PowerShell was gated) replaces that group.
 JEV_HOOKS = (
     ("PreToolUse", "Agent|Task", "jev-route.py", None),
-    ("PreToolUse", "Bash", "jev-guard.py", "gate"),
+    ("PreToolUse", "Bash|PowerShell", "jev-guard.py", "gate"),
     ("PreToolUse", "SubagentHandback", "jev-guard.py", "handback"),
     ("PostToolUse", "Agent|Task|SubagentHandback", "jev-guard.py", "agent-done"),
 )

@@ -453,6 +453,38 @@ class RelayTests(unittest.TestCase):
         if state.is_dir():
             self.assertEqual(list(state.glob("*.json")), [])
 
+    def test_session_id_path_traversal_is_rejected(self):
+        state = self.home / "relay/state"
+        outside = state.parent / "x.json"
+        outside.parent.mkdir(parents=True)
+        outside.write_text('{"secret": 1}')
+        with patch.object(relay_module, "STATE", state):
+            for bad in ("../x", "..\\x", "a/b", "", None, 5, "a" * 129):
+                with self.subTest(session_id=bad):
+                    self.assertEqual(relay_module.load_state(bad), {})
+                    relay_module.save_state(bad, {"v": 1})
+            self.assertEqual(outside.read_text(), '{"secret": 1}')
+            self.assertEqual(sorted(p.name for p in state.parent.rglob("*") if p.is_file()), ["x.json"])
+            relay_module.save_state("ok-id_1", {"v": 1})
+            self.assertEqual(relay_module.load_state("ok-id_1"), {"v": 1})
+
+    def test_git_and_clipboard_use_resolved_executables(self):
+        with patch.object(relay_module, "resolve_executable", return_value=None):
+            self.assertEqual(relay_module.git(self.temp.name, "status"), "")
+            self.assertEqual(relay_module.clipboard_commands(), [])
+        with patch.object(relay_module, "resolve_executable", return_value="/abs/git"), \
+                patch.object(relay_module.subprocess, "run") as run:
+            run.return_value.stdout = "out\n"
+            self.assertEqual(relay_module.git("c", "status"), "out")
+        self.assertEqual(run.call_args.args[0][:3], ["/abs/git", "-C", "c"])
+        with patch.object(relay_module, "resolve_executable", side_effect=lambda n: f"/abs/{n}"), \
+                patch.object(relay_module.sys, "platform", "win32"):
+            self.assertEqual(relay_module.clipboard_commands(), [["/abs/clip"]])
+
+    def test_resolve_executable_ignores_relative_path_entries(self):
+        with patch.dict(os.environ, {"PATH": os.pathsep.join(["", ".", "rel"])}):
+            self.assertIsNone(relay_module.resolve_executable("git"))
+
 
 if __name__ == "__main__":
     unittest.main()

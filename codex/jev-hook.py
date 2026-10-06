@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -248,10 +249,38 @@ def grade_handoff(body, cfg, classify_fn=None):
     return {"score": score, "weak": score < cfg["handoff_min_score"]}
 
 
+OUTWARD_COMMAND_RE = re.compile(r"\bgit\b[^;&|\n]*\bpush\b|\bheroku\b|\bdeploy\b", re.IGNORECASE)
+CRASH_DENY_REASON = ("[jev risk gate] The risk classifier crashed, so this push/deploy is blocked "
+                     "(fail-closed). Do not retry or work around it: ask the user to run it manually "
+                     "or retry once Jev answers normally.")
+
+
+def fail_closed(raw, payload):
+    """After a crash, deny outward commands (push/deploy) instead of silently allowing them.
+    Defined locally: the guard module may be what failed."""
+    try:
+        if isinstance(payload, dict):
+            if payload.get("hook_event_name") != "PreToolUse" or payload.get("tool_name") != "Bash":
+                return
+            tool_input = payload.get("tool_input")
+            command = tool_input.get("command") if isinstance(tool_input, dict) else None
+            text = command if isinstance(command, str) else raw
+        else:
+            text = raw
+        if OUTWARD_COMMAND_RE.search(text or ""):
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": CRASH_DENY_REASON}}))
+    except Exception:
+        pass
+
+
 def main():
+    raw, payload = "", None
     try:
         # Hook payloads are UTF-8 whatever the locale (e.g. cp1255 on Windows).
-        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
+        raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+        payload = json.loads(raw or "{}")
         cfg = settings()
         if len(sys.argv) > 1 and sys.argv[1] == "grade":
             result = grade_handoff(str(payload.get("handoff") or ""), cfg)
@@ -271,7 +300,7 @@ def main():
         if result is not None:
             print(json.dumps(result))
     except Exception:
-        pass
+        fail_closed(raw, payload)
     return 0
 
 

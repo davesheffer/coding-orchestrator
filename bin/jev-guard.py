@@ -88,7 +88,7 @@ REPLACE_RETRY_SECONDS = 0.05
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
     DEFAULTS, ROOT, ask, coerce_confidence, config_number, elapsed_ms, feature_enabled, load_config,
-    noul, timestamp, write_log)
+    noul, resolve_executable, timestamp, write_log)
 
 def _char_limit(cfg, key):
     """cfg[key] as a non-negative whole number of characters; junk falls back to its default."""
@@ -259,16 +259,24 @@ _TERMINATOR_LINE_RE = re.compile(r"(?m)^([ \t]*)([\w.-]+)[ \t]*\r?$")
 # component of the file's path, directories included, so `secrets/db.yaml` matches too);
 # only the file name and a `[redacted]` marker go out.
 REDACT_FILE_PATTERNS = (".env*", "*.env", "*.pem", "*.key", "*secret*", "id_rsa*", "*.p12", "*.pfx",
-                         "credentials*", "*.jks", "*.keystore")
+                         "credentials*", "*.jks", "*.keystore", ".netrc", "_netrc", ".npmrc",
+                         ".pypirc", ".git-credentials", ".pgpass", ".htpasswd", "*.ppk",
+                         "*.tfvars", "*.kdbx", "id_dsa*", "id_ecdsa*", "id_ed25519*")
 # Token shapes scrubbed from diff and report text before it is sent. A key body may not
 # contain another marker or cross a hunk/file boundary, so each BEGIN scans only up to the
-# next one (linear time).
+# next one (linear time). npm tokens, JWTs (header and payload both start `eyJ`, i.e.
+# base64 `{"`) and `scheme://user:password@` URL credentials (the user may be empty, or
+# be a 20+ char token with no password: `https://<token>@host`) are also scrubbed; every
+# alternative after the key block has a fixed literal start and bounded or [\w-]-only
+# repetition that can't run past the next start, so a failed attempt never rescans.
 SECRET_RE = re.compile(
     r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
     r"(?:(?!-----(?:BEGIN|END) |\ndiff --git |\n@@).)*"
     r"-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
     r"|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}"
-    r"|xox[abpr]-[\w-]{10,}", re.DOTALL)
+    r"|xox[abpr]-[\w-]{10,}|\bnpm_[A-Za-z0-9]{36}\b"
+    r"|(?<![\w-])eyJ[\w-]{10,}\.eyJ[\w-]{10,}\.[\w-]{10,}"
+    r"|://(?:[^\s:/@]{0,256}:[^\s@/]{1,256}|[A-Za-z0-9_-]{20,256})@", re.DOTALL)
 # Private key markers left unpaired after SECRET_RE, e.g. a hunk that edits only one end.
 KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
 KEY_END_RE = re.compile(r"-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
@@ -344,6 +352,56 @@ FAIL_CLOSED_REASON = (
     "[jev risk gate] The risk classifier {problem}, so this push/deploy is blocked "
     "(fail-closed). Do not retry or work around it: ask the user to run it manually or "
     "retry once Jev answers normally.")
+# _push_signals: a best-effort lexical backstop counting the pushes in a command, so one
+# _scan_targets can't parse (quoted or escaped words, `bash -c`/`eval`/`| sh` wrappers, a
+# script's argv list, `git -c alias.*` and other aliases, a subcommand built at run time)
+# still costs a denial. It can't see through string concatenation, `iex`, `cmd /c` caret
+# escapes, globbing or scripts; the gate stays advisory (deny-once) by design.
+# _PUSH_LEX_RE reads words in one pass: separators split them only outside quotes, a
+# quoted span (to the end if unbalanced) stays inside its word without its quotes, and
+# `\`-newline is dropped. A quoted span's content is also read as command text of its
+# own (to _PUSH_QUOTE_DEPTH levels), so `bash -c "git push"` still counts.
+_PUSH_LEX_RE = re.compile(
+    r"(?P<sep>[\s;&|()\[\],<>]+)|'(?P<sq>[^']*)'?|\"(?P<dq>(?:[^\"\\]|\\.)*)\"?"
+    r"|\\(?P<esc>.?)|(?P<run>[^\s;&|()\[\],<>\"'\\]+)", re.DOTALL)
+# What a backslash keeps escaped inside double quotes (its content read as a command).
+_DQ_UNESCAPE_RE = re.compile(r"\\([\\\"$`])")
+# A message's quoted value is prose, not command text, so it isn't re-read: after one of
+# these options in a git command that takes a message, until the command ends (`;`, `&`,
+# `|`, a parenthesis or newline), unless it is double-quoted with a substitution in it.
+_MESSAGE_CMDS = frozenset(("commit", "tag", "merge", "stash", "notes"))
+_MESSAGE_OPT_RE = re.compile(r"-a?m|--message=?|-f|--file=?")
+_COMMAND_END_RE = re.compile(r"[;&|()\n]")
+_DQ_SUBST_RE = re.compile(r"\$\(|`")
+_PUSH_QUOTE_DEPTH = 2
+# A brace group's `{`/`}` on its own is not a word (`{ git push; }`).
+_BRACES_RE = re.compile(r"[{}]+")
+# A word with one of these is dynamic (`$p`, `pus$(echo h)`, a backtick, PowerShell
+# `@('push')`, `%P%`, brace expansion `pus{h..h}`); it is read with _PUSH_CLEAN_RE's
+# characters removed (`$GIT`, `${GIT}` and `%GIT%` read `git`).
+_PUSH_DYNAMIC_RE = re.compile(r"[$`@%{}]")
+_PUSH_CLEAN_RE = re.compile(r"[$`\\{}%\"']")
+_PUSH_GIT_WORD_RE = re.compile(r"git(?:\.exe)?")
+_GIT_PUSH_WORD_RE = re.compile(r"git-push(?:\.exe)?")
+_PATH_SEP_RE = re.compile(r"[/\\]")
+# Config that environment variables pass to git (an alias among it may push).
+_GIT_CONFIG_ENV_RE = re.compile(r"git_config_(?:parameters=|count=|key_)")
+# Global git options (lowercased, so `-c` is also `-C`) whose value is the next word.
+_GIT_VALUE_OPTS = frozenset(("-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+                             "--config-env", "--super-prefix"))
+# How many words after a `git` word are searched for its subcommand; still inside its
+# options past that counts as a push (unknown subcommand).
+_GIT_SUBCOMMAND_WINDOW = 64
+UNPARSED_PUSH_REASON = (
+    "[jev risk gate] This command looks like it pushes through quoting, an alias or a "
+    "wrapper (bash -c, eval, git -c alias.*), which the gate cannot review. Rerun it as a "
+    "plain `git push …` so the diff is checked. If it does not push, rerun the identical "
+    "command once to proceed.")
+UNJUDGED_PUSH_REASON = (
+    "[jev risk gate] Could not work out what this push sends (no upstream or origin default "
+    "branch, or git timed out), so it was not reviewed. Set an upstream or review the "
+    "commits, then rerun; if review is not warranted, rerun the identical command once to "
+    "proceed.")
 
 
 def fail_closed_output(problem="is unavailable"):
@@ -1380,8 +1438,12 @@ def _scrub(text):
             return match.group(0)  # a path, long identifier or separator, not a key
         return match.group(1) + "[redacted]"
 
+    def redact_secret(match):
+        # URL credentials keep their scheme and host readable: `https://[redacted]@host`.
+        return "://[redacted]@" if match.group(0).startswith("://") else "[redacted]"
+
     hunks = []
-    for hunk in HUNK_SPLIT_RE.split(SECRET_RE.sub("[redacted]", text)):
+    for hunk in HUNK_SPLIT_RE.split(SECRET_RE.sub(redact_secret, text)):
         lines, found = _scrub_key_markers(hunk.splitlines(keepends=True))
         runs = False
         hunk = BASE64_RUN_RE.sub(redact_run, "".join(lines))
@@ -1407,8 +1469,13 @@ def _run_git(args, cwd, deadline=None, git_opts=None):
         if remaining <= 0:
             return None
         timeout = max(0.1, min(timeout, remaining))
+    # Resolved from PATH on every call: a bare "git" on Windows would run a `git.exe`
+    # planted in the repository (the cwd). Not found counts as a failed git call.
+    git = resolve_executable("git")
+    if git is None:
+        return None
     try:
-        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=timeout)
+        result = subprocess.run([git, *args], cwd=cwd, capture_output=True, timeout=timeout)
     except Exception:
         return None
     if result.returncode != 0:
@@ -1950,6 +2017,134 @@ def _scan_targets(raw_command, base_cwd, max_targets=None):
     return targets
 
 
+def _push_words(text):
+    """The words of `text` (see _PUSH_LEX_RE) and the content of its quoted spans, except
+    a message (`git commit -m "explain git push"`) with no substitution in it."""
+    words, spans, parts = [], [], []
+    message_cmd = False  # in a `git commit`/`tag`/... command, up to its end
+    for m in _PUSH_LEX_RE.finditer(text):
+        kind = m.lastgroup
+        if kind == "sep":
+            if parts:
+                word = "".join(parts)
+                parts.clear()
+                if not _BRACES_RE.fullmatch(word):
+                    words.append(word)
+                    message_cmd = message_cmd or word.lower() in _MESSAGE_CMDS
+            if message_cmd and _COMMAND_END_RE.search(m.group(0)):
+                message_cmd = False
+        elif kind == "esc":
+            if m.group("esc") != "\n":  # `\`-newline joins lines
+                parts.append(m.group(0))
+        else:
+            content = m.group(kind)
+            # `-m "msg"`, `-m"msg"`, `--message="msg"`, `-F "file"`: not a command,
+            # unless double quotes hold a substitution that runs one.
+            message = message_cmd and (
+                _MESSAGE_OPT_RE.fullmatch(parts[0].lower()) if len(parts) == 1
+                else not parts and words and _MESSAGE_OPT_RE.fullmatch(words[-1].lower())
+            ) and (kind == "sq" or not _DQ_SUBST_RE.search(content))
+            parts.append(content)
+            if not content or kind == "run" or message:
+                continue
+            spans.append(content if kind == "sq" else _DQ_UNESCAPE_RE.sub(r"\1", content))
+    if parts:
+        word = "".join(parts)
+        if not _BRACES_RE.fullmatch(word):
+            words.append(word)
+    return words, spans
+
+
+def _git_walk(clean, dyn, i, dyn_sub=True):
+    """(push hits, last word index consumed) for the `git` word at index i: its first
+    subcommand after global options is push or send-pack, dynamic (if `dyn_sub`),
+    `subtree push`, or `config [set|add] alias.<x> <value>` with a value holding push or
+    send-pack or starting with `!`."""
+    n = len(clean)
+    end = min(n, i + 1 + _GIT_SUBCOMMAND_WINDOW)
+    skip, sub = False, None
+    for j in range(i + 1, end):
+        word = clean[j]
+        if skip:
+            skip = False
+        elif word.startswith("-"):  # `--git-dir=$D` too: never the subcommand
+            skip = (word in _GIT_VALUE_OPTS if sub is None
+                    else sub == "subtree" and word in ("-p", "--prefix"))
+        elif sub == "config":
+            if word.startswith("alias.") and j + 1 < n:
+                value = clean[j + 1]
+                return int("push" in value or "send-pack" in value or value.startswith("!")
+                           or dyn[j + 1]), j + 1
+            if word not in ("set", "add"):
+                return 0, j
+        elif dyn[j] and dyn_sub or word in ("push", "send-pack"):
+            return 1, j  # a dynamic word may be push at run time
+        elif not word:
+            continue  # e.g. `''`
+        elif sub == "subtree":
+            return 0, j
+        elif word in ("subtree", "config"):
+            sub = word
+        else:
+            return 0, j - 1  # the first subcommand isn't push (`git stash push`)
+    return int(end < n), end - 1  # options past the window: subcommand unknown
+
+
+def _push_signals(command, depth=0):
+    """How many pushes `command` may hold, parsed or not (see _PUSH_LEX_RE). Coarse on
+    purpose: an extra one only costs one denial an identical retry overrides. Every
+    word is looked at a bounded number of times (linear time)."""
+    tokens, spans = _push_words(command)
+    dyn = [bool(_PUSH_DYNAMIC_RE.search(t)) for t in tokens]
+    clean = [_PUSH_CLEAN_RE.sub("", t).lower() for t in tokens]
+    has_alias = "alias" in command.lower()
+    hits, env_hit, done = 0, False, -1
+    for i, token in enumerate(tokens):
+        word = clean[i]
+        # `git -c alias.p=push p`, a shell alias (`alias.p=!git push`) or one set at
+        # run time (`alias.p=$cmd`).
+        if word.startswith("alias."):
+            hits += ("push" in word or "send-pack" in word
+                     or word.partition("=")[2].startswith("!")
+                     or bool(_PUSH_DYNAMIC_RE.search(token.partition("=")[2])))
+            continue
+        if has_alias and not env_hit and _GIT_CONFIG_ENV_RE.match(word):
+            hits, env_hit = hits + 1, True
+            continue
+        if i <= done:
+            continue  # an option or the subcommand of the git word before
+        # The segment keeps `\` as a separator (`C:\Git\cmd\git.exe`).
+        seg = _PATH_SEP_RE.split(token.replace("\\", "/").lower())[-1]
+        seg = _PUSH_CLEAN_RE.sub("", seg)
+        if _GIT_PUSH_WORD_RE.fullmatch(seg):
+            hits += bool(_PATH_SEP_RE.search(token))  # not `man git-push`
+        elif (_PUSH_GIT_WORD_RE.fullmatch(seg) or _PUSH_GIT_WORD_RE.fullmatch(word)
+              or dyn[i] and word.endswith("git")):
+            # A dynamic path (`cp -r $SRC/git $DST`) may be an argument: a dynamic word
+            # after it isn't taken for a subcommand.
+            found, done = _git_walk(clean, dyn, i,
+                                    not (dyn[i] and _PATH_SEP_RE.search(token)))
+            hits += found
+        elif not dyn[i] or i + 1 == len(tokens):
+            continue
+        elif clean[i + 1] == "push":
+            hits, done = hits + 1, i + 1  # `g=git; $g push`
+        elif not word.startswith("-") and clean[i + 1].startswith("-"):
+            # A dynamic command word with options (`$g -C . push`, `"$GIT_BIN" -c k=v
+            # push`) is walked like git, but a dynamic word after it (`$EDITOR -n $f`)
+            # isn't taken for a subcommand.
+            found, done = _git_walk(clean, dyn, i, False)
+            hits += found
+    # Every quoted span's content at once, one per line (linear in their total length).
+    if spans and depth < _PUSH_QUOTE_DEPTH:
+        hits += _push_signals("\n".join(spans), depth + 1)
+    return hits
+
+
+def _looks_like_push(command):
+    return _push_signals(command) > 0
+
+
 def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR,
          deadline=None):
     """Return the PreToolUse hook output dict, or None to leave the command unchanged.
@@ -1969,7 +2164,8 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     entered = time.monotonic()
     if deadline is None:
         deadline = entered + GATE_BUDGET_SECONDS
-    if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+    # PowerShell runs git just as Bash does; its commands go through the same scanner.
+    if not isinstance(payload, dict) or payload.get("tool_name") not in ("Bash", "PowerShell"):
         return None
     if not feature_enabled(cfg, "risk_gate"):
         return None
@@ -1993,6 +2189,55 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
                 f"exceeds a scanner limit ({MAX_TARGETS} candidate targets, bounded "
                 "branching, or substitution depth). Split it into smaller commands."),
         }}
+
+    def deny_once(key, reason_code, reason):
+        """Deny the command once for a check that needs no classifier; the identical
+        retry (same `key`, cwd and raw command, among the session's last 20 denials) is
+        logged as an override and returns None so the normal flow continues. The cwd
+        is part of it so a denial in one repository doesn't pass the command in another."""
+        session_id = payload.get("session_id")
+        retry_hash = hashlib.sha256(
+            f"{key}\0{base_cwd}\0{raw_command}".encode("utf-8", "replace")).hexdigest()
+        entry = {"ts": timestamp(), "feature": "risk_gate", "op": "push", "reason": reason_code}
+        if retry_hash in (load_session_state(session_id, state_dir).get("denied") or []):
+            if log_fn:
+                log_fn({**entry, "decision": "override"})
+            return None
+
+        def add_denied(s):
+            s["denied"] = ((s.get("denied") or []) + [retry_hash])[-20:]
+
+        try:
+            update_state(session_state_path(session_id, state_dir), add_denied, deadline)
+        except Exception as exc:
+            # Still deny: without the saved hash, the identical retry is denied again,
+            # and the reason says so (its "rerun once" would not work).
+            entry["state_error"] = type(exc).__name__
+            reason += (" (This denial could not be recorded, so an identical retry will be "
+                       "checked again.)")
+        if log_fn:
+            log_fn({**entry, "decision": "deny"})
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }}
+
+    # A push the scanner didn't parse (quoted, aliased or wrapped, possibly next to one
+    # it did: `git push; bash -c "git push --force"`) can't be diffed, so it is denied
+    # once instead of passing unreviewed. Parsed pushes are counted both as distinct
+    # targets and as plain `git push` matches, so `git push && git push --tags` (one
+    # target, two pushes) isn't taken for a hidden one; the second count, a rescan, runs
+    # only when the first falls short.
+    signals = _push_signals(raw_command)
+    parsed = sum(t[0] == "push" for t in targets)
+    if signals > parsed:
+        parsed = max(parsed, sum(m.group(2) == "push"
+                                 for m in GIT_COMMAND_RE.finditer(_strip(raw_command)[0])))
+    if signals > parsed:
+        denial = deny_once("unparsed-push", "unparsed_push", UNPARSED_PUSH_REASON)
+        if denial is not None:
+            return denial
     if not targets:
         return None
     op = "push" if any(t[0] == "push" for t in targets) else "commit"
@@ -2007,10 +2252,12 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
     names_failed = False
     untracked_overflow = False
     untracked_identity = []
+    push_unjudged = False  # a push whose range couldn't be diffed (see below the loop)
     for target_op, cwd, all_flag, git_opts in targets:
         base = _push_base(cwd, git_deadline, git_opts) if target_op == "push" else None
         part = _diff_range(target_op, all_flag, cwd, git_deadline, base, git_opts)
         if part is None:
+            push_unjudged = push_unjudged or target_op == "push"
             continue
         names_out = _diff_names(target_op, all_flag, cwd, git_deadline, base, git_opts)
         names_failed = names_failed or names_out is None
@@ -2051,6 +2298,12 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
             # Keep the name for review, but never open their contents here.
             diff += f"new file: {name}\n[untracked content omitted]\n"[:room]
 
+    # No upstream or origin default branch, a failed git call or a spent git budget
+    # leaves a push's range unknown; deny it once rather than let it pass unreviewed.
+    if push_unjudged:
+        denial = deny_once("unjudged-push", "unjudged_push", UNJUDGED_PUSH_REASON)
+        if denial is not None:
+            return denial
     if not diff:
         return None
 

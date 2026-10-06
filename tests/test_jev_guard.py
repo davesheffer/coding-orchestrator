@@ -423,9 +423,258 @@ class GateTests(unittest.TestCase):
 
     def test_push_without_upstream_falls_back_or_fails_open(self):
         out = self.gate(self.payload("git push"), classify_fn=self.classify())
-        # No origin/main and no upstream configured -> both diff attempts fail -> None, no call
-        self.assertIsNone(out)
+        # No origin/main and no upstream configured -> both diff attempts fail -> the
+        # unreviewable push is denied once, without a classifier call.
+        hook = out["hookSpecificOutput"]
+        self.assertEqual(hook["permissionDecision"], "deny")
+        self.assertEqual(hook["permissionDecisionReason"], jev.UNJUDGED_PUSH_REASON)
         self.assertEqual(self.calls, [])
+        self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
+                         ("deny", "unjudged_push"))
+        # The identical retry proceeds as before: None, no call.
+        self.assertIsNone(self.gate(self.payload("git push"), classify_fn=self.classify()))
+        self.assertEqual(self.calls, [])
+        self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
+                         ("override", "unjudged_push"))
+        # A different command (or session) is denied again.
+        self.assertIsNotNone(self.gate(self.payload("git push origin"), classify_fn=self.classify()))
+        self.assertIsNotNone(self.gate(self.payload("git push", session_id="sess2"),
+                                       classify_fn=self.classify()))
+
+    def test_unjudged_push_retry_still_gates_its_commits(self):
+        self.stage_change()
+        command = "git commit -m x && git push"
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         jev.UNJUDGED_PUSH_REASON)
+        self.assertEqual(self.calls, [])
+        # The retry reviews the commit's diff as today (as a push operation).
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        self.assertIn("This push looks risky", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_unjudged_push_when_git_budget_is_spent(self):
+        out = jev.gate(self.payload("git push"), self.cfg, self.classify(), self.logs.append,
+                       state_dir=self.state_dir, deadline=time.monotonic() - 1)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         jev.UNJUDGED_PUSH_REASON)
+
+    def test_powershell_payload_is_gated(self):
+        self.stage_change()
+        payload = dict(self.payload("git commit -m x"), tool_name="PowerShell")
+        out = self.gate(payload, classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(len(self.calls), 1)
+        unparsed = dict(self.payload("& git.exe 'push'"), tool_name="PowerShell")
+        self.assertEqual(self.gate(unparsed, classify_fn=self.classify())["hookSpecificOutput"][
+            "permissionDecisionReason"], jev.UNPARSED_PUSH_REASON)
+        for tool in ("Read", "Edit", None):
+            self.assertIsNone(self.gate(dict(payload, tool_name=tool), classify_fn=self.classify()))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_looks_like_push(self):
+        for command in ('git "push" origin main', 'gi"t" push', "git pu\\sh", 'bash -c "git push"',
+                        "sh -c 'git push origin main'", 'eval "git push"', "echo git push | sh",
+                        "xargs git push",
+                        "python -c \"import subprocess; subprocess.run(['git','push'])\"",
+                        "git -c alias.p=push p", "git -c alias.p='!git push' p",
+                        "GIT=git; $GIT push", "C:\\Git\\cmd\\git.exe push", "& git.exe push",
+                        "git -C repo push", "/usr/libexec/git-core/git-push origin",
+                        "git --git-dir x --no-pager push",
+                        # A subcommand built at run time, or hidden past escapes/options.
+                        "p=push; git $p", "git \\\npush", "git pus$(echo h)",
+                        "git $(printf 'pu%s' sh)", "git `echo push`", "git ${_:-push}",
+                        "git @('push')", "git -c alias.p=pu\\sh p",
+                        "git" + " -c k=v" * 6 + ' "push"', "git" + " -x" * 70 + " push",
+                        # Quoted multi-word option values stay one word.
+                        "git -C 'a b' push",
+                        'git -c "http.extraHeader=Authorization: Bearer t" push',
+                        'bash -c "git -C \\"a b\\" push"',
+                        '& "C:\\Program Files\\Git\\cmd\\git.exe" push',
+                        # A dynamic command word.
+                        "g=git; $g push origin main", "x=mygit; $x push",
+                        # Aliases set at run time, through the environment or git config.
+                        "git -c alias.p=${x:-push} p", "cmd=push; git -c alias.p=$cmd p",
+                        "GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" git p",
+                        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p",
+                        "git config alias.p push && git p",
+                        'git config --global alias.p "!git push" && git p',
+                        # Pushes under another first subcommand.
+                        "git subtree push --prefix=lib origin main",
+                        "git subtree -P lib push origin main", "git send-pack origin main",
+                        # Brace expansion, and a brace group.
+                        "git pus{h..h} origin main", "git {p..p}ush", "{ git push; }",
+                        # A dynamic command word with options before the subcommand.
+                        "g=git; $g -C . push origin main", "g=git; $g --no-pager push",
+                        '"$GIT_BIN" -c k=v push',
+                        # send-pack aliases.
+                        "git -c alias.p=send-pack p", "git config alias.p send-pack && git p",
+                        # A message is skipped, but a wrapper or substitution is not.
+                        'git commit -m "$(git push)"', 'git commit -m x && bash -c -m "git push"',
+                        'sh -cm "git push"'):
+            self.assertTrue(jev._looks_like_push(command), command)
+        for command in ("git stash push", 'git commit -m "fix push bug"', "git status", "ls -la",
+                        "npm run build", "git log --oneline", "", "git", "git -C push status",
+                        "git log $(git rev-parse HEAD)", "man git-push",
+                        "git -c alias.co=checkout co pushfix", "git log --format=%H",
+                        "git --git-dir=$D status", "git -c user.email=me@x.org commit -m x",
+                        'git -C "a b" status', "{ git status; }", "git subtree split -P lib",
+                        "git config alias.co checkout", "git config user.name 'push bot'",
+                        "cp -r $SRC/git $DST", "$EDITOR -n file", "$EDITOR -n $f",
+                        'git commit -m "docs: explain git push"', "git commit -am'git push'",
+                        'git commit --message="git push"', 'git tag -a v1 -m "git push"',
+                        'git commit -F "git push"'):
+            self.assertFalse(jev._looks_like_push(command), command)
+        # Every push counts, so one hidden next to a parsed one is still seen.
+        for command, count in (("git push", 1), ("cd a && git push", 1),
+                               ("git push && git push --tags", 2),
+                               ('git push; bash -c "cd ../other && git push --force"', 2),
+                               ("git -c alias.p=push p; git push", 2),
+                               ("git -C $DIR push", 1), ("git -C $DIR push; git push", 2),
+                               ('mkdir -p "a b" && git -C "a b" push origin main; '
+                                'bash -c "git push --force origin main"', 2),
+                               ('git commit -m "add git push hook" && git push', 1),
+                               ('git commit -m "x" && bash -c "git push"', 1)):
+            self.assertEqual(jev._push_signals(command), count, command)
+        # The hardened scanner misses these, which is what the backstop is for.
+        for command in ('git "push" origin main', 'gi"t" push', 'bash -c "git push"',
+                        "git -c alias.p=push p"):
+            self.assertEqual(jev._scan_targets(command, "/repo"), [], command)
+
+    def test_unparsed_push_denied_once(self):
+        command = 'bash -c "git push"'
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        hook = out["hookSpecificOutput"]
+        self.assertEqual(hook["permissionDecision"], "deny")
+        self.assertEqual(hook["permissionDecisionReason"], jev.UNPARSED_PUSH_REASON)
+        self.assertEqual(self.calls, [])
+        self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
+                         ("deny", "unparsed_push"))
+        # The identical retry is an override with no targets left: None.
+        self.assertIsNone(self.gate(self.payload(command), classify_fn=self.classify()))
+        self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
+                         ("override", "unparsed_push"))
+        self.assertEqual(self.calls, [])
+        # Another wrapped push is denied on its own.
+        self.assertIsNotNone(self.gate(self.payload("eval 'git push'"), classify_fn=self.classify()))
+        # Ordinary commands never reach the backstop.
+        for command in ("git stash push", "git status", 'git commit -m "fix push bug"'):
+            self.assertIsNone(self.gate(self.payload(command), classify_fn=self.classify()), command)
+        self.assertEqual(self.calls, [])
+
+    def test_unparsed_push_retry_still_gates_its_commits(self):
+        self.stage_change()
+        command = 'git commit -m x; bash -c "git push"'
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         jev.UNPARSED_PUSH_REASON)
+        self.assertEqual(self.calls, [])
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        self.assertIn("This commit looks risky", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_push_smuggled_next_to_a_parsed_push_is_denied_once(self):
+        command = 'git push; bash -c "cd ../other && git push --force"'
+        self.assertEqual(len(jev._scan_targets(command, str(self.repo))), 1)
+
+        def reason():
+            out = self.gate(self.payload(command), classify_fn=self.classify())
+            return out and out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(reason(), jev.UNPARSED_PUSH_REASON)
+        # The retry reaches the parsed push (no upstream here: denied once as unjudged),
+        # and the next identical retry proceeds.
+        self.assertEqual(reason(), jev.UNJUDGED_PUSH_REASON)
+        self.assertIsNone(reason())
+        self.assertEqual(self.calls, [])
+        # Parsed pushes alone never trigger the backstop.
+        for command in ("git push", "cd . && git push", "git push && git push --tags",
+                        "git push origin main; git push origin v1"):
+            self.assertEqual(reason(), jev.UNJUDGED_PUSH_REASON, command)
+
+    def test_push_hidden_after_a_quoted_cwd_push_is_denied_once(self):
+        (self.repo / "a b").mkdir()
+        command = ('mkdir -p "a b" && git -C "a b" push origin main; '
+                   'bash -c "git push --force origin main"')
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         jev.UNPARSED_PUSH_REASON)
+        # Each newly caught shape is denied once too, with no parsed push beside it.
+        for command in ("g=git; $g push origin main", "git config alias.p push && git p",
+                        "git pus{h..h} origin main", "git subtree push --prefix=lib origin main",
+                        "cmd=push; git -c alias.p=$cmd p"):
+            out = self.gate(self.payload(command), classify_fn=self.classify())
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                             jev.UNPARSED_PUSH_REASON, command)
+        self.assertEqual(self.calls, [])
+
+    def test_commit_message_mentioning_push_is_not_a_hidden_push(self):
+        self.stage_change()
+        out = self.gate(self.payload('git commit -m "docs: explain git push"'),
+                        classify_fn=self.classify())
+        self.assertIn("This commit looks risky", out["hookSpecificOutput"]["permissionDecisionReason"])
+        # Beside a real push only the push's own check applies (no upstream: unjudged).
+        out = self.gate(self.payload('git commit -m "add git push hook" && git push'),
+                        classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         jev.UNJUDGED_PUSH_REASON)
+        # A dynamic command word with options is still caught.
+        out = self.gate(self.payload("g=git; $g -C . push origin main"),
+                        classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         jev.UNPARSED_PUSH_REASON)
+
+    def test_deny_once_is_per_cwd(self):
+        command = 'bash -c "git push"'
+        other = self.repo.parent / "other"
+        other.mkdir()
+
+        def reason(cwd):
+            out = self.gate(self.payload(command, cwd=str(cwd)), classify_fn=self.classify())
+            return out and out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(reason(self.repo), jev.UNPARSED_PUSH_REASON)
+        # Overridden in this repository only: the same command elsewhere is denied again.
+        self.assertEqual(reason(other), jev.UNPARSED_PUSH_REASON)
+        self.assertIsNone(reason(self.repo))
+        self.assertIsNone(reason(other))
+
+    def test_deny_once_says_when_it_could_not_be_recorded(self):
+        command = 'bash -c "git push"'
+        suffix = (" (This denial could not be recorded, so an identical retry will be "
+                  "checked again.)")
+        with mock.patch.object(jev, "update_state", side_effect=OSError("locked")):
+            for _ in range(2):
+                out = self.gate(self.payload(command), classify_fn=self.classify())
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                                 jev.UNPARSED_PUSH_REASON + suffix)
+                self.assertEqual(self.logs[-1]["state_error"], "OSError")
+        # Recorded normally, the reason has no suffix.
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         jev.UNPARSED_PUSH_REASON)
+        self.assertNotIn("state_error", self.logs[-1])
+
+    def test_looks_like_push_is_linear(self):
+        for command, label in (("git " * 250_000, "git words"),
+                               ("git " + "-c x " * 200_000, "value options"),
+                               ("git -x " * 150_000, "flag runs"),
+                               ("alias." * 150_000, "alias without push"),
+                               ('"' * 1_000_000, "quotes"),
+                               ("a\\" * 500_000, "backslashes"),
+                               ("git " + "$x " * 250_000, "dynamic words"),
+                               ("git -x " + "-x " * 300_000, "options past the window"),
+                               ("/git-push " * 100_000, "git-push paths"),
+                               ("'git' " * 200_000, "quoted git words"),
+                               ('"git push" ' * 100_000, "quoted pushes"),
+                               ("'" * 1_000_001, "unbalanced quotes"),
+                               ('"\\' * 500_000, "escapes in an unbalanced quote"),
+                               ("{" * 1_000_000, "braces"),
+                               ("git config " * 100_000, "config runs"),
+                               ("git subtree " * 100_000, "subtree runs"),
+                               ("alias.p=$x " * 100_000, "dynamic aliases"),
+                               ("git commit " + '-m "a" ' * 150_000, "messages"),
+                               ("git commit -m" + '"a"' * 300_000, "one long message word"),
+                               ("$g -x " * 150_000, "dynamic words with options")):
+            self._assert_fast(lambda: jev._looks_like_push(command), label)
 
     def test_classify_raising_is_noop(self):
         self.stage_change()
@@ -745,10 +994,17 @@ class GateTests(unittest.TestCase):
                              cwd=tempfile.gettempdir())
 
     def test_issue_39_work_tree_threaded_to_git(self):
-        with mock.patch.object(jev.subprocess, "run") as run:
+        with mock.patch.object(jev.subprocess, "run") as run, \
+                mock.patch.object(jev, "resolve_executable", return_value="/usr/bin/git"):
             run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
             jev._run_git(["status"], "/repo", git_opts=("--work-tree", "/w"))
-        self.assertEqual(run.call_args[0][0], ["git", "--work-tree", "/w", "status"])
+        self.assertEqual(run.call_args[0][0], ["/usr/bin/git", "--work-tree", "/w", "status"])
+        # Without a git on PATH (never the cwd's), the call fails like a failed git.
+        with mock.patch.object(jev.subprocess, "run") as run, \
+                mock.patch.object(jev, "resolve_executable", return_value=None) as resolve:
+            self.assertIsNone(jev._run_git(["status"], "/repo"))
+        resolve.assert_called_once_with("git")
+        run.assert_not_called()
         # `commit -a` with only a --work-tree diffs that work tree (the repository is
         # still discovered from the cwd), not the cwd's own clean checkout.
         work = self.repo.parent / "work"
@@ -1298,7 +1554,11 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
                          ("deny", "too_many_targets"))
-        # Ordinary commands are unaffected.
+        # Ordinary commands are unaffected: the cap's pushes (to missing directories) are
+        # denied once as unjudged, and the identical retry passes as before.
+        out = self.gate(self.payload(at_cap), classify_fn=self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         jev.UNJUDGED_PUSH_REASON)
         self.assertIsNone(self.gate(self.payload(at_cap), classify_fn=self.classify()))
         self.stage_change()
         out = self.gate(self.payload("cd . || cd x; git commit -m x"),
@@ -1652,6 +1912,43 @@ class GateTests(unittest.TestCase):
             self.assertEqual(jev._scrub(f"before {secret} after"), "before [redacted] after", secret)
         self.assertEqual(jev._scrub("sk-short and AKIAlower"), "sk-short and AKIAlower")
 
+    def test_scrub_npm_jwt_and_url_credentials(self):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLWJ5dGVz"
+        self.assertEqual(jev._scrub(f"before npm_{'a1B2' * 9} after"), "before [redacted] after")
+        self.assertEqual(jev._scrub(f"token: {jwt}"), "token: [redacted]")
+        self.assertEqual(jev._scrub("url = https://deploy:hunter2@example.com/repo.git"),
+                         "url = https://[redacted]@example.com/repo.git")
+        self.assertEqual(jev._scrub("+git clone https://x-token:ghx123@github.com/o/r\n"),
+                         "+git clone https://[redacted]@github.com/o/r\n")
+        # An empty user, and a token as the user with no password.
+        for text, want in (("redis://:hunter2@host:6379/0", "redis://[redacted]@host:6379/0"),
+                           ("https://:ghx_tok@github.com/o/r", "https://[redacted]@github.com/o/r"),
+                           ("https://abcdefghij0123456789KL_-@host/x", "https://[redacted]@host/x")):
+            self.assertEqual(jev._scrub(text), want, text)
+        for text in ("ssh://git@github.com/o/r", "https://user@host/x",
+                     "https://" + "a" * 19 + "@host/x"):
+            self.assertEqual(jev._scrub(text), text, text)
+        # Near misses are kept: short npm tokens, one-part `eyJ` words, plain URLs and
+        # ports, and an `@` past the host.
+        for text in ("npm_short", "npm_" + "a" * 37, "eyJhbGciOiJIUzI1NiJ9 only",
+                     "https://example.com:8080/path", "ssh://git@github.com/o/r",
+                     "https://example.com/a:b/@c"):
+            self.assertEqual(jev._scrub(text), text, text)
+
+    def test_redact_diff_new_secret_file_patterns(self):
+        def file_diff(name, body="+hunter2\n"):
+            return (f"diff --git a/{name} b/{name}\nindex 1..2 100644\n--- a/{name}\n"
+                    f"+++ b/{name}\n@@ -0,0 +1 @@\n{body}")
+        for name in (".netrc", "home/_netrc", ".npmrc", ".pypirc", ".git-credentials",
+                     ".pgpass", "web/.htpasswd", "keys/server.ppk", "infra/prod.tfvars",
+                     "vault.kdbx", "id_dsa", "ssh/id_ecdsa.pub", "id_ed25519", "ID_ED25519_SK"):
+            out = jev._redact_diff(file_diff(name))
+            self.assertNotIn("hunter2", out, name)
+            self.assertIn(f"diff --git a/{name} b/{name}", out, name)
+            self.assertIn("[redacted]", out, name)
+        for name in ("src/netrc.py", "docs/npmrc.md", "main.tf", "src/tfvars.md"):
+            self.assertIn("hunter2", jev._redact_diff(file_diff(name)), name)
+
     def test_secret_directories_redacted_before_sending(self):
         (self.repo / "secrets").mkdir()
         (self.repo / "config" / "Credentials").mkdir(parents=True)
@@ -1995,6 +2292,16 @@ class GateTests(unittest.TestCase):
             out = jev._scrub(text)
             self.assertLess(time.monotonic() - started, 3.0, text[:40])
             self.assertNotIn("A" * 40, out)
+        # The npm, JWT and URL-credential alternatives stay linear on 1M-char inputs.
+        for text in ("eyJ" * 333_334, "-eyJ" * 250_000, "eyJ" + "a" * 1_000_000,
+                     "eyJaaaaaaaaaaaa." * 62_500, "://a:" * 200_000, "://" * 333_334,
+                     "://:" * 250_000, ("://" + "a" * 30) * 30_000, ("://" + "a" * 300) * 3_300,
+                     ("://:" + "a" * 300) * 3_300,
+                     "://" + "a" * 1_000_000, "://a:" + "b" * 1_000_000, "npm_" * 250_000,
+                     "npm_" + "a" * 1_000_000):
+            started = time.monotonic()
+            jev._scrub(text)
+            self.assertLess(time.monotonic() - started, 3.0, text[:40])
 
 
 class AgentDoneTests(unittest.TestCase):

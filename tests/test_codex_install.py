@@ -38,6 +38,15 @@ class CodexInstallTests(unittest.TestCase):
         with mock.patch.object(install_module.os, "name", "posix"):
             self.assertEqual(install_module.platform_python(), "python3")
 
+    def test_windows_hook_command_rejects_shell_expandable_paths(self):
+        with mock.patch.object(install_module.os, "name", "nt"):
+            self.assertIn('"', install_module.hook_command(Path("C:/Users/me/.codex")))
+            for char in '%$`"':
+                with self.subTest(char=char), self.assertRaises(ValueError):
+                    install_module.hook_command(Path(f"C:/Users/a{char}b/.codex"))
+        with mock.patch.object(install_module.os, "name", "posix"):
+            self.assertIn("jev-hook.py", install_module.hook_command(self.home / "a%b"))
+
     def test_fresh_install_parses_and_installs_helper(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)

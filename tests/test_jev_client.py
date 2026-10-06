@@ -318,6 +318,37 @@ class ClientTests(unittest.TestCase):
                          [20.0, jev_client.MAX_DEADLINE_SECONDS, jev_client.MAX_ASK_DEADLINE_SECONDS])
         self.assertEqual(jev_client.MAX_ASK_DEADLINE_SECONDS, 60.0)
 
+    def test_api_key_file_must_hold_a_single_token(self):
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
+            good = self.dir / "key"
+            good.write_text("  tok-123  \n", encoding="utf-8")
+            self.assertEqual(jev_client.api_key({"api_key_file": str(good)}), "tok-123")
+            for text in ("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+                         "machine example.com login a password b", "x" * 513, ""):
+                bad = self.dir / "bad"
+                bad.write_text(text, encoding="utf-8")
+                self.assertIsNone(jev_client.api_key({"api_key_file": str(bad)}), text[:20])
+
+    def test_resolve_executable_skips_cwd_and_relative_path_entries(self):
+        name = "jevtool"
+        exe = name + (".exe" if os.name == "nt" else "")
+        planted = self.dir / "cwd"
+        planted.mkdir()
+        (planted / exe).write_bytes(b"")
+        real = self.dir / "bin"
+        real.mkdir()
+        (real / exe).write_bytes(b"")
+        os.chmod(real / exe, 0o755)
+        os.chmod(planted / exe, 0o755)
+        old = os.getcwd()
+        os.chdir(planted)
+        self.addCleanup(os.chdir, old)
+        env = {"PATH": os.pathsep.join([".", "", str(real)]), "PATHEXT": ".COM;.EXE"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(Path(jev_client.resolve_executable(name)), real / exe)
+        with mock.patch.dict(os.environ, {"PATH": ".", "PATHEXT": ".COM;.EXE"}):
+            self.assertIsNone(jev_client.resolve_executable(name))
+
 
 if __name__ == "__main__":
     unittest.main()

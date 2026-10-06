@@ -23,3 +23,4 @@ relay/handoffs/
 .hunch/dropped-commit-repairs.json
 .hunch-private/
 # <<< hunch <<<
+.playwright-mcp/

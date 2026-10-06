@@ -23,7 +23,6 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import subprocess
 import sys
 import time
@@ -172,7 +171,16 @@ def k(n):
     return f"{round(n / 1000)}k"
 
 
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def valid_session_id(session_id):
+    return isinstance(session_id, str) and bool(SESSION_ID_RE.fullmatch(session_id))
+
+
 def load_state(session_id):
+    if not valid_session_id(session_id):
+        return {}
     try:
         return json.loads((STATE / f"{session_id}.json").read_text(encoding="utf-8"))
     except Exception:
@@ -198,6 +206,8 @@ def _restrict_windows_state(path):
 
 
 def save_state(session_id, state):
+    if not valid_session_id(session_id):
+        return
     STATE.mkdir(parents=True, exist_ok=True)
     path = STATE / f"{session_id}.json"
     stage = STATE / f".private-{secrets.token_hex(8)}"
@@ -476,9 +486,34 @@ def cmd_stop():
         "say exactly where to resume.")}))
 
 
+def resolve_executable(name):
+    """Absolute path of `name` from PATH, never from the current directory.
+
+    On Windows a bare name given to CreateProcess (and shutil.which) is looked up in
+    the current directory first, so a repository could plant `git.exe`. Relative PATH
+    entries are skipped for the same reason. Returns None when nothing is found."""
+    if os.name == "nt":
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").lower().split(";") if e]
+        names = [name] if Path(name).suffix.lower() in exts else [name + ext for ext in exts]
+    else:
+        names = [name]
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry):
+            continue
+        for candidate in names:
+            path = os.path.join(entry, candidate)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
 def git(cwd, *args):
     try:
-        return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=5).stdout.strip()
+        exe = resolve_executable("git")
+        if not exe:
+            return ""
+        return subprocess.run([exe, "-C", cwd, *args], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         return ""
 
@@ -500,7 +535,8 @@ def clipboard_commands():
         candidates = [["clip"]]
     else:
         candidates = [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
-    return [[shutil.which(c[0])] + c[1:] for c in candidates if shutil.which(c[0])]
+    resolved = [(resolve_executable(c[0]), c[1:]) for c in candidates]
+    return [[exe] + rest for exe, rest in resolved if exe]
 
 
 def copy_to_clipboard(text):

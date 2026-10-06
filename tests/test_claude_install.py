@@ -267,7 +267,8 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["jev"], {"enabled": True})
         self.assertEqual(hooks(), (
-            [user, group("Agent|Task", "jev-route.py"), group("Bash", "jev-guard.py", " gate"),
+            [user, group("Agent|Task", "jev-route.py"),
+             group("Bash|PowerShell", "jev-guard.py", " gate"),
              group("SubagentHandback", "jev-guard.py", " handback")],
             [group("Agent|Task|SubagentHandback", "jev-guard.py", " agent-done")]))
         manifest = json.loads(self.home.joinpath(".coding-orchestrator-manifest.json").read_text())
@@ -451,6 +452,21 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(added["hooks"]["PostToolUse"], template["PostToolUse"])
         only_ours = install_module.merge_jev_hook({"hooks": {"PreToolUse": [owned, owned]}}, bin_dir, False)
         self.assertNotIn("PreToolUse", only_ours["hooks"])
+
+    def test_merge_jev_hook_replaces_gate_installed_with_old_bash_matcher(self):
+        bin_dir = self.home / "bin"
+        template = install_module.jev_template(bin_dir)["hooks"]
+        gate = next(g for g in template["PreToolUse"] if g["hooks"][0]["command"].endswith(
+            "gate 2>/dev/null || true"))
+        self.assertEqual(gate["matcher"], "Bash|PowerShell")
+        old_gate = {**gate, "matcher": "Bash"}
+        user = {"matcher": "Bash", "hooks": [{"type": "command", "command": "audit-bash"}]}
+        settings = {"hooks": {"PreToolUse": [user, old_gate]}}
+        upgraded = install_module.merge_jev_hook(settings, bin_dir, True)
+        self.assertEqual(upgraded["hooks"]["PreToolUse"], [user] + template["PreToolUse"])
+        self.assertNotIn(old_gate, upgraded["hooks"]["PreToolUse"])
+        removed = install_module.merge_jev_hook(settings, bin_dir, False)
+        self.assertEqual(removed["hooks"]["PreToolUse"], [user])
 
     def test_default_install_adds_no_pre_tool_use_hook(self):
         self.assertEqual(self.run_install().returncode, 0)

@@ -191,6 +191,9 @@ def parse_json(path: Path, data: bytes | None) -> dict:
 def hook_command(dest: Path) -> str:
     python = "python" if os.name == "nt" else "python3"
     path = str(dest / "bin" / "jev-hook.py")
+    if os.name == "nt" and any(c in path for c in '%$`"'):
+        fail(f"cannot install the hook: {path} contains one of % $ ` \" which the hook shell would expand; "
+             "use a CODEX_HOME without those characters")
     return f'{python} "{path}"' if os.name == "nt" else f"{python} {shlex.quote(path)}"
 
 

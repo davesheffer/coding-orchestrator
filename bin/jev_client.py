@@ -233,6 +233,28 @@ def call_with_deadline(fn, args, timeout):
     return box["value"]
 
 
+def resolve_executable(name):
+    """Absolute path of `name` from PATH, never from the current directory.
+
+    On Windows a bare name given to CreateProcess (and shutil.which) is looked up in
+    the current directory first, so a repository could plant `git.exe`. Relative PATH
+    entries are skipped for the same reason. Returns None when nothing is found."""
+    if os.name == "nt":
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").lower().split(";") if e]
+        names = [name] if Path(name).suffix.lower() in exts else [name + ext for ext in exts]
+    else:
+        names = [name]
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry):
+            continue
+        for candidate in names:
+            path = os.path.join(entry, candidate)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
 def api_key(cfg):
     key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     if key:
@@ -240,9 +262,14 @@ def api_key(cfg):
     path = cfg.get("api_key_file")
     if isinstance(path, str) and path:
         try:
-            return Path(path).expanduser().read_text(encoding="utf-8").strip() or None
+            key = Path(path).expanduser().read_text(encoding="utf-8").strip()
         except Exception:
             return None
+        # A key is one short token; anything else (a private key, a dotfile) is the
+        # wrong file and must never be sent as a Bearer header.
+        if not key or len(key) > 512 or any(ch.isspace() for ch in key):
+            return None
+        return key
     if cfg.get("api_key_source") == "claude_settings":
         try:
             settings = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))

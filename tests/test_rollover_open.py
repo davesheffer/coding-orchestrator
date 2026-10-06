@@ -19,12 +19,42 @@ SPEC.loader.exec_module(rollover)
 class RolloverOpenTests(unittest.TestCase):
     def test_windows_opener_uses_code_cli(self):
         with patch.object(rollover.sys, "platform", "win32"), \
-                patch.object(rollover.shutil, "which", return_value="code.cmd"), \
+                patch.object(rollover, "resolve_executable", return_value="code.cmd") as resolve, \
                 patch.object(rollover.subprocess, "run") as run:
             rollover.open_uri("vscode://coding-orchestrator.handoff-bridge/open?id=test")
+        resolve.assert_called_once_with("code")
         run.assert_called_once_with(
             ["code.cmd", "--open-url", "vscode://coding-orchestrator.handoff-bridge/open?id=test"],
             check=True, capture_output=True)
+
+    def test_resolve_executable_ignores_cwd_and_relative_path_entries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            name = "code.exe" if os.name == "nt" else "code"
+            tool = Path(temp) / name
+            tool.write_text("x")
+            tool.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": os.pathsep.join(["", ".", temp])}):
+                self.assertEqual(Path(rollover.resolve_executable("code")), tool)
+            with patch.dict(os.environ, {"PATH": os.pathsep.join(["", "."])}), \
+                    patch.object(rollover.os, "getcwd", return_value=temp):
+                self.assertIsNone(rollover.resolve_executable("code"))
+
+    def test_stale_tmp_file_does_not_block_write_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "launches" / "a.json"
+            path.parent.mkdir()
+            (path.parent / "a.json.tmp").write_text("stale")
+            rollover.write_json(path, {"ok": True})
+            self.assertEqual(json.loads(path.read_text()), {"ok": True})
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["a.json", "a.json.tmp"])
+
+    def test_write_json_removes_tmp_on_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "a.json"
+            with patch.object(rollover.os, "replace", side_effect=OSError("boom")):
+                with self.assertRaises(OSError):
+                    rollover.write_json(path, {"ok": True})
+            self.assertEqual(list(Path(temp).iterdir()), [])
 
     def test_launch_uses_opaque_id_and_waits_for_bridge_ack(self):
         with tempfile.TemporaryDirectory() as temp, \
