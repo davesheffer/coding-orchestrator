@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { hunchCli, hunchInvocation, hunchName, hunchOutcome } from '../hooks/parse'
+import { hunchCli, hunchInvocation, hunchName, hunchOutcome, reapStale } from '../hooks/parse'
 
 const TASK = 'htask_a0a4770f5592438f23dad47a'
 
@@ -43,6 +43,41 @@ describe('hunch parsing', () => {
     expect(hunchCli('git commit -m "feat: band; hunch update now runs"')).toBeUndefined()
     expect(hunchCli("echo '(hunch status)'")).toBeUndefined()
     expect(hunchCli('git add . && hunch update')?.name).toBe('cli update')
+    // Heredoc bodies are data, not commands; a newline or `$(` starts a command.
+    expect(hunchCli("git commit -F- <<'EOF'\nfeat: band\nhunch update\nEOF")).toBeUndefined()
+    expect(hunchCli('cat <<EOF > notes.md\n(hunch status)\nEOF')).toBeUndefined()
+    expect(hunchCli('echo foo (hunch status)')).toBeUndefined()
+    expect(hunchCli('cd repo\nhunch update')?.name).toBe('cli update')
+    expect(hunchCli('id=$(hunch now)')?.name).toBe('cli now')
+    // Not heredocs: a here-string and a shift; and a real call after a heredoc's terminator.
+    expect(hunchCli('cat <<< "x" && hunch update')?.name).toBe('cli update')
+    expect(hunchCli('echo $((1 << 2)); hunch update')?.name).toBe('cli update')
+    expect(hunchCli('cat <<EOF > f\nbody\nEOF\nhunch update')?.name).toBe('cli update')
+    expect(hunchCli('cat <<EOF > f\r\nbody\r\nEOF\r\nhunch update')?.name).toBe('cli update')
+    // A launcher path quoted in a heredoc body is data; one before the heredoc is the call.
+    const launcher = `node C:/x/@davesheffer/hunch/dist/cli/index.js task verify ${TASK} --`
+    expect(hunchCli(`python relay.py handoff <<'H'\nVERIFIED: ${launcher} flutter test exit 0\nH`)).toBeUndefined()
+    expect(hunchCli(`${launcher} python - <<'PY'\nprint(1)\nPY`)?.name).toBe('verify')
+  })
+
+  test('stale running calls are reaped, fresh ones kept', async () => {
+    const base = { target: '', role: 'main', summary: '', level: 'info' as const }
+    const now = Date.parse('2026-10-06T14:00:00')
+    const calls = [
+      { ...base, id: 'old', name: 'context', startedAt: now - 16 * 60_000, status: 'running' as const },
+      { ...base, id: 'long', name: 'verify', startedAt: now - 11 * 60_000, status: 'running' as const },
+      { ...base, id: 'new', name: 'why', startedAt: now - 60_000, status: 'running' as const },
+      { ...base, id: 'done', name: 'why', startedAt: now - 60 * 60_000, status: 'ok' as const },
+    ]
+    const reaped = reapStale(calls, now)
+    expect(reaped.map(call => [call.id, call.status])).toEqual([
+      ['old', 'error'],
+      ['long', 'running'],
+      ['new', 'running'],
+      ['done', 'ok'],
+    ])
+    expect(reaped[0]?.summary).toBe('no result recorded')
+    expect(reaped[0]?.level).toBe('warn')
   })
 
   test('constraints: warning is warn, advisory is listed but quiet', async () => {
@@ -81,6 +116,16 @@ describe('hunch parsing', () => {
     // `| tail -5` cut the JSON's head off: the Bash call's own exit decides.
     expect(hunchOutcome('verify', 'Exit code 1\n  "timed_out": false,\n  "source": "x"\n}', true).summary).toBe('exit 1')
     expect(hunchOutcome('verify', '  "timed_out": false,\n  "source": "x"\n}', false).level).toBe('warn')
+    // A failed timeout alerts even when no exit code survived; the command's own `timed_out` does not.
+    expect(hunchOutcome('verify', '  "timed_out": true,\n  "source": "x"\n}', true).summary).toBe('timed out')
+    expect(hunchOutcome('verify', '{"results":{"timed_out": true}}', false).level).toBe('warn')
+    // `Exit code N` in a passing command's stdout is not core's marker.
+    const tolerated = hunchOutcome('verify', 'step A\nExit code 1 (tolerated)\n{"exit_code": 0, "timed_out": false}', false)
+    expect([tolerated.summary, tolerated.level]).toEqual(['exit 0', 'info'])
+    // Launcher JSON cut off, the checked command's own JSON said 0: the Bash exit wins.
+    const cut = hunchOutcome('verify', 'Exit code 1\n{"exit_code": 0, "suite": "x"}\n3 tests failed', true)
+    expect(cut.summary).toBe('exit 1')
+    expect(cut.level).toBe('alert')
 
     const broken = hunchOutcome('why', 'hunch: task not found in this repository', true)
     expect(broken.level).toBe('alert')
@@ -187,4 +232,48 @@ test('task verify through Bash records its exit code and toasts a failure', asyn
   expect(await pane.find({ text: /verify 2/ })).toBeDefined()
   expect(await pane.find({ text: /exit 0/ })).toBeDefined()
   await pane.unmount()
+})
+
+test('an interrupted call is marked interrupted, without a failure toast', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-06T14:00:00') })
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: true }, text: '' }))
+  on('tool.call', { tool: 'mcp__hunch__hunch_why' }, () => ({
+    isError: true as const,
+    result: undefined,
+    text: '[Request interrupted by user for tool use]',
+  }))
+
+  const cli = `node C:/x/@davesheffer/hunch/dist/cli/index.js task verify ${TASK} --`
+  await $.tool.call({ tool: 'Bash', command: `${cli} flutter test slow`, description: 'verify' })
+  await $.tool.call({ tool: 'mcp__hunch__hunch_why', target: 'lib/a.dart' })
+
+  expect(toasts.filter(text => /Hunch/.test(text))).toEqual([])
+
+  const pane = await $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'mission-control',
+    props: { title: 'Mission Control', isFocused: false, bodyColumns: 100, placement: 'dock', scroll, view: {} },
+  })
+  expect(await pane.find({ text: /interrupted/ })).toBeDefined()
+  await pane.unmount()
+
+  // Interrupted calls count but do not raise the band's warning mark.
+  const band = await $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 120, scroll, view: {} },
+  })
+  expect(await band.find({ text: /hunch 2/ })).toBeDefined()
+  expect(await band.find({ text: /hunch 2 ⚠/ })).toBeUndefined()
+  await band.unmount()
 })

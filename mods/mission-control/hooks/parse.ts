@@ -1,4 +1,4 @@
-import type { Confidence, HunchConstraint, HunchLevel, JevEntry, JevStatus, Zone } from '../types'
+import type { Confidence, HunchCall, HunchConstraint, HunchLevel, JevEntry, JevStatus, Zone } from '../types'
 
 // Pure helpers: no `$`, so the tests exercise them directly.
 
@@ -255,11 +255,15 @@ const TASK_ID = /\bhtask_[a-f0-9]{24}\b/
 const TARGET_KEYS = ['target', 'scope', 'topic', 'symbol', 'symptom_or_symbol', 'query', 'id', 'title'] as const
 
 // The CLI as the prompt hook prints it (`node .../@davesheffer/hunch/dist/cli/index.js task verify ...`),
-// or `hunch <sub>` / `npx @davesheffer/hunch <sub>` starting a command (matched with quoted text blanked,
-// so `git commit -m "hunch update"` is not a call).
+// or `hunch <sub>` / `npx @davesheffer/hunch <sub>` starting a command (matched with quoted text blanked
+// and heredoc bodies dropped, so `git commit -m "hunch update"` is not a call).
+
+// A heredoc opener (`<<EOF`, `<<-'EOF'`; not `<<<` or `1 << 2`), the rest of its line, then its body
+// up to the terminator line, or to the end when none follows.
+const HEREDOC = /(?<!<)<<-?[ \t]*(['"]?)([A-Za-z_]\w*)\1([^\n]*)(?:\n[\s\S]*?(?:\n[ \t]*\2[ \t]*(?=\r?\n|$)|$)|$)/g
 const HUNCH_LAUNCHER = /@davesheffer[\\/]+hunch[\\/]+dist[\\/]+cli[\\/]+index\.js['"]?\s+([a-z][\w-]*)(?:\s+([a-z][\w-]*))?/i
 
-const HUNCH_BARE = /(?:^|[;&|(]\s*)(?:npx\s+(?:-y\s+)?)?(?:@davesheffer\/)?hunch\s+([a-z][\w-]*)(?:\s+([a-z][\w-]*))?/i
+const HUNCH_BARE = /(?:^|[;&|\n]|\$\()\s*(?:\(\s*)?(?:npx\s+(?:-y\s+)?)?(?:@davesheffer\/)?hunch\s+([a-z][\w-]*)(?:\s+([a-z][\w-]*))?/i
 
 const LEVEL_RANK: Record<HunchLevel, number> = { info: 0, warn: 1, alert: 2 }
 
@@ -309,7 +313,8 @@ export function hunchInvocation(name: string, args: Record<string, unknown>): Hu
 
 /** The hunch CLI call a Bash command makes, or undefined when it makes none. */
 export function hunchCli(command: string): HunchInvocation | undefined {
-  const match = HUNCH_LAUNCHER.exec(command) ?? HUNCH_BARE.exec(command.replace(/"[^"]*"|'[^']*'/g, '""'))
+  const lines = command.replace(HEREDOC, (_all, _quote: string, tag: string, rest: string) => `<<${tag}${rest}`)
+  const match = HUNCH_LAUNCHER.exec(lines) ?? HUNCH_BARE.exec(lines.replace(/"[^"]*"|'[^']*'/g, '""'))
   if (match === null) return undefined
 
   const [, sub = '', action = ''] = match
@@ -392,10 +397,14 @@ function verifyOutcome(output: string, isError: boolean): HunchOutcome {
   const codes = [...output.matchAll(/"exit_code"\s*:\s*(-?\d+)/g)]
   const jsonCode = codes.at(-1)?.[1]
   const bashCode = /^Exit code (-?\d+)/m.exec(output)?.[1]
-  const code = jsonCode ?? bashCode
+  // On an errored call core's `Exit code N` beats a 0 that may be the checked command's own JSON
+  // (the launcher's cut off); otherwise an `Exit code` line is the command's stdout, not evidence.
+  const code = isError && bashCode !== undefined && bashCode !== '0' ? bashCode : (jsonCode ?? bashCode)
   const isTimedOut = /"timed_out"\s*:\s*true/.test(output)
 
   if (code === undefined) {
+    if (isTimedOut && isError) return { summary: 'timed out', level: 'alert', constraints: [], taskId }
+
     return isError
       ? { summary: `failed: ${firstLine(output) || 'no exit code'}`, level: 'alert', constraints: [], taskId }
       : { summary: 'exit code not in output (piped or truncated?)', level: 'warn', constraints: [], taskId }
@@ -409,6 +418,25 @@ function verifyOutcome(output: string, isError: boolean): HunchOutcome {
     exitCode,
     taskId,
   }
+}
+
+/** A call still running this long never got its result recorded (a lost abort, a reload); past Bash's 10 min cap. */
+export const STALE_MS = 15 * 60_000
+
+/** Marks running calls older than STALE_MS as errored, so the pane and band stop waiting on them. */
+export function reapStale(calls: readonly HunchCall[], now: number): HunchCall[] {
+  return calls.map(call =>
+    call.status === 'running' && now - call.startedAt > STALE_MS
+      ? { ...call, status: 'error', level: 'warn', durationMs: now - call.startedAt, summary: 'no result recorded' }
+      : call,
+  )
+}
+
+/** Whether an abort ended the call: Bash's own `interrupted`, or the marker text core gives the model. */
+export function wasInterrupted(result: unknown, text: string): boolean {
+  if (typeof result === 'object' && result !== null && (result as { interrupted?: unknown }).interrupted === true) return true
+
+  return /^\[?Request interrupted by user|^Interrupted by user/i.test(text.trim())
 }
 
 function oneLine(value: string): string {

@@ -16,9 +16,11 @@ import {
   maxLevel,
   parseCard,
   parseLines,
+  reapStale,
   roleOf,
   seconds,
   shortModel,
+  wasInterrupted,
   zoneOf,
 } from './parse'
 
@@ -178,7 +180,7 @@ async function startHunchCall(
     ...log,
     taskId: agentId === undefined ? (invocation.taskId ?? log.taskId) : log.taskId,
     total: log.total + 1,
-    calls: [...log.calls.filter(one => one.id !== id), call].slice(-HUNCH_KEEP),
+    calls: [...reapStale(log.calls, call.startedAt).filter(one => one.id !== id), call].slice(-HUNCH_KEEP),
   }))
   await refreshStatus($)
 }
@@ -190,6 +192,16 @@ async function finishHunchCall($: EngineInterface, id: string, result: ToolCallR
 
   const now = await $.clock.now()
   const isDenied = result.deny !== undefined
+
+  // The person stopped it: no verdict on Hunch, so no failure toast and no finish check.
+  if (!isDenied && wasInterrupted(result.result, resultText(result))) {
+    const stopped: HunchCall = { ...call, status: 'error', durationMs: now - call.startedAt, summary: 'interrupted', level: 'info' }
+    await update($, hunch, current => ({ ...current, calls: current.calls.map(one => (one.id === id ? stopped : one)) }))
+    await refreshStatus($)
+
+    return
+  }
+
   const isError = isDenied || result.isError === true
   const outcome = hunchOutcome(call.name, resultText(result), isError)
   const taskId = call.taskId ?? outcome.taskId
@@ -252,16 +264,17 @@ async function finishHunchCall($: EngineInterface, id: string, result: ToolCallR
   await refreshStatus($)
 }
 
-async function settleHunchCall($: EngineInterface, id: string) {
+/** Closes a call that got no result: `interrupted` (the dispatch was abandoned) is quiet, `lost` alerts. */
+async function settleHunchCall($: EngineInterface, id: string, why: 'interrupted' | 'lost') {
   const now = await $.clock.now()
+  const [level, summary] = why === 'interrupted' ? (['info', 'interrupted'] as const) : (['alert', 'aborted or not recorded'] as const)
   await update($, hunch, log => ({
     ...log,
     calls: log.calls.map(one =>
-      one.id === id && one.status === 'running'
-        ? { ...one, status: 'error' as const, level: 'alert' as const, durationMs: now - one.startedAt, summary: 'aborted or not recorded' }
-        : one,
+      one.id === id && one.status === 'running' ? { ...one, status: 'error' as const, level, durationMs: now - one.startedAt, summary } : one,
     ),
   }))
+  await refreshStatus($)
 }
 
 async function refreshStatus($: EngineInterface) {
@@ -403,7 +416,13 @@ export const register: Register = on => {
     if (name === undefined) return next(e)
 
     await startHunchCall($, e.tool_use_id, e.agentId, hunchInvocation(name, e as unknown as Record<string, unknown>))
+    const onAbort = () => void settleHunchCall($, e.tool_use_id, 'interrupted').catch(() => undefined)
+    next.signal.addEventListener('abort', onAbort, { once: true })
+    if (next.signal.aborted) onAbort()
     const result = await next(e)
+    next.signal.removeEventListener('abort', onAbort)
+    // Abandoned, then resolved late (e.g. backgrounded by a turn abort): keep it interrupted.
+    if (next.signal.aborted) return result
     await finishHunchCall($, e.tool_use_id, result)
 
     return result
@@ -411,7 +430,7 @@ export const register: Register = on => {
     try {
       return await next(e)
     } finally {
-      await settleHunchCall($, e.tool_use_id).catch(() => undefined)
+      await settleHunchCall($, e.tool_use_id, next.signal.aborted ? 'interrupted' : 'lost').catch(() => undefined)
     }
   })
 
@@ -420,7 +439,13 @@ export const register: Register = on => {
     if (invocation === undefined) return next(e)
 
     await startHunchCall($, e.tool_use_id, e.agentId, invocation)
+    const onAbort = () => void settleHunchCall($, e.tool_use_id, 'interrupted').catch(() => undefined)
+    next.signal.addEventListener('abort', onAbort, { once: true })
+    if (next.signal.aborted) onAbort()
     const result = await next(e)
+    next.signal.removeEventListener('abort', onAbort)
+    // Abandoned, then resolved late (e.g. backgrounded by a turn abort): keep it interrupted.
+    if (next.signal.aborted) return result
     await finishHunchCall($, e.tool_use_id, result)
 
     return result
@@ -428,7 +453,7 @@ export const register: Register = on => {
     try {
       return await next(e)
     } finally {
-      await settleHunchCall($, e.tool_use_id).catch(() => undefined)
+      await settleHunchCall($, e.tool_use_id, next.signal.aborted ? 'interrupted' : 'lost').catch(() => undefined)
     }
   })
 
@@ -601,7 +626,8 @@ export const register: Register = on => {
             label="clear done"
             onPress={async () => {
               await update($, agents, all => all.filter(agent => agent.status === 'running'))
-              await update($, hunch, log => ({ ...log, calls: log.calls.filter(call => call.status === 'running') }))
+              const now = await $.clock.now()
+              await update($, hunch, log => ({ ...log, calls: reapStale(log.calls, now).filter(call => call.status === 'running') }))
             }}
           />
         </Box>
