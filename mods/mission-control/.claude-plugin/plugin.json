@@ -1,0 +1,6 @@
+{
+  "name": "mission-control",
+  "version": "0.1.0",
+  "description": "Live coding-orchestrator cockpit: relay context zone, subagents in flight, report-card grades and the Jev decision feed.",
+  "types": "./types/index.d.ts"
+}
