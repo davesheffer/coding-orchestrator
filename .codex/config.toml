@@ -1,0 +1,7 @@
+# >>> hunch mcp (managed) >>>
+[mcp_servers.hunch]
+command = 'npx'
+args = ['-y', '--package=hunch-exact@npm:@davesheffer/hunch@1.43.0', 'hunch', 'mcp']
+# A cold npx install can exceed Codex's 10 s default; a slow start must not drop Hunch from the tool catalog.
+startup_timeout_sec = 60
+# <<< hunch mcp <<<

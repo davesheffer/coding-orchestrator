@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider vscode"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider vscode"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider vscode"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider vscode"
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider vscode"
+      }
+    ]
+  }
+}

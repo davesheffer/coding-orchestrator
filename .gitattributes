@@ -2,3 +2,10 @@
 *.sh text eol=lf
 **/bin/pr-status text eol=lf
 bin/pr-status text eol=lf
+.hunch/**/*.json merge=hunch
+.hunch/manifest.json merge=text
+CLAUDE.md merge=hunch-grounding
+AGENTS.md merge=hunch-grounding
+.github/copilot-instructions.md merge=hunch-grounding
+.cursor/rules/hunch.mdc merge=hunch-grounding
+.windsurf/rules/hunch.md merge=hunch-grounding

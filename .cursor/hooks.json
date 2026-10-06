@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider cursor"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider cursor"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider cursor"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider cursor"
+      }
+    ],
+    "stop": [
+      {
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider cursor"
+      }
+    ]
+  },
+  "version": 1
+}

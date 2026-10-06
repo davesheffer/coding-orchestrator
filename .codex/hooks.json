@@ -1,0 +1,76 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider codex"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider codex"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "apply_patch|Bash|PowerShell|shell|local_shell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider codex"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch|Bash|PowerShell|shell|local_shell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider codex"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider codex"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider codex"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider codex"
+          }
+        ]
+      }
+    ]
+  }
+}

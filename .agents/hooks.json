@@ -1,0 +1,30 @@
+{
+  "hunch": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider antigravity",
+        "timeout": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider antigravity",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider antigravity",
+        "timeout": 15
+      }
+    ]
+  }
+}
