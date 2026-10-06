@@ -157,8 +157,15 @@ class SessionFocusTests(unittest.TestCase):
         self.assertEqual(self.run_focus(), (1, "session process 500 is gone (stale registry file)"))
 
     def test_unreadable_creation_time_on_windows_is_not_proof_of_life(self):
-        self.register(procStart="134357575816763395")
+        # Patching os.name makes pathlib build WindowsPath on POSIX, so stub it only around
+        # is_alive (which builds no paths) and run the end-to-end check on real Windows.
+        entry = {"pid": 500, "procStart": "134357575816763395"}
         with patch.object(focus.os, "name", "nt"):
+            self.assertFalse(focus.is_alive(entry, dict(PARENTS), start=self.starts.get))
+        with patch.object(focus.os, "name", "posix"):
+            self.assertTrue(focus.is_alive(entry, dict(PARENTS), start=self.starts.get))
+        if os.name == "nt":
+            self.register(procStart="134357575816763395")
             self.assertEqual(self.run_focus(), (1, "session process 500 is gone (stale registry file)"))
 
     def test_matching_creation_time_is_live(self):
