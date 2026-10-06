@@ -39,11 +39,15 @@ class CodexInstallTests(unittest.TestCase):
             self.assertEqual(install_module.platform_python(), "python3")
 
     def test_windows_hook_command_rejects_shell_expandable_paths(self):
+        # Build paths before patching os.name: Python 3.11 refuses to create a
+        # WindowsPath on a POSIX host once os.name reads "nt".
+        good = Path("C:/Users/me/.codex")
+        bad = {char: Path(f"C:/Users/a{char}b/.codex") for char in '%$`"'}
         with mock.patch.object(install_module.os, "name", "nt"):
-            self.assertIn('"', install_module.hook_command(Path("C:/Users/me/.codex")))
-            for char in '%$`"':
+            self.assertIn('"', install_module.hook_command(good))
+            for char, path in bad.items():
                 with self.subTest(char=char), self.assertRaises(ValueError):
-                    install_module.hook_command(Path(f"C:/Users/a{char}b/.codex"))
+                    install_module.hook_command(path)
         with mock.patch.object(install_module.os, "name", "posix"):
             self.assertIn("jev-hook.py", install_module.hook_command(self.home / "a%b"))
 
