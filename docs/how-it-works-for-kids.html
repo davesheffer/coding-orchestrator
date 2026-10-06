@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My AI Coding Team</title>
+<style>
+  :root {
+    --ink: #1e1b2e;
+    --muted: #5b5870;
+    --paper: #ffffff;
+    --chef: #6d4aff;   --chef-bg: #efeaff;
+    --scout: #0e7490;  --scout-bg: #e0f5f9;
+    --runner: #b45309; --runner-bg: #fff3df;
+    --builder: #15803d;--builder-bg: #e3f6e8;
+    --critic: #c0262d; --critic-bg: #fde8e8;
+    --you: #334155;    --you-bg: #eef1f5;
+    --jev: #0f766e;    --jev-bg: #dcf5f1;
+    --ask: #a16207;    --ask-bg: #fff8d6;
+  }
+  @page { size: A4; margin: 14mm 16mm 14mm 16mm; }
+  * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  html, body { background: var(--paper); color: var(--ink); }
+  body { font-family: "Segoe UI", system-ui, sans-serif; font-size: 11.5pt; line-height: 1.5; margin: 0; }
+  .page { break-after: page; }
+  .page:last-child { break-after: auto; }
+  h1 { font-size: 30pt; line-height: 1.1; margin: 0 0 6px; letter-spacing: -0.5px; }
+  h2 { font-size: 18pt; margin: 0 0 6px; color: var(--chef); }
+  h3 { font-size: 13pt; margin: 14px 0 4px; }
+  p { margin: 0 0 8px; }
+  .lead { font-size: 13pt; color: var(--muted); }
+  .kicker { text-transform: uppercase; letter-spacing: 2px; font-size: 9pt; font-weight: 700; color: var(--chef); }
+  .motto { margin: 18px 0; padding: 14px 18px; border-radius: 14px; background: var(--chef-bg); border-left: 6px solid var(--chef); font-size: 14pt; }
+  .motto b { color: var(--chef); }
+  .note { padding: 10px 14px; border-radius: 10px; background: var(--ask-bg); border: 1px solid #f0d97a; margin: 10px 0; font-size: 10.5pt; }
+  .note b { color: var(--ask); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+  .card { border-radius: 12px; padding: 10px 12px; border: 2px solid; break-inside: avoid; }
+  .card h3 { margin: 0 0 2px; font-size: 12.5pt; }
+  .card .model { font-size: 9pt; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+  .card p { margin: 4px 0 0; font-size: 10.5pt; }
+  .card.chef { border-color: var(--chef); background: var(--chef-bg); grid-column: span 2; }
+  .card.chef h3, .card.chef .model { color: var(--chef); }
+  .card.scout { border-color: var(--scout); background: var(--scout-bg); }
+  .card.scout h3, .card.scout .model { color: var(--scout); }
+  .card.runner { border-color: var(--runner); background: var(--runner-bg); }
+  .card.runner h3, .card.runner .model { color: var(--runner); }
+  .card.builder { border-color: var(--builder); background: var(--builder-bg); }
+  .card.builder h3, .card.builder .model { color: var(--builder); }
+  .card.critic { border-color: var(--critic); background: var(--critic-bg); }
+  .card.critic h3, .card.critic .model { color: var(--critic); }
+  .rc { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0; }
+  .rc div { border-radius: 10px; padding: 8px 10px; background: var(--you-bg); font-size: 10pt; }
+  .rc b { display: block; font-size: 10.5pt; color: var(--chef); letter-spacing: 0.5px; }
+  .rc i { color: var(--muted); }
+  ol, ul { margin: 4px 0 8px; padding-left: 22px; }
+  li { margin: 2px 0; }
+  figure { margin: 8px 0 6px; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figure.f1 svg { height: 222mm; width: auto; margin: 0 auto; }
+  figure.f2 svg { height: 102mm; width: auto; margin: 0 auto; }
+  figure.f3 svg { height: 112mm; width: auto; margin: 0 auto; }
+  figcaption { font-size: 9.5pt; color: var(--muted); text-align: center; margin-top: 2px; }
+  .gauge { display: flex; height: 30px; border-radius: 8px; overflow: hidden; font-weight: 700; font-size: 10pt; color: #fff; margin: 8px 0 2px; }
+  .gauge div { display: flex; align-items: center; justify-content: center; }
+  .gauge-scale { position: relative; height: 14px; font-size: 8.5pt; color: var(--muted); margin-bottom: 8px; }
+  .gauge-scale span { position: absolute; transform: translateX(-50%); }
+  .gauge-scale span:first-child { left: 0; transform: none; }
+  .gauge-scale span:last-child { left: auto; transform: none; }
+  table.tight { font-size: 10pt; }
+  table.tight td, table.tight th { padding: 4px 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 10.5pt; margin: 8px 0; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; vertical-align: top; }
+  th { background: var(--you-bg); }
+  .rules li { margin: 6px 0; }
+  .cover-art { margin: 26px 0 18px; }
+  code { font-family: Consolas, monospace; font-size: 10pt; background: var(--you-bg); padding: 0 4px; border-radius: 4px; }
+
+  /* flowchart styles */
+  svg text { font-family: "Segoe UI", system-ui, sans-serif; fill: var(--ink); }
+  svg .t { font-size: 14px; font-weight: 700; }
+  svg .s { font-size: 12px; fill: #3d3a50; }
+  svg .xs { font-size: 10.5px; fill: #3d3a50; }
+  svg .lbl { font-size: 11px; font-weight: 700; fill: var(--muted); }
+  svg .line { stroke: #4b4860; stroke-width: 2; fill: none; }
+  svg .dash { stroke-dasharray: 5 4; }
+  svg .you { fill: var(--you-bg); stroke: var(--you); stroke-width: 2; }
+  svg .chef { fill: var(--chef-bg); stroke: var(--chef); stroke-width: 2; }
+  svg .scout { fill: var(--scout-bg); stroke: var(--scout); stroke-width: 2; }
+  svg .runner { fill: var(--runner-bg); stroke: var(--runner); stroke-width: 2; }
+  svg .builder { fill: var(--builder-bg); stroke: var(--builder); stroke-width: 2; }
+  svg .critic { fill: var(--critic-bg); stroke: var(--critic); stroke-width: 2; }
+  svg .jev { fill: var(--jev-bg); stroke: var(--jev); stroke-width: 2; }
+  svg .ask { fill: var(--ask-bg); stroke: var(--ask); stroke-width: 2; }
+  svg .ok { fill: #e3f6e8; stroke: #15803d; stroke-width: 2; }
+  svg .stop { fill: #fde8e8; stroke: #c0262d; stroke-width: 2; }
+  svg .amber { fill: #fff3df; stroke: #b45309; stroke-width: 2; }
+  svg .noteb { fill: #fafafa; stroke: #9a97ad; stroke-width: 1.5; stroke-dasharray: 5 4; }
+</style>
+</head>
+<body>
+
+<!-- ============ PAGE 1: COVER + BIG IDEA ============ -->
+<section class="page">
+  <div class="kicker">A guide to the Coding Orchestrator</div>
+  <h1>How my AI coding team works</h1>
+  <p class="lead">One smart AI becomes a whole team: a boss who thinks, helpers who do the busy work, a critic who hunts for mistakes, and safety guards that stop big accidents.</p>
+
+  <div class="motto">The motto: <b>cheap hands, expensive eyes.</b><br>
+  Let fast, cheap helpers do the running around. Keep the smartest brain for thinking, judging, and checking.</div>
+
+  <h3>First, what problem does this solve?</h3>
+  <p>Claude Code is an AI that can read and write computer code. If you let <b>one</b> AI do everything by itself, two things go wrong:</p>
+  <ul>
+    <li><b>It's expensive.</b> The smartest AI model costs the most. Using it to read hundreds of files is like hiring a top surgeon to sweep the hospital floor.</li>
+    <li><b>Its memory fills up.</b> An AI can only hold so much text in its head at once. This is called its <b>context</b>, and it's measured in <b>tokens</b> (small pieces of words). When it gets too full, the AI gets slower and starts forgetting details.</li>
+  </ul>
+
+  <h3>The fix: run it like a restaurant kitchen</h3>
+  <p>A great restaurant doesn't have the head chef chop every onion. The head chef plans the menu, gives clear orders, and <b>tastes every dish before it leaves the kitchen</b>. The kitchen helpers do the chopping, stirring, and timing.</p>
+  <p>The Coding Orchestrator is a set of <b>rules, helpers, and safety tools</b> that makes Claude work the same way. The "orchestrator" is the head chef (like the conductor of an orchestra, who doesn't play every instrument but keeps everyone together).</p>
+
+  <svg class="cover-art" viewBox="0 0 680 150" role="img" aria-label="The head chef in the middle, connected to four helpers">
+    <defs><marker id="a0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b4860"/></marker></defs>
+    <rect class="chef" x="250" y="8" width="180" height="52" rx="12"/>
+    <text class="t" x="340" y="31" text-anchor="middle">Head Chef</text>
+    <text class="s" x="340" y="49" text-anchor="middle">the orchestrator · Opus 5.5</text>
+    <path class="line" d="M340,60 V78 M85,78 H595 M85,78 V92 M255,78 V92 M425,78 V92 M595,78 V92" />
+    <rect class="scout" x="10" y="94" width="150" height="48" rx="10"/>
+    <text class="t" x="85" y="115" text-anchor="middle">Scout</text><text class="s" x="85" y="132" text-anchor="middle">finds &amp; reads</text>
+    <rect class="runner" x="180" y="94" width="150" height="48" rx="10"/>
+    <text class="t" x="255" y="115" text-anchor="middle">Runner</text><text class="s" x="255" y="132" text-anchor="middle">runs the tests</text>
+    <rect class="builder" x="350" y="94" width="150" height="48" rx="10"/>
+    <text class="t" x="425" y="115" text-anchor="middle">Builder</text><text class="s" x="425" y="132" text-anchor="middle">makes the change</text>
+    <rect class="critic" x="520" y="94" width="150" height="48" rx="10"/>
+    <text class="t" x="595" y="115" text-anchor="middle">Critic</text><text class="s" x="595" y="132" text-anchor="middle">hunts for mistakes</text>
+  </svg>
+</section>
+
+<!-- ============ PAGE 2: THE TEAM ============ -->
+<section class="page">
+  <h2>Meet the team</h2>
+  <p>Each team member is an AI with one job. They use different AI <b>models</b> (different "brains"): bigger brains think better but cost more, so each job gets the brain it actually needs.</p>
+
+  <div class="grid">
+    <div class="card chef">
+      <div class="model">Head Chef · the orchestrator · Opus 5.5 (the big thinker)</div>
+      <h3>Plans, decides, and checks everything</h3>
+      <p>Talks to you, figures out what you really need, splits the work into small jobs, and writes each helper a clear set of instructions (a <b>brief</b>). It makes the hard calls: design choices, finding the real cause of a bug, anything about security. And it <b>checks the helpers' work</b> before telling you it's done.</p>
+    </div>
+    <div class="card scout">
+      <div class="model">Scout · Sonnet (fast &amp; cheap)</div>
+      <h3>The researcher</h3>
+      <p>Finds files, reads code, and sends back a short summary. It only <b>reads</b>; it never changes anything. This saves the head chef from stuffing its memory with whole files.</p>
+    </div>
+    <div class="card runner">
+      <div class="model">Runner · Sonnet (fast &amp; cheap)</div>
+      <h3>The tester</h3>
+      <p>Runs the exact command it's given (like "run all the tests") and reports what happened: did it pass or fail, and the exact error. It doesn't try to fix anything. Test output can be thousands of lines long; the runner boils it down.</p>
+    </div>
+    <div class="card builder">
+      <div class="model">Builder · Sonnet (fast &amp; cheap)</div>
+      <h3>The maker</h3>
+      <p>Makes a change that has <b>already been decided</b> ("add this button in this file"), then runs a check to prove it works. The thinking about <i>what</i> to build was done by the head chef. The builder never commits or pushes.</p>
+    </div>
+    <div class="card critic">
+      <div class="model">Critic · Fable (sharp-eyed reviewer)</div>
+      <h3>The fault-finder</h3>
+      <p>Its only job is to find what's <b>wrong</b>. It starts with "fresh eyes": it doesn't see the head chef's reasoning, so it can't be talked into agreeing. Called in for risky changes: security, deleting data, things other programs depend on.</p>
+    </div>
+  </div>
+
+  <div class="note"><b>Small jobs skip the team.</b> If something takes about three steps or fewer, the head chef just does it. Writing a brief for a helper would take longer than doing the job. (But a risky small job still gets the critic.)</div>
+
+</section>
+
+<section class="page">
+  <h2>Who does what, and with which brain</h2>
+  <h3 style="margin-top:4px">The golden rule about big actions</h3>
+  <p>Some actions reach outside your computer and are hard to undo: <b>pushing</b> code to GitHub, <b>publishing</b>, <b>deploying</b> a website, <b>deleting</b> things, and <b>sending</b> messages. Helpers are never allowed to do these. Only the head chef can, and only when <b>you</b> have said yes.</p>
+  <h3>Which model does what</h3>
+  <table class="tight">
+    <tr><th style="width:15%">Role</th><th style="width:16%">Claude Code</th><th style="width:22%">Codex</th><th>Why that one</th></tr>
+    <tr><td><b>Head chef</b></td><td>Opus 5.5</td><td>GPT-6.1 Sol · medium</td><td>Hard decisions and final checking need the strongest brain.</td></tr>
+    <tr><td><b>Scout</b></td><td>Sonnet</td><td>GPT-6 Luna · low</td><td>Reading and summarizing: fast and cheap is enough.</td></tr>
+    <tr><td><b>Runner</b></td><td>Sonnet</td><td>GPT-6 Luna · low</td><td>Just runs a command and reports what came out.</td></tr>
+    <tr><td><b>Builder</b></td><td>Sonnet</td><td>GPT-6.1 Sol · medium</td><td>Writes code from a plan that's already decided.</td></tr>
+    <tr><td><b>Critic</b></td><td>Fable</td><td>GPT-6 Astra · high</td><td>A different, sharp brain that's good at spotting mistakes.</td></tr>
+    <tr><td><b>Jev</b></td><td colspan="2">jev-latest (TypeSafe)</td><td>A small, fast judge for quick questions and scores. It can move a helper to a bigger brain (Sonnet → Opus/Fable) when a job is hard.</td></tr>
+  </table>
+</section>
+
+<!-- ============ PAGE 3: FLOW 1 ============ -->
+<section class="page">
+  <h2>Flowchart 1: the life of a request</h2>
+  <p>Here's what happens from the moment you ask for something until you get an answer. Diamonds are questions; follow the "yes" or "no" arrow.</p>
+
+  <figure class="f1">
+  <svg viewBox="0 0 680 945" role="img" aria-label="Flowchart of a request moving through the head chef, helpers, checks, critic and final report">
+    <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b4860"/></marker></defs>
+
+    <!-- A: you ask -->
+    <rect class="you" x="200" y="10" width="280" height="46" rx="12"/>
+    <text class="t" x="340" y="30" text-anchor="middle">You ask for something</text>
+    <text class="s" x="340" y="47" text-anchor="middle">e.g. "add a dark-mode button"</text>
+    <path class="line" d="M340,56 V78" marker-end="url(#a1)"/>
+
+    <!-- B: chef thinks -->
+    <rect class="chef" x="170" y="80" width="340" height="50" rx="12"/>
+    <text class="t" x="340" y="101" text-anchor="middle">Head Chef (Opus 5.5) thinks it through</text>
+    <text class="s" x="340" y="119" text-anchor="middle">What's really needed? What's the plan?</text>
+    <path class="line" d="M340,130 V146" marker-end="url(#a1)"/>
+
+    <!-- D1: small job? -->
+    <polygon class="ask" points="340,148 450,183 340,218 230,183"/>
+    <text class="t" x="340" y="181" text-anchor="middle">Small job?</text>
+    <text class="xs" x="340" y="196" text-anchor="middle">(about 3 steps)</text>
+    <path class="line" d="M230,183 H202" marker-end="url(#a1)"/>
+    <text class="lbl" x="216" y="176" text-anchor="middle">yes</text>
+    <rect class="chef" x="30" y="160" width="170" height="46" rx="10"/>
+    <text class="t" x="115" y="180" text-anchor="middle">Head Chef does it</text>
+    <text class="s" x="115" y="197" text-anchor="middle">alone (it's faster)</text>
+    <path class="line" d="M30,183 H14 V630 H218" marker-end="url(#a1)"/>
+    <text class="lbl" x="24" y="620">risk check still applies</text>
+    <path class="line" d="M340,218 V238" marker-end="url(#a1)"/>
+    <text class="lbl" x="348" y="232">no</text>
+
+    <!-- C: split -->
+    <rect class="chef" x="170" y="240" width="340" height="50" rx="12"/>
+    <text class="t" x="340" y="261" text-anchor="middle">Split it into small jobs</text>
+    <text class="s" x="340" y="279" text-anchor="middle">Write each helper a clear, exact brief</text>
+    <path class="line" d="M340,290 V305 M130,305 H550"/>
+    <path class="line" d="M130,305 V320" marker-end="url(#a1)"/>
+    <path class="line" d="M340,305 V320" marker-end="url(#a1)"/>
+    <path class="line" d="M550,305 V320" marker-end="url(#a1)"/>
+
+    <!-- helpers -->
+    <rect class="scout" x="40" y="322" width="180" height="58" rx="10"/>
+    <text class="t" x="130" y="346" text-anchor="middle">Scout</text>
+    <text class="s" x="130" y="365" text-anchor="middle">finds &amp; reads the code</text>
+    <rect class="runner" x="250" y="322" width="180" height="58" rx="10"/>
+    <text class="t" x="340" y="346" text-anchor="middle">Runner</text>
+    <text class="s" x="340" y="365" text-anchor="middle">runs tests &amp; builds</text>
+    <rect class="builder" x="460" y="322" width="180" height="58" rx="10"/>
+    <text class="t" x="550" y="346" text-anchor="middle">Builder</text>
+    <text class="s" x="550" y="365" text-anchor="middle">makes the change</text>
+    <path class="line" d="M130,380 V398 H550 M340,380 V398 M550,380 V398"/>
+    <path class="line" d="M340,398 V412" marker-end="url(#a1)"/>
+
+    <!-- report card -->
+    <rect class="chef" x="160" y="414" width="360" height="50" rx="12"/>
+    <text class="t" x="340" y="435" text-anchor="middle">A report card comes back</text>
+    <text class="xs" x="340" y="453" text-anchor="middle">RESULT · EVIDENCE · CONFIDENCE · UNVERIFIED</text>
+    <path class="line" d="M340,464 V482" marker-end="url(#a1)"/>
+
+    <!-- D2: proof good? -->
+    <polygon class="ask" points="340,484 450,519 340,554 230,519"/>
+    <text class="t" x="340" y="516" text-anchor="middle">Is the proof</text>
+    <text class="t" x="340" y="533" text-anchor="middle">good enough?</text>
+    <path class="line" d="M450,519 H488" marker-end="url(#a1)"/>
+    <text class="lbl" x="466" y="512" text-anchor="middle">no</text>
+    <rect class="amber" x="490" y="490" width="178" height="62" rx="10"/>
+    <text class="t" x="579" y="510" text-anchor="middle">Not sure?</text>
+    <text class="s" x="579" y="526" text-anchor="middle">Head Chef checks it,</text>
+    <text class="s" x="579" y="542" text-anchor="middle">or a stronger helper</text>
+    <path class="line" d="M579,490 V382" marker-end="url(#a1)"/>
+    <text class="lbl" x="586" y="445">try again</text>
+    <path class="line" d="M340,554 V593" marker-end="url(#a1)"/>
+    <text class="lbl" x="348" y="578">yes</text>
+
+    <!-- D3: risky? -->
+    <polygon class="ask" points="340,595 460,630 340,665 220,630"/>
+    <text class="t" x="340" y="628" text-anchor="middle">Is it risky?</text>
+    <text class="xs" x="340" y="643" text-anchor="middle">(security, data, APIs)</text>
+    <path class="line" d="M460,630 H488" marker-end="url(#a1)"/>
+    <text class="lbl" x="474" y="622" text-anchor="middle">yes</text>
+    <rect class="critic" x="490" y="600" width="178" height="60" rx="10"/>
+    <text class="t" x="579" y="621" text-anchor="middle">Critic (Fable)</text>
+    <text class="s" x="579" y="637" text-anchor="middle">attacks it with</text>
+    <text class="s" x="579" y="652" text-anchor="middle">fresh eyes</text>
+    <path class="line" d="M579,660 V688" marker-end="url(#a1)"/>
+    <rect class="chef" x="490" y="690" width="178" height="42" rx="10"/>
+    <text class="t" x="579" y="716" text-anchor="middle">Fix what it finds</text>
+    <path class="line" d="M490,712 H462" marker-end="url(#a1)"/>
+    <path class="line" d="M340,665 V688" marker-end="url(#a1)"/>
+    <text class="lbl" x="348" y="681">no</text>
+
+    <!-- E: final checks -->
+    <rect class="runner" x="200" y="690" width="260" height="50" rx="12"/>
+    <text class="t" x="330" y="711" text-anchor="middle">Run the final checks</text>
+    <text class="s" x="330" y="729" text-anchor="middle">the tests must really pass</text>
+    <path class="line" d="M340,740 V760" marker-end="url(#a1)"/>
+
+    <!-- D4: big action -->
+    <polygon class="ask" points="340,762 470,800 340,838 210,800"/>
+    <text class="t" x="340" y="797" text-anchor="middle">Big outside action?</text>
+    <text class="xs" x="340" y="812" text-anchor="middle">(push · deploy · delete · send)</text>
+    <path class="line" d="M210,800 H187" marker-end="url(#a1)"/>
+    <text class="lbl" x="198" y="792" text-anchor="middle">yes</text>
+    <rect class="you" x="20" y="776" width="165" height="48" rx="10"/>
+    <text class="t" x="102" y="797" text-anchor="middle">Ask YOU first</text>
+    <text class="s" x="102" y="814" text-anchor="middle">you hold the keys</text>
+    <path class="line" d="M102,824 V897 H168" marker-end="url(#a1)"/>
+    <path class="line" d="M340,838 V868" marker-end="url(#a1)"/>
+    <text class="lbl" x="348" y="858">no</text>
+
+    <!-- F: report -->
+    <rect class="you" x="170" y="870" width="340" height="56" rx="12"/>
+    <text class="t" x="340" y="893" text-anchor="middle">Report back to you</text>
+    <text class="s" x="340" y="912" text-anchor="middle">what ran · what passed · what's still unchecked</text>
+  </svg>
+  <figcaption>Purple = head chef · blue/orange/green = helpers · red = critic · yellow diamonds = questions</figcaption>
+  </figure>
+</section>
+
+<!-- ============ PAGE 4: WALKTHROUGH + REPORT CARD ============ -->
+<section class="page">
+  <h2>A real example, step by step</h2>
+  <p>Say you ask: <i>"Add a dark-mode button to my app."</i></p>
+  <ol>
+    <li><b>Head chef thinks.</b> Where do colors live in this app? Is there already a settings screen? This is too big for three steps, so it splits the work.</li>
+    <li><b>Scout goes looking.</b> Brief: "Find where the app's colors and settings screen are defined. Don't change anything." Scout comes back with: "Colors are in <code>theme.dart</code> lines 10–40; settings screen is <code>settings.dart</code>."</li>
+    <li><b>Head chef designs the change</b> using that summary, without having to read every file itself.</li>
+    <li><b>Builder makes it.</b> Brief: "Add a dark theme in <code>theme.dart</code> and a switch in <code>settings.dart</code>. Then run the settings tests." Builder returns its report card <i>and</i> the actual change (called a <b>diff</b>), which the head chef reads.</li>
+    <li><b>Runner runs all the tests</b> and reports: "312 passed, 0 failed, exit code 0."</li>
+    <li><b>Risky?</b> A color switch isn't a security change, so no critic needed this time.</li>
+    <li><b>Head chef reports to you:</b> what changed, which tests ran and passed, and anything it couldn't check (for example, "I didn't look at it on a real phone").</li>
+  </ol>
+
+  <h2 style="margin-top:16px">The report card</h2>
+  <p>Every helper must answer with the same four sections. It's like showing your work in math class: an answer without working gets marked down.</p>
+  <div class="rc">
+    <div><b>RESULT</b>What happened, in one or two lines.<br><i>"Added the dark-mode switch."</i></div>
+    <div><b>EVIDENCE</b>Proof: commands run and their real results.<br><i>"Tests: 14 passed, exit code 0."</i></div>
+    <div><b>CONFIDENCE</b>How sure: high, medium, or low.<br><i>"High."</i></div>
+    <div><b>UNVERIFIED</b>What it did <u>not</u> check.<br><i>"Didn't test on iPhone."</i></div>
+  </div>
+
+  <h3>Why not just trust the helpers?</h3>
+  <p>Helpers use cheaper, faster brains, so they sometimes make mistakes or sound more sure than they should. The rules say:</p>
+  <ul>
+    <li>If the evidence is <b>missing</b>, or confidence is only <b>low or medium</b>, the head chef doesn't just ask the same helper again. It <b>checks it itself</b>, or <b>moves the job up one level</b> (scout or runner → builder → head chef).</li>
+    <li>The head chef always <b>reads the builder's actual change</b>, not just the summary.</li>
+    <li>Checks must be run <b>after the last edit</b>. A test that passed before a change proves nothing about after it.</li>
+    <li>"I think it works" is not a result. A result is a command that ran, plus its <b>exit code</b> (0 means success; anything else means something failed).</li>
+  </ul>
+
+  <div class="note"><b>Fun fact:</b> the critic is handed only the change and the claim to attack, never the head chef's conclusions. If you tell a reviewer "I'm pretty sure this is fine," they tend to agree. Fresh eyes catch more.</div>
+</section>
+
+<!-- ============ PAGE 5: JEV ============ -->
+<section class="page">
+  <h2>Flowchart 2: the safety guard (Jev)</h2>
+  <p><b>Jev</b> is a small, very fast AI judge from a company called TypeSafe. It's an optional add-on (switched on here). It never writes code. It just answers quick questions like "how risky is this?" in a split second. The orchestrator uses it in a few places. The most important one is a <b>guard at the door</b> before code is saved into history (<code>git commit</code>) or shared online (<code>git push</code>).</p>
+
+  <figure class="f2">
+  <svg viewBox="0 0 680 555" role="img" aria-label="Flowchart of the Jev risk gate before git commit and git push">
+    <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b4860"/></marker></defs>
+
+    <rect class="chef" x="260" y="10" width="340" height="50" rx="12"/>
+    <text class="t" x="430" y="31" text-anchor="middle">Head Chef runs git commit / git push</text>
+    <text class="s" x="430" y="49" text-anchor="middle">(save the work / share it online)</text>
+    <path class="line" d="M430,60 V78" marker-end="url(#a2)"/>
+
+    <rect class="jev" x="260" y="80" width="340" height="46" rx="12"/>
+    <text class="t" x="430" y="100" text-anchor="middle">Jev guard looks at the change first</text>
+    <text class="s" x="430" y="117" text-anchor="middle">secret files and keys are blanked out before sending</text>
+    <path class="line" d="M430,126 V144" marker-end="url(#a2)"/>
+
+    <!-- D1 -->
+    <polygon class="ask" points="430,146 540,181 430,216 320,181"/>
+    <text class="t" x="430" y="179" text-anchor="middle">Could Jev answer?</text>
+    <text class="xs" x="430" y="194" text-anchor="middle">(online, working)</text>
+    <path class="line" d="M320,181 H257" marker-end="url(#a2)"/>
+    <text class="lbl" x="290" y="173" text-anchor="middle">no</text>
+
+    <!-- D2 push? -->
+    <polygon class="ask" points="155,146 255,181 155,216 55,181"/>
+    <text class="t" x="155" y="179" text-anchor="middle">Push or</text>
+    <text class="t" x="155" y="195" text-anchor="middle">commit?</text>
+    <path class="line" d="M155,216 V232 M75,232 H215"/>
+    <path class="line" d="M75,232 V248" marker-end="url(#a2)"/>
+    <path class="line" d="M215,232 V248" marker-end="url(#a2)"/>
+    <text class="lbl" x="66" y="244" text-anchor="end">push</text>
+    <text class="lbl" x="224" y="244">commit</text>
+    <rect class="stop" x="10" y="250" width="130" height="80" rx="10"/>
+    <text class="t" x="75" y="272" text-anchor="middle">Blocked</text>
+    <text class="s" x="75" y="290" text-anchor="middle">waits until Jev</text>
+    <text class="s" x="75" y="305" text-anchor="middle">is back (or you</text>
+    <text class="s" x="75" y="320" text-anchor="middle">push it yourself)</text>
+    <rect class="ok" x="150" y="250" width="130" height="80" rx="10"/>
+    <text class="t" x="215" y="272" text-anchor="middle">Allowed</text>
+    <text class="s" x="215" y="290" text-anchor="middle">commits stay on</text>
+    <text class="s" x="215" y="305" text-anchor="middle">your computer,</text>
+    <text class="s" x="215" y="320" text-anchor="middle">so less risky</text>
+
+    <path class="line" d="M430,216 V238" marker-end="url(#a2)"/>
+    <text class="lbl" x="438" y="232">yes</text>
+
+    <rect class="jev" x="310" y="240" width="240" height="50" rx="12"/>
+    <text class="t" x="430" y="261" text-anchor="middle">Jev scores the risk</text>
+    <text class="s" x="430" y="279" text-anchor="middle">security · data loss · public API</text>
+    <path class="line" d="M430,290 V308" marker-end="url(#a2)"/>
+
+    <!-- D3 -->
+    <polygon class="ask" points="430,310 555,350 430,390 305,350"/>
+    <text class="t" x="430" y="347" text-anchor="middle">Risky, with no critic</text>
+    <text class="t" x="430" y="364" text-anchor="middle">since the last edit?</text>
+    <path class="line" d="M555,350 H573" marker-end="url(#a2)"/>
+    <text class="lbl" x="563" y="342" text-anchor="middle">no</text>
+    <rect class="ok" x="575" y="325" width="100" height="50" rx="10"/>
+    <text class="t" x="625" y="355" text-anchor="middle">Allowed</text>
+    <path class="line" d="M430,390 V413" marker-end="url(#a2)"/>
+    <text class="lbl" x="438" y="406">yes</text>
+
+    <rect class="stop" x="280" y="415" width="300" height="50" rx="12"/>
+    <text class="t" x="430" y="436" text-anchor="middle">Stopped once</text>
+    <text class="s" x="430" y="454" text-anchor="middle">"get a critic review first"</text>
+    <path class="line" d="M430,465 V483" marker-end="url(#a2)"/>
+
+    <rect class="critic" x="280" y="485" width="300" height="50" rx="12"/>
+    <text class="t" x="430" y="506" text-anchor="middle">Critic reviews → fix → try again</text>
+    <text class="s" x="430" y="524" text-anchor="middle">now the guard sees a fresh critic run</text>
+    <path class="line" d="M580,510 H625 V377" marker-end="url(#a2)"/>
+
+    <!-- note -->
+    <rect class="noteb" x="10" y="360" width="250" height="150" rx="10"/>
+    <text class="t" x="24" y="384">A speed bump, not a wall</text>
+    <text class="s" x="24" y="406">If Jev is working, the "stopped once"</text>
+    <text class="s" x="24" y="423">is a warning: trying the exact same</text>
+    <text class="s" x="24" y="440">command again lets it through. The</text>
+    <text class="s" x="24" y="457">real decision stays with the Head Chef</text>
+    <text class="s" x="24" y="474">and you. Only a push while Jev is</text>
+    <text class="s" x="24" y="491">down stays blocked on every retry.</text>
+  </svg>
+  <figcaption>Teal = Jev · green = allowed · red = stopped</figcaption>
+  </figure>
+
+  <h3>Jev's other jobs</h3>
+  <table class="tight">
+    <tr><th style="width:26%">Job</th><th>What Jev does</th></tr>
+    <tr><td><b>Pick the brain size</b></td><td>Before a helper starts, Jev reads the task and suggests which model should do it. It moves a job to a bigger brain easily (doing a hard job with a small brain is the expensive mistake) but needs to be very sure before moving one to a smaller brain. The critic is never moved.</td></tr>
+    <tr><td><b>Check report cards</b></td><td>If a helper's report is missing a section, or the evidence doesn't back up the result, it's sent back <b>once</b> to fix it.</td></tr>
+    <tr><td><b>Spot a topic change</b></td><td>If your new message is about something totally different, it says "start a fresh session" (see the next page).</td></tr>
+    <tr><td><b>Grade handoff notes</b></td><td>Scores the "baton" note from 0 to 4 (next page). A weak note isn't saved until it's fixed.</td></tr>
+    <tr><td><b>Answer questions about files</b></td><td><code>ask-jev</code> lets the head chef ask "which of these files handles logins?" without reading them all into its own memory.</td></tr>
+  </table>
+  <p style="font-size:10pt;color:var(--muted)">If Jev is offline, almost everything just works the way it did without Jev ("fails open"). The one exception is pushing code online, which is too important to wave through unchecked ("fails closed").</p>
+</section>
+
+<!-- ============ PAGE 6: RELAY ============ -->
+<section class="page">
+  <h2>Flowchart 3: the relay race (when memory fills up)</h2>
+  <p>Remember the AI's memory (its <b>context</b>) has a limit. A little program called the <b>relay</b> checks how full it is every time you send a message, and shows a fuel gauge:</p>
+
+  <div class="gauge">
+    <div style="flex:150;background:#15803d">GREEN · keep working</div>
+    <div style="flex:100;background:#b45309">AMBER · start wrapping up</div>
+    <div style="flex:60;background:#c0262d">RED · hand off</div>
+  </div>
+  <div class="gauge-scale"><span>0 tokens</span><span style="left:48.4%">150,000</span><span style="left:80.6%">250,000</span><span style="right:0">full</span></div>
+
+  <p>Like a relay race: when one runner gets tired, they pass the <b>baton</b> to a fresh runner, who carries on from exactly the same spot. Here the baton is a written <b>handoff note</b>.</p>
+
+  <figure class="f3">
+  <svg viewBox="0 0 680 520" role="img" aria-label="Flowchart of the relay: gauge zones, writing a handoff note, grading it, opening a fresh session">
+    <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b4860"/></marker></defs>
+
+    <rect class="you" x="170" y="10" width="340" height="50" rx="12"/>
+    <text class="t" x="340" y="31" text-anchor="middle">You send a message</text>
+    <text class="s" x="340" y="49" text-anchor="middle">the relay checks how full the memory is</text>
+    <path class="line" d="M340,60 V74 M115,74 H565"/>
+    <path class="line" d="M115,74 V90" marker-end="url(#a3)"/>
+    <path class="line" d="M340,74 V90" marker-end="url(#a3)"/>
+    <path class="line" d="M565,74 V90" marker-end="url(#a3)"/>
+
+    <rect class="ok" x="20" y="92" width="190" height="70" rx="10"/>
+    <text class="t" x="115" y="114" text-anchor="middle">GREEN · under 150k</text>
+    <text class="s" x="115" y="133" text-anchor="middle">Keep working</text>
+    <text class="s" x="115" y="149" text-anchor="middle">normally</text>
+    <rect class="amber" x="245" y="92" width="190" height="70" rx="10"/>
+    <text class="t" x="340" y="114" text-anchor="middle">AMBER · 150k+</text>
+    <text class="s" x="340" y="133" text-anchor="middle">Helpers do the reading;</text>
+    <text class="s" x="340" y="149" text-anchor="middle">hand off at a good stop</text>
+    <rect class="stop" x="470" y="92" width="190" height="70" rx="10"/>
+    <text class="t" x="565" y="114" text-anchor="middle">RED · 250k+</text>
+    <text class="s" x="565" y="133" text-anchor="middle">No new work.</text>
+    <text class="s" x="565" y="149" text-anchor="middle">Hand off now.</text>
+
+    <path class="line dash" d="M115,162 V186 H340"/>
+    <text class="lbl" x="124" y="180">only if you switch to a new topic</text>
+    <path class="line" d="M340,162 V186 M565,162 V186 H340"/>
+    <path class="line" d="M340,186 V204" marker-end="url(#a3)"/>
+
+    <rect class="chef" x="140" y="206" width="400" height="66" rx="12"/>
+    <text class="t" x="340" y="228" text-anchor="middle">Write a handoff note (the baton)</text>
+    <text class="xs" x="340" y="246" text-anchor="middle">GOAL · STATE · DECISIONS · FILES</text>
+    <text class="xs" x="340" y="262" text-anchor="middle">VERIFIED vs UNVERIFIED · NEXT STEP</text>
+    <path class="line" d="M340,272 V288" marker-end="url(#a3)"/>
+
+    <polygon class="ask" points="340,290 460,325 340,360 220,325"/>
+    <text class="t" x="340" y="322" text-anchor="middle">Jev grades it</text>
+    <text class="xs" x="340" y="338" text-anchor="middle">good enough? (2+ out of 4)</text>
+    <path class="line" d="M220,325 H192" marker-end="url(#a3)"/>
+    <text class="lbl" x="206" y="317" text-anchor="middle">no</text>
+    <rect class="amber" x="20" y="300" width="170" height="50" rx="10"/>
+    <text class="t" x="105" y="321" text-anchor="middle">Fill in the gaps</text>
+    <text class="s" x="105" y="338" text-anchor="middle">and write it again</text>
+    <path class="line" d="M105,300 V239 H138" marker-end="url(#a3)"/>
+    <path class="line" d="M340,360 V383" marker-end="url(#a3)"/>
+    <text class="lbl" x="348" y="376">yes</text>
+
+    <rect class="jev" x="140" y="385" width="400" height="52" rx="12"/>
+    <text class="t" x="340" y="406" text-anchor="middle">Note saved · a new Claude tab opens</text>
+    <text class="s" x="340" y="425" text-anchor="middle">with a resume code like  relay:1a2b3c4d</text>
+    <path class="line" d="M340,437 V455" marker-end="url(#a3)"/>
+
+    <rect class="you" x="140" y="457" width="400" height="52" rx="12"/>
+    <text class="t" x="340" y="478" text-anchor="middle">Fresh session reads the note</text>
+    <text class="s" x="340" y="497" text-anchor="middle">and keeps going right where the last one stopped</text>
+  </svg>
+  </figure>
+
+  <h3>What goes in the handoff note?</h3>
+  <table>
+    <tr><td style="width:30%"><b>GOAL</b></td><td>What we're trying to achieve.</td></tr>
+    <tr><td><b>STATE</b></td><td>What's done and what's left.</td></tr>
+    <tr><td><b>DECISIONS</b></td><td>Choices made and why, plus ideas that were rejected (so the next session doesn't try them again).</td></tr>
+    <tr><td><b>VERIFIED vs UNVERIFIED</b></td><td>What was actually tested (with the command and result) versus what's only assumed. The new session re-checks the unverified parts.</td></tr>
+    <tr><td><b>NEXT STEP</b></td><td>The exact next thing to do.</td></tr>
+  </table>
+  <p style="font-size:10pt;color:var(--muted)">This very document was made after a handoff like this! The previous session filled up, wrote a note, and a fresh session picked it up.</p>
+</section>
+
+<!-- ============ PAGE 7: RECAP ============ -->
+<section class="page">
+  <h2>The big rules, in one page</h2>
+  <ol class="rules">
+    <li><b>The boss thinks; the helpers fetch.</b> Design, tricky bugs, and security decisions stay with the head chef. Reading, running tests, and following clear instructions go to cheaper helpers.</li>
+    <li><b>Small jobs: just do them.</b> If it's about three steps or fewer, no helpers.</li>
+    <li><b>Clear orders.</b> Every brief says the goal, the exact files, the rules, how to check it worked, and what to send back.</li>
+    <li><b>Show your work.</b> Every report has RESULT, EVIDENCE, CONFIDENCE, and UNVERIFIED, with real exit codes.</li>
+    <li><b>Don't trust, verify.</b> Weak proof means the head chef checks it, or the job moves up a level. Never just "try the same thing again."</li>
+    <li><b>Risky means critic.</b> Security, deleted data, and changes other programs depend on all get a fresh-eyes review before they count as done.</li>
+    <li><b>You hold the keys.</b> Push, publish, deploy, delete, and send: only the head chef does these, and only with your permission.</li>
+    <li><b>Pass the baton.</b> When memory runs low, write a great handoff note and continue in a fresh session.</li>
+    <li><b>Tell the truth.</b> The final report says what ran, what passed, and what wasn't checked. Failures are reported word for word.</li>
+  </ol>
+
+  <h3>Words to know</h3>
+  <table>
+    <tr><td style="width:24%"><b>Orchestrator</b></td><td>The "boss" AI that plans and coordinates, like a conductor or head chef.</td></tr>
+    <tr><td><b>Subagent</b></td><td>A helper AI the orchestrator starts for one job (scout, runner, builder, critic).</td></tr>
+    <tr><td><b>Model</b></td><td>The AI "brain" being used. Opus 5.5 is the big thinker; Sonnet is fast and cheap; Fable is the critic's reviewer.</td></tr>
+    <tr><td><b>Context / tokens</b></td><td>The AI's short-term memory, and the small word pieces it's measured in.</td></tr>
+    <tr><td><b>Brief</b></td><td>The instructions given to a helper.</td></tr>
+    <tr><td><b>Diff</b></td><td>The exact list of lines that were added or removed in a change.</td></tr>
+    <tr><td><b>Exit code</b></td><td>The number a program gives when it finishes: 0 = success, anything else = a problem.</td></tr>
+    <tr><td><b>git commit / push</b></td><td>Commit = save a snapshot of the code on your computer. Push = upload those snapshots to GitHub for others.</td></tr>
+    <tr><td><b>Hook</b></td><td>A little program that runs automatically at certain moments (like before a command runs). The relay and the Jev guard are hooks.</td></tr>
+    <tr><td><b>Jev</b></td><td>A fast AI judge (from TypeSafe) that answers quick "how risky / which one / is this good enough" questions.</td></tr>
+    <tr><td><b>Handoff / relay</b></td><td>The note and the system that let a fresh session continue the work.</td></tr>
+  </table>
+</section>
+
+</body>
+</html>

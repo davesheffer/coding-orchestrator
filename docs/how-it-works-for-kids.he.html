@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>צוות הקוד שלי</title>
+<style>
+  :root {
+    --ink: #1e1b2e;
+    --muted: #5b5870;
+    --paper: #ffffff;
+    --chef: #6d4aff;   --chef-bg: #efeaff;
+    --scout: #0e7490;  --scout-bg: #e0f5f9;
+    --runner: #b45309; --runner-bg: #fff3df;
+    --builder: #15803d;--builder-bg: #e3f6e8;
+    --critic: #c0262d; --critic-bg: #fde8e8;
+    --you: #334155;    --you-bg: #eef1f5;
+    --jev: #0f766e;    --jev-bg: #dcf5f1;
+    --ask: #a16207;    --ask-bg: #fff8d6;
+  }
+  @page { size: A4; margin: 14mm 16mm 14mm 16mm; }
+  * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  html, body { background: var(--paper); color: var(--ink); }
+  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 11.5pt; line-height: 1.55; margin: 0; }
+  .page { break-after: page; }
+  .page:last-child { break-after: auto; }
+  h1 { font-size: 30pt; line-height: 1.15; margin: 0 0 6px; }
+  h2 { font-size: 18pt; margin: 0 0 6px; color: var(--chef); }
+  h3 { font-size: 13pt; margin: 14px 0 4px; }
+  p { margin: 0 0 8px; }
+  .lead { font-size: 13pt; color: var(--muted); }
+  .kicker { letter-spacing: 1px; font-size: 10pt; font-weight: 700; color: var(--chef); }
+  .motto { margin: 18px 0; padding: 14px 18px; border-radius: 14px; background: var(--chef-bg); border-inline-start: 6px solid var(--chef); font-size: 14pt; }
+  .motto b { color: var(--chef); }
+  .note { padding: 10px 14px; border-radius: 10px; background: var(--ask-bg); border: 1px solid #f0d97a; margin: 10px 0; font-size: 10.5pt; }
+  .note b { color: var(--ask); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+  .card { border-radius: 12px; padding: 10px 12px; border: 2px solid; break-inside: avoid; }
+  .card h3 { margin: 0 0 2px; font-size: 12.5pt; }
+  .card .model { font-size: 9.5pt; font-weight: 700; }
+  .card p { margin: 4px 0 0; font-size: 10.5pt; }
+  .card.chef { border-color: var(--chef); background: var(--chef-bg); grid-column: span 2; }
+  .card.chef h3, .card.chef .model { color: var(--chef); }
+  .card.scout { border-color: var(--scout); background: var(--scout-bg); }
+  .card.scout h3, .card.scout .model { color: var(--scout); }
+  .card.runner { border-color: var(--runner); background: var(--runner-bg); }
+  .card.runner h3, .card.runner .model { color: var(--runner); }
+  .card.builder { border-color: var(--builder); background: var(--builder-bg); }
+  .card.builder h3, .card.builder .model { color: var(--builder); }
+  .card.critic { border-color: var(--critic); background: var(--critic-bg); }
+  .card.critic h3, .card.critic .model { color: var(--critic); }
+  .rc { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0; }
+  .rc div { border-radius: 10px; padding: 8px 10px; background: var(--you-bg); font-size: 10pt; }
+  .rc b { display: block; font-size: 10.5pt; color: var(--chef); letter-spacing: 0.5px; }
+  .rc i { color: var(--muted); font-style: normal; }
+  ol, ul { margin: 4px 0 8px; padding-inline-start: 22px; padding-left: 0; }
+  li { margin: 2px 0; }
+  figure { margin: 8px 0 6px; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figure.f1 svg { height: 222mm; width: auto; margin: 0 auto; }
+  figure.f2 svg { height: 102mm; width: auto; margin: 0 auto; }
+  figure.f3 svg { height: 112mm; width: auto; margin: 0 auto; }
+  figcaption { font-size: 9.5pt; color: var(--muted); text-align: center; margin-top: 2px; }
+  .gauge { display: flex; height: 30px; border-radius: 8px; overflow: hidden; font-weight: 700; font-size: 10pt; color: #fff; margin: 8px 0 2px; }
+  .gauge div { display: flex; align-items: center; justify-content: center; }
+  .gauge-scale { position: relative; height: 14px; font-size: 8.5pt; color: var(--muted); margin-bottom: 8px; }
+  .gauge-scale span { position: absolute; transform: translateX(50%); }
+  .gauge-scale span:first-child { right: 0; transform: none; }
+  .gauge-scale span:last-child { left: 0; transform: none; }
+  table.tight { font-size: 10pt; }
+  table.tight td, table.tight th { padding: 4px 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 10.5pt; margin: 8px 0; }
+  th, td { text-align: start; padding: 6px 8px; border-bottom: 1px solid #ddd; vertical-align: top; }
+  th { background: var(--you-bg); }
+  .rules li { margin: 6px 0; }
+  .cover-art { margin: 26px 0 18px; }
+  code { font-family: Consolas, monospace; font-size: 10pt; background: var(--you-bg); padding: 0 4px; border-radius: 4px; direction: ltr; unicode-bidi: isolate; }
+  .en { direction: ltr; unicode-bidi: isolate; }
+
+  /* flowchart styles */
+  svg text { font-family: "Segoe UI", Arial, sans-serif; fill: var(--ink); direction: rtl; }
+  svg .t { font-size: 14px; font-weight: 700; }
+  svg .s { font-size: 12px; fill: #3d3a50; }
+  svg .xs { font-size: 10.5px; fill: #3d3a50; }
+  svg .lbl { font-size: 11px; font-weight: 700; fill: var(--muted); }
+  svg .line { stroke: #4b4860; stroke-width: 2; fill: none; }
+  svg .dash { stroke-dasharray: 5 4; }
+  svg .you { fill: var(--you-bg); stroke: var(--you); stroke-width: 2; }
+  svg .chef { fill: var(--chef-bg); stroke: var(--chef); stroke-width: 2; }
+  svg .scout { fill: var(--scout-bg); stroke: var(--scout); stroke-width: 2; }
+  svg .runner { fill: var(--runner-bg); stroke: var(--runner); stroke-width: 2; }
+  svg .builder { fill: var(--builder-bg); stroke: var(--builder); stroke-width: 2; }
+  svg .critic { fill: var(--critic-bg); stroke: var(--critic); stroke-width: 2; }
+  svg .jev { fill: var(--jev-bg); stroke: var(--jev); stroke-width: 2; }
+  svg .ask { fill: var(--ask-bg); stroke: var(--ask); stroke-width: 2; }
+  svg .ok { fill: #e3f6e8; stroke: #15803d; stroke-width: 2; }
+  svg .stop { fill: #fde8e8; stroke: #c0262d; stroke-width: 2; }
+  svg .amber { fill: #fff3df; stroke: #b45309; stroke-width: 2; }
+  svg .noteb { fill: #fafafa; stroke: #9a97ad; stroke-width: 1.5; stroke-dasharray: 5 4; }
+</style>
+</head>
+<body>
+
+<!-- ============ עמוד 1 ============ -->
+<section class="page">
+  <div class="kicker">מדריך ל-Coding Orchestrator</div>
+  <h1>איך צוות ה-AI שלי כותב קוד</h1>
+  <p class="lead">בינה מלאכותית אחת חכמה הופכת לצוות שלם: בוס שחושב, עוזרים שעושים את העבודה השחורה, מבקר שמחפש טעויות, ושומרים שעוצרים תאונות גדולות.</p>
+
+  <div class="motto">המוטו: <b>ידיים זולות, עיניים יקרות.</b><br>
+  עוזרים מהירים וזולים עושים את הריצות. המוח הכי חכם שמור לחשיבה, להחלטות ולבדיקה.</div>
+
+  <h3>קודם כל, איזו בעיה זה פותר?</h3>
+  <p>Claude Code הוא AI שיודע לקרוא ולכתוב קוד. אם נותנים ל-AI <b>אחד</b> לעשות הכול לבד, קורים שני דברים רעים:</p>
+  <ul>
+    <li><b>זה יקר.</b> המודל הכי חכם הוא גם הכי יקר. להשתמש בו כדי לקרוא מאות קבצים זה כמו להזמין מנתח מומחה כדי שיטאטא את הרצפה בבית החולים.</li>
+    <li><b>הזיכרון שלו מתמלא.</b> AI יכול להחזיק רק כמות מוגבלת של טקסט בראש בבת אחת. לזה קוראים <b>קונטקסט</b> (context), והוא נמדד ב<b>טוקנים</b> (חתיכות קטנות של מילים). כשהוא מתמלא מדי, ה-AI נהיה איטי ומתחיל לשכוח פרטים.</li>
+  </ul>
+
+  <h3>הפתרון: לעבוד כמו מטבח של מסעדה</h3>
+  <p>במסעדה טובה השף הראשי לא חותך כל בצל לבד. השף מתכנן את התפריט, נותן הוראות ברורות, ו<b>טועם כל מנה לפני שהיא יוצאת מהמטבח</b>. העוזרים במטבח חותכים, מערבבים ומודדים זמנים.</p>
+  <p>ה-Coding Orchestrator הוא אוסף של <b>חוקים, עוזרים וכלי בטיחות</b> שגורם ל-Claude לעבוד בדיוק ככה. ה"אורקסטרטור" הוא השף הראשי (כמו מנצח של תזמורת: הוא לא מנגן בכל כלי, אבל שומר שכולם ינגנו יחד).</p>
+
+  <svg class="cover-art" viewBox="0 0 680 150" role="img" aria-label="השף הראשי באמצע, מחובר לארבעה עוזרים">
+    <rect class="chef" x="250" y="8" width="180" height="52" rx="12"/>
+    <text class="t" x="340" y="31" text-anchor="middle">השף הראשי</text>
+    <text class="s" x="340" y="49" text-anchor="middle">האורקסטרטור · Opus 5.5</text>
+    <path class="line" d="M340,60 V78 M85,78 H595 M85,78 V92 M255,78 V92 M425,78 V92 M595,78 V92" />
+    <rect class="critic" x="10" y="94" width="150" height="48" rx="10"/>
+    <text class="t" x="85" y="115" text-anchor="middle">מבקר</text><text class="s" x="85" y="132" text-anchor="middle">מחפש טעויות</text>
+    <rect class="builder" x="180" y="94" width="150" height="48" rx="10"/>
+    <text class="t" x="255" y="115" text-anchor="middle">בנאי</text><text class="s" x="255" y="132" text-anchor="middle">מבצע את השינוי</text>
+    <rect class="runner" x="350" y="94" width="150" height="48" rx="10"/>
+    <text class="t" x="425" y="115" text-anchor="middle">מריץ</text><text class="s" x="425" y="132" text-anchor="middle">מריץ בדיקות</text>
+    <rect class="scout" x="520" y="94" width="150" height="48" rx="10"/>
+    <text class="t" x="595" y="115" text-anchor="middle">סייר</text><text class="s" x="595" y="132" text-anchor="middle">מוצא וקורא</text>
+  </svg>
+</section>
+
+<!-- ============ עמוד 2 ============ -->
+<section class="page">
+  <h2>הכירו את הצוות</h2>
+  <p>כל חבר צוות הוא AI עם תפקיד אחד. הם משתמשים ב<b>מודלים</b> שונים ("מוחות" שונים): מוח גדול חושב טוב יותר אבל עולה יותר, אז כל תפקיד מקבל בדיוק את המוח שהוא צריך.</p>
+
+  <div class="grid">
+    <div class="card chef">
+      <div class="model">השף הראשי · האורקסטרטור · <span class="en">Opus 5.5</span> (החושב הגדול)</div>
+      <h3>מתכנן, מחליט ובודק הכול</h3>
+      <p>מדבר איתכם, מבין מה אתם באמת צריכים, מפרק את העבודה למשימות קטנות וכותב לכל עוזר הוראות ברורות (<b>תדריך</b>). הוא מקבל את ההחלטות הקשות: איך לתכנן, מה הסיבה האמיתית לבאג, וכל דבר שקשור לאבטחה. והוא <b>בודק את העבודה של העוזרים</b> לפני שהוא אומר לכם שסיימנו.</p>
+    </div>
+    <div class="card scout">
+      <div class="model">סייר (Scout) · <span class="en">Sonnet</span> (מהיר וזול)</div>
+      <h3>החוקר</h3>
+      <p>מוצא קבצים, קורא קוד ומחזיר סיכום קצר. הוא רק <b>קורא</b> ואף פעם לא משנה כלום. ככה השף לא צריך למלא את הזיכרון שלו בקבצים שלמים.</p>
+    </div>
+    <div class="card runner">
+      <div class="model">מריץ (Runner) · <span class="en">Sonnet</span> (מהיר וזול)</div>
+      <h3>הבודק</h3>
+      <p>מריץ בדיוק את הפקודה שקיבל (למשל "תריץ את כל הבדיקות") ומדווח מה קרה: עבר או נכשל, ומה השגיאה המדויקת. הוא לא מנסה לתקן. פלט של בדיקות יכול להיות אלפי שורות, והמריץ מקצר אותו.</p>
+    </div>
+    <div class="card builder">
+      <div class="model">בנאי (Builder) · <span class="en">Sonnet</span> (מהיר וזול)</div>
+      <h3>המבצע</h3>
+      <p>מבצע שינוי <b>שכבר הוחלט עליו</b> ("להוסיף את הכפתור הזה בקובץ הזה"), ואז מריץ בדיקה שמוכיחה שזה עובד. החשיבה על <i>מה</i> לבנות כבר נעשתה אצל השף. הבנאי אף פעם לא עושה commit או push.</p>
+    </div>
+    <div class="card critic">
+      <div class="model">מבקר (Critic) · <span class="en">Fable</span> (עין חדה)</div>
+      <h3>מוצא התקלות</h3>
+      <p>התפקיד היחיד שלו הוא למצוא מה <b>לא בסדר</b>. הוא מגיע "בעיניים רעננות": הוא לא רואה את ההסברים של השף, אז אי אפשר לשכנע אותו להסכים. קוראים לו לשינויים מסוכנים: אבטחה, מחיקת מידע, דברים שתוכנות אחרות תלויות בהם.</p>
+    </div>
+  </div>
+
+  <div class="note"><b>משימות קטנות מדלגות על הצוות.</b> אם משהו לוקח בערך שלושה צעדים או פחות, השף פשוט עושה אותו. לכתוב תדריך לעוזר היה לוקח יותר זמן מהמשימה עצמה. (אבל משימה קטנה ומסוכנת עדיין עוברת אצל המבקר.)</div>
+
+</section>
+
+<section class="page">
+  <h2>מי עושה מה, ועם איזה מוח</h2>
+  <h3 style="margin-top:4px">חוק הזהב לגבי פעולות גדולות</h3>
+  <p>יש פעולות שיוצאות מהמחשב שלכם וקשה לבטל אותן: <b>push</b> של קוד ל-GitHub, <b>פרסום</b>, <b>העלאה לאוויר</b> של אתר (deploy), <b>מחיקה</b>, ו<b>שליחת</b> הודעות. לעוזרים אסור לעשות את זה. רק השף יכול, ורק אחרי ש<b>אתם</b> אישרתם.</p>
+  <h3>איזה מודל עושה מה</h3>
+  <table class="tight">
+    <tr><th style="width:17%">תפקיד</th><th style="width:16%">Claude Code</th><th style="width:22%">Codex</th><th>למה דווקא הוא</th></tr>
+    <tr><td><b>השף</b></td><td class="en">Opus 5.5</td><td class="en">GPT-6.1 Sol · medium</td><td>החלטות קשות ובדיקה סופית צריכות את המוח הכי חזק.</td></tr>
+    <tr><td><b>סייר</b></td><td class="en">Sonnet</td><td class="en">GPT-6 Luna · low</td><td>לקרוא ולסכם: מהיר וזול זה מספיק.</td></tr>
+    <tr><td><b>מריץ</b></td><td class="en">Sonnet</td><td class="en">GPT-6 Luna · low</td><td>רק מריץ פקודה ומדווח מה יצא.</td></tr>
+    <tr><td><b>בנאי</b></td><td class="en">Sonnet</td><td class="en">GPT-6.1 Sol · medium</td><td>כותב קוד לפי תוכנית שכבר הוחלטה.</td></tr>
+    <tr><td><b>מבקר</b></td><td class="en">Fable</td><td class="en">GPT-6 Astra · high</td><td>מוח אחר וחד, שטוב במציאת טעויות.</td></tr>
+    <tr><td><b>Jev</b></td><td colspan="2" class="en">jev-latest (TypeSafe)</td><td>שופט קטן ומהיר לשאלות קצרות ולציונים. כשהמשימה קשה, הוא יכול להעביר עוזר מ-<span class="en">Sonnet</span> למוח גדול יותר: <span class="en">Opus</span> או <span class="en">Fable</span>.</td></tr>
+  </table>
+</section>
+
+<!-- ============ עמוד 3: תרשים 1 ============ -->
+<section class="page">
+  <h2>תרשים 1: החיים של בקשה</h2>
+  <p>ככה זה עובד מהרגע שאתם מבקשים משהו ועד שאתם מקבלים תשובה. המעוינים הם שאלות: עקבו אחרי החץ של "כן" או של "לא".</p>
+
+  <figure class="f1">
+  <svg viewBox="0 0 680 945" role="img" aria-label="תרשים זרימה של בקשה: השף, העוזרים, הבדיקות, המבקר והדיווח הסופי">
+    <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b4860"/></marker></defs>
+
+    <rect class="you" x="200" y="10" width="280" height="46" rx="12"/>
+    <text class="t" x="340" y="30" text-anchor="middle">אתם מבקשים משהו</text>
+    <text class="s" x="340" y="47" text-anchor="middle">למשל: "להוסיף כפתור מצב כהה"</text>
+    <path class="line" d="M340,56 V78" marker-end="url(#a1)"/>
+
+    <rect class="chef" x="170" y="80" width="340" height="50" rx="12"/>
+    <text class="t" x="340" y="101" text-anchor="middle">השף הראשי (Opus 5.5) חושב</text>
+    <text class="s" x="340" y="119" text-anchor="middle">מה באמת צריך? מה התוכנית?</text>
+    <path class="line" d="M340,130 V146" marker-end="url(#a1)"/>
+
+    <polygon class="ask" points="340,148 450,183 340,218 230,183"/>
+    <text class="t" x="340" y="181" text-anchor="middle">משימה קטנה?</text>
+    <text class="xs" x="340" y="196" text-anchor="middle">(בערך 3 צעדים)</text>
+    <path class="line" d="M230,183 H202" marker-end="url(#a1)"/>
+    <text class="lbl" x="216" y="176" text-anchor="middle">כן</text>
+    <rect class="chef" x="30" y="160" width="170" height="46" rx="10"/>
+    <text class="t" x="115" y="180" text-anchor="middle">השף עושה לבד</text>
+    <text class="s" x="115" y="197" text-anchor="middle">(ככה יותר מהר)</text>
+    <path class="line" d="M30,183 H14 V630 H218" marker-end="url(#a1)"/>
+    <text class="lbl" x="24" y="620" text-anchor="end">גם כאן בודקים סיכון</text>
+    <path class="line" d="M340,218 V238" marker-end="url(#a1)"/>
+    <text class="lbl" x="348" y="232" text-anchor="end">לא</text>
+
+    <rect class="chef" x="170" y="240" width="340" height="50" rx="12"/>
+    <text class="t" x="340" y="261" text-anchor="middle">מפרקים למשימות קטנות</text>
+    <text class="s" x="340" y="279" text-anchor="middle">כל עוזר מקבל תדריך ברור ומדויק</text>
+    <path class="line" d="M340,290 V305 M130,305 H550"/>
+    <path class="line" d="M130,305 V320" marker-end="url(#a1)"/>
+    <path class="line" d="M340,305 V320" marker-end="url(#a1)"/>
+    <path class="line" d="M550,305 V320" marker-end="url(#a1)"/>
+
+    <rect class="builder" x="40" y="322" width="180" height="58" rx="10"/>
+    <text class="t" x="130" y="346" text-anchor="middle">בנאי</text>
+    <text class="s" x="130" y="365" text-anchor="middle">מבצע את השינוי</text>
+    <rect class="runner" x="250" y="322" width="180" height="58" rx="10"/>
+    <text class="t" x="340" y="346" text-anchor="middle">מריץ</text>
+    <text class="s" x="340" y="365" text-anchor="middle">מריץ בדיקות ובנייה</text>
+    <rect class="scout" x="460" y="322" width="180" height="58" rx="10"/>
+    <text class="t" x="550" y="346" text-anchor="middle">סייר</text>
+    <text class="s" x="550" y="365" text-anchor="middle">מוצא וקורא את הקוד</text>
+    <path class="line" d="M130,380 V398 H550 M340,380 V398 M550,380 V398"/>
+    <path class="line" d="M340,398 V412" marker-end="url(#a1)"/>
+
+    <rect class="chef" x="160" y="414" width="360" height="50" rx="12"/>
+    <text class="t" x="340" y="435" text-anchor="middle">חוזרת תעודת דיווח</text>
+    <text class="xs" x="340" y="453" text-anchor="middle">RESULT · EVIDENCE · CONFIDENCE · UNVERIFIED</text>
+    <path class="line" d="M340,464 V482" marker-end="url(#a1)"/>
+
+    <polygon class="ask" points="340,484 450,519 340,554 230,519"/>
+    <text class="t" x="340" y="516" text-anchor="middle">ההוכחה</text>
+    <text class="t" x="340" y="533" text-anchor="middle">מספיק טובה?</text>
+    <path class="line" d="M450,519 H488" marker-end="url(#a1)"/>
+    <text class="lbl" x="466" y="512" text-anchor="middle">לא</text>
+    <rect class="amber" x="490" y="490" width="178" height="62" rx="10"/>
+    <text class="t" x="579" y="510" text-anchor="middle">לא בטוח?</text>
+    <text class="s" x="579" y="526" text-anchor="middle">השף בודק בעצמו,</text>
+    <text class="s" x="579" y="542" text-anchor="middle">או עוזר חזק יותר</text>
+    <path class="line" d="M579,490 V382" marker-end="url(#a1)"/>
+    <text class="lbl" x="586" y="445" text-anchor="end">מנסים שוב</text>
+    <path class="line" d="M340,554 V593" marker-end="url(#a1)"/>
+    <text class="lbl" x="348" y="578" text-anchor="end">כן</text>
+
+    <polygon class="ask" points="340,595 460,630 340,665 220,630"/>
+    <text class="t" x="340" y="628" text-anchor="middle">יש סיכון?</text>
+    <text class="xs" x="340" y="643" text-anchor="middle">(אבטחה, מידע, API)</text>
+    <path class="line" d="M460,630 H488" marker-end="url(#a1)"/>
+    <text class="lbl" x="474" y="622" text-anchor="middle">כן</text>
+    <rect class="critic" x="490" y="600" width="178" height="60" rx="10"/>
+    <text class="t" x="579" y="621" text-anchor="middle">מבקר (Fable)</text>
+    <text class="s" x="579" y="637" text-anchor="middle">מחפש טעויות</text>
+    <text class="s" x="579" y="652" text-anchor="middle">בעיניים רעננות</text>
+    <path class="line" d="M579,660 V688" marker-end="url(#a1)"/>
+    <rect class="chef" x="490" y="690" width="178" height="42" rx="10"/>
+    <text class="t" x="579" y="716" text-anchor="middle">מתקנים מה שנמצא</text>
+    <path class="line" d="M490,712 H462" marker-end="url(#a1)"/>
+    <path class="line" d="M340,665 V688" marker-end="url(#a1)"/>
+    <text class="lbl" x="348" y="681" text-anchor="end">לא</text>
+
+    <rect class="runner" x="200" y="690" width="260" height="50" rx="12"/>
+    <text class="t" x="330" y="711" text-anchor="middle">בדיקות אחרונות</text>
+    <text class="s" x="330" y="729" text-anchor="middle">הבדיקות חייבות באמת לעבור</text>
+    <path class="line" d="M340,740 V760" marker-end="url(#a1)"/>
+
+    <polygon class="ask" points="340,762 470,800 340,838 210,800"/>
+    <text class="t" x="340" y="797" text-anchor="middle">פעולה גדולה החוצה?</text>
+    <text class="xs" x="340" y="812" text-anchor="middle">(push · deploy · מחיקה · שליחה)</text>
+    <path class="line" d="M210,800 H187" marker-end="url(#a1)"/>
+    <text class="lbl" x="198" y="792" text-anchor="middle">כן</text>
+    <rect class="you" x="20" y="776" width="165" height="48" rx="10"/>
+    <text class="t" x="102" y="797" text-anchor="middle">קודם שואלים אתכם</text>
+    <text class="s" x="102" y="814" text-anchor="middle">המפתחות אצלכם</text>
+    <path class="line" d="M102,824 V897 H168" marker-end="url(#a1)"/>
+    <path class="line" d="M340,838 V868" marker-end="url(#a1)"/>
+    <text class="lbl" x="348" y="858" text-anchor="end">לא</text>
+
+    <rect class="you" x="170" y="870" width="340" height="56" rx="12"/>
+    <text class="t" x="340" y="893" text-anchor="middle">דיווח אליכם</text>
+    <text class="s" x="340" y="912" text-anchor="middle">מה רץ · מה עבר · מה עוד לא נבדק</text>
+  </svg>
+  <figcaption>סגול = השף · כחול/כתום/ירוק = העוזרים · אדום = המבקר · מעוינים צהובים = שאלות</figcaption>
+  </figure>
+</section>
+
+<!-- ============ עמוד 4 ============ -->
+<section class="page">
+  <h2>דוגמה אמיתית, צעד אחרי צעד</h2>
+  <p>נניח שביקשתם: <i>"להוסיף לאפליקציה שלי כפתור מצב כהה."</i></p>
+  <ol>
+    <li><b>השף חושב.</b> איפה מוגדרים הצבעים באפליקציה? יש כבר מסך הגדרות? זה יותר משלושה צעדים, אז הוא מפרק את העבודה.</li>
+    <li><b>הסייר יוצא לחפש.</b> התדריך: "תמצא איפה מוגדרים הצבעים ומסך ההגדרות. אל תשנה כלום." הסייר חוזר עם: "הצבעים ב-<code>theme.dart</code> בשורות 10–40; מסך ההגדרות ב-<code>settings.dart</code>."</li>
+    <li><b>השף מתכנן את השינוי</b> לפי הסיכום הזה, בלי לקרוא בעצמו כל קובץ.</li>
+    <li><b>הבנאי מבצע.</b> התדריך: "תוסיף ערכת צבעים כהה ב-<code>theme.dart</code> ומתג ב-<code>settings.dart</code>. אחר כך תריץ את בדיקות ההגדרות." הבנאי מחזיר תעודת דיווח <i>וגם</i> את השינוי עצמו (שנקרא <b>diff</b>), והשף קורא אותו.</li>
+    <li><b>המריץ מריץ את כל הבדיקות</b> ומדווח: "312 עברו, 0 נכשלו, קוד יציאה 0."</li>
+    <li><b>יש סיכון?</b> מתג צבעים זה לא שינוי אבטחה, אז הפעם לא צריך מבקר.</li>
+    <li><b>השף מדווח לכם:</b> מה השתנה, אילו בדיקות רצו ועברו, ומה הוא לא הצליח לבדוק (למשל "לא בדקתי על טלפון אמיתי").</li>
+  </ol>
+
+  <h2 style="margin-top:16px">תעודת הדיווח</h2>
+  <p>כל עוזר חייב לענות עם אותם ארבעה חלקים. זה כמו להראות את הדרך בשיעור מתמטיקה: תשובה בלי דרך מקבלת פחות נקודות.</p>
+  <div class="rc">
+    <div><b>RESULT</b>מה קרה, בשורה או שתיים.<br><i>"הוספתי מתג מצב כהה."</i></div>
+    <div><b>EVIDENCE</b>הוכחה: אילו פקודות רצו ומה יצא.<br><i>"בדיקות: 14 עברו, קוד יציאה 0."</i></div>
+    <div><b>CONFIDENCE</b>כמה הוא בטוח: גבוה, בינוני או נמוך.<br><i>"גבוה."</i></div>
+    <div><b>UNVERIFIED</b>מה הוא <u>לא</u> בדק.<br><i>"לא בדקתי באייפון."</i></div>
+  </div>
+
+  <h3>למה לא פשוט לסמוך על העוזרים?</h3>
+  <p>לעוזרים יש מוחות זולים ומהירים יותר, אז לפעמים הם טועים או נשמעים בטוחים יותר ממה שהם באמת. לכן החוקים אומרים:</p>
+  <ul>
+    <li>אם <b>חסרה</b> הוכחה, או שהביטחון רק <b>נמוך או בינוני</b>, השף לא מבקש שוב מאותו עוזר. הוא <b>בודק בעצמו</b>, או <b>מעלה את המשימה רמה אחת</b> (סייר או מריץ ← בנאי ← השף).</li>
+    <li>השף תמיד <b>קורא את השינוי האמיתי של הבנאי</b>, לא רק את הסיכום.</li>
+    <li>את הבדיקות מריצים <b>אחרי העריכה האחרונה</b>. בדיקה שעברה לפני שינוי לא מוכיחה כלום על מה שאחריו.</li>
+    <li>"נראה לי שזה עובד" זו לא תוצאה. תוצאה היא פקודה שרצה, יחד עם <b>קוד היציאה</b> שלה (0 אומר הצלחה; כל מספר אחר אומר שמשהו נכשל).</li>
+  </ul>
+
+  <div class="note"><b>עובדה מעניינת:</b> המבקר מקבל רק את השינוי ואת הטענה שהוא צריך לתקוף, אף פעם לא את המסקנות של השף. אם אומרים לבודק "אני די בטוח שזה בסדר", הוא נוטה להסכים. עיניים רעננות תופסות יותר.</div>
+</section>
+
+<!-- ============ עמוד 5: תרשים 2 ============ -->
+<section class="page">
+  <h2>תרשים 2: שומר הבטיחות (Jev)</h2>
+  <p><b>Jev</b> הוא שופט AI קטן ומהיר מאוד מחברה בשם TypeSafe. זו תוספת אופציונלית (אצלנו היא דולקת). הוא אף פעם לא כותב קוד. הוא רק עונה בשבריר שנייה על שאלות קצרות כמו "כמה זה מסוכן?". האורקסטרטור משתמש בו בכמה מקומות. החשוב ביותר הוא <b>שומר בדלת</b> לפני שקוד נשמר בהיסטוריה (<code>git commit</code>) או משותף ברשת (<code>git push</code>).</p>
+
+  <figure class="f2">
+  <svg viewBox="0 0 680 555" role="img" aria-label="תרשים זרימה של שומר הסיכון של Jev לפני git commit ו-git push">
+    <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b4860"/></marker></defs>
+
+    <rect class="chef" x="260" y="10" width="340" height="50" rx="12"/>
+    <text class="t" x="430" y="31" text-anchor="middle">השף מריץ git commit / git push</text>
+    <text class="s" x="430" y="49" text-anchor="middle">(שמירת העבודה / שיתוף ברשת)</text>
+    <path class="line" d="M430,60 V78" marker-end="url(#a2)"/>
+
+    <rect class="jev" x="260" y="80" width="340" height="46" rx="12"/>
+    <text class="t" x="430" y="100" text-anchor="middle">השומר Jev בודק קודם את השינוי</text>
+    <text class="s" x="430" y="117" text-anchor="middle">קבצים סודיים ומפתחות מוסתרים לפני השליחה</text>
+    <path class="line" d="M430,126 V144" marker-end="url(#a2)"/>
+
+    <polygon class="ask" points="430,146 540,181 430,216 320,181"/>
+    <text class="t" x="430" y="179" text-anchor="middle">Jev הצליח לענות?</text>
+    <text class="xs" x="430" y="194" text-anchor="middle">(מחובר ועובד)</text>
+    <path class="line" d="M320,181 H257" marker-end="url(#a2)"/>
+    <text class="lbl" x="290" y="173" text-anchor="middle">לא</text>
+
+    <polygon class="ask" points="155,146 255,181 155,216 55,181"/>
+    <text class="t" x="155" y="179" text-anchor="middle">push</text>
+    <text class="t" x="155" y="195" text-anchor="middle">או commit?</text>
+    <path class="line" d="M155,216 V232 M75,232 H215"/>
+    <path class="line" d="M75,232 V248" marker-end="url(#a2)"/>
+    <path class="line" d="M215,232 V248" marker-end="url(#a2)"/>
+    <text class="lbl" x="66" y="244" text-anchor="start">push</text>
+    <text class="lbl" x="224" y="244" text-anchor="end">commit</text>
+    <rect class="stop" x="10" y="250" width="130" height="80" rx="10"/>
+    <text class="t" x="75" y="272" text-anchor="middle">חסום</text>
+    <text class="s" x="75" y="290" text-anchor="middle">מחכה ש-Jev יחזור</text>
+    <text class="s" x="75" y="305" text-anchor="middle">(או שתעשו</text>
+    <text class="s" x="75" y="320" text-anchor="middle">push בעצמכם)</text>
+    <rect class="ok" x="150" y="250" width="130" height="80" rx="10"/>
+    <text class="t" x="215" y="272" text-anchor="middle">מותר</text>
+    <text class="s" x="215" y="290" text-anchor="middle">commit נשאר</text>
+    <text class="s" x="215" y="305" text-anchor="middle">במחשב שלכם,</text>
+    <text class="s" x="215" y="320" text-anchor="middle">אז פחות מסוכן</text>
+
+    <path class="line" d="M430,216 V238" marker-end="url(#a2)"/>
+    <text class="lbl" x="438" y="232" text-anchor="end">כן</text>
+
+    <rect class="jev" x="310" y="240" width="240" height="50" rx="12"/>
+    <text class="t" x="430" y="261" text-anchor="middle">Jev נותן ציון סיכון</text>
+    <text class="s" x="430" y="279" text-anchor="middle">אבטחה · אובדן מידע · API ציבורי</text>
+    <path class="line" d="M430,290 V308" marker-end="url(#a2)"/>
+
+    <polygon class="ask" points="430,310 555,350 430,390 305,350"/>
+    <text class="t" x="430" y="347" text-anchor="middle">מסוכן, ואין מבקר</text>
+    <text class="t" x="430" y="364" text-anchor="middle">מאז העריכה האחרונה?</text>
+    <path class="line" d="M555,350 H573" marker-end="url(#a2)"/>
+    <text class="lbl" x="563" y="342" text-anchor="middle">לא</text>
+    <rect class="ok" x="575" y="325" width="100" height="50" rx="10"/>
+    <text class="t" x="625" y="355" text-anchor="middle">מותר</text>
+    <path class="line" d="M430,390 V413" marker-end="url(#a2)"/>
+    <text class="lbl" x="438" y="406" text-anchor="end">כן</text>
+
+    <rect class="stop" x="280" y="415" width="300" height="50" rx="12"/>
+    <text class="t" x="430" y="436" text-anchor="middle">נעצר פעם אחת</text>
+    <text class="s" x="430" y="454" text-anchor="middle">"קודם תעבירו את זה למבקר"</text>
+    <path class="line" d="M430,465 V483" marker-end="url(#a2)"/>
+
+    <rect class="critic" x="280" y="485" width="300" height="50" rx="12"/>
+    <text class="t" x="430" y="506" text-anchor="middle">המבקר בודק ← מתקנים ← שוב</text>
+    <text class="s" x="430" y="524" text-anchor="middle">עכשיו השומר רואה ביקורת טרייה</text>
+    <path class="line" d="M580,510 H625 V377" marker-end="url(#a2)"/>
+
+    <rect class="noteb" x="10" y="360" width="250" height="150" rx="10"/>
+    <text class="t" x="246" text-anchor="start" y="384">פס האטה, לא קיר</text>
+    <text class="s" x="246" text-anchor="start" y="406">כש-Jev עובד, "נעצר פעם אחת"</text>
+    <text class="s" x="246" text-anchor="start" y="423">הוא רק אזהרה: אותה פקודה בדיוק</text>
+    <text class="s" x="246" text-anchor="start" y="440">עוברת בניסיון השני. ההחלטה</text>
+    <text class="s" x="246" text-anchor="start" y="457">האמיתית נשארת אצל השף ואצלכם.</text>
+    <text class="s" x="246" text-anchor="start" y="474">רק push בזמן ש-Jev לא זמין</text>
+    <text class="s" x="246" text-anchor="start" y="491">נשאר חסום בכל ניסיון.</text>
+  </svg>
+  <figcaption>טורקיז = Jev · ירוק = מותר · אדום = נעצר</figcaption>
+  </figure>
+
+  <h3>עוד תפקידים של Jev</h3>
+  <table class="tight">
+    <tr><th style="width:26%">תפקיד</th><th>מה Jev עושה</th></tr>
+    <tr><td><b>בוחר גודל מוח</b></td><td>לפני שעוזר מתחיל, Jev קורא את המשימה וממליץ איזה מודל יעשה אותה. הוא מעביר בקלות משימה למוח גדול יותר (לתת משימה קשה למוח קטן זו הטעות היקרה), אבל צריך להיות בטוח מאוד כדי להעביר משימה למוח קטן יותר. את המבקר הוא אף פעם לא מחליף.</td></tr>
+    <tr><td><b>בודק תעודות דיווח</b></td><td>אם בדיווח של עוזר חסר חלק, או שההוכחה לא תומכת בתוצאה, הדיווח נשלח חזרה <b>פעם אחת</b> לתיקון.</td></tr>
+    <tr><td><b>מזהה החלפת נושא</b></td><td>אם ההודעה החדשה שלכם על משהו אחר לגמרי, הוא אומר "תתחילו סשן חדש" (ראו בעמוד הבא).</td></tr>
+    <tr><td><b>נותן ציון לפתקי העברה</b></td><td>נותן ציון מ-0 עד 4 ל"מקל" (בעמוד הבא). פתק חלש לא נשמר עד שמתקנים אותו.</td></tr>
+    <tr><td><b>עונה על שאלות על קבצים</b></td><td>בעזרת <code>ask-jev</code> השף יכול לשאול "איזה מהקבצים האלה מטפל בכניסה למערכת?" בלי לקרוא את כולם לזיכרון שלו.</td></tr>
+  </table>
+  <p style="font-size:10pt;color:var(--muted)">אם Jev לא זמין, כמעט הכול ממשיך לעבוד כמו בלעדיו ("נכשל פתוח"). יש חריג אחד: push של קוד לרשת חשוב מדי כדי להעביר אותו בלי בדיקה ("נכשל סגור").</p>
+</section>
+
+<!-- ============ עמוד 6: תרשים 3 ============ -->
+<section class="page">
+  <h2>תרשים 3: מרוץ שליחים (כשהזיכרון מתמלא)</h2>
+  <p>זוכרים שלזיכרון של ה-AI (ה<b>קונטקסט</b>) יש גבול? תוכנה קטנה שנקראת <b>הממסר</b> (relay) בודקת כמה הוא מלא בכל פעם שאתם שולחים הודעה, ומציגה מד דלק:</p>
+
+  <div class="gauge">
+    <div style="flex:150;background:#15803d">ירוק · ממשיכים לעבוד</div>
+    <div style="flex:100;background:#b45309">כתום · מתחילים לסגור</div>
+    <div style="flex:60;background:#c0262d">אדום · מעבירים</div>
+  </div>
+  <div class="gauge-scale"><span>0 טוקנים</span><span style="right:48.4%">150,000</span><span style="right:80.6%">250,000</span><span>מלא</span></div>
+
+  <p>כמו במרוץ שליחים: כשרץ אחד מתעייף, הוא מעביר את <b>המקל</b> לרץ רענן, שממשיך בדיוק מאותה נקודה. כאן המקל הוא <b>פתק העברה</b> כתוב (handoff).</p>
+
+  <figure class="f3">
+  <svg viewBox="0 0 680 520" role="img" aria-label="תרשים זרימה של הממסר: אזורי המד, כתיבת פתק העברה, ציון ופתיחת סשן חדש">
+    <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b4860"/></marker></defs>
+
+    <rect class="you" x="170" y="10" width="340" height="50" rx="12"/>
+    <text class="t" x="340" y="31" text-anchor="middle">אתם שולחים הודעה</text>
+    <text class="s" x="340" y="49" text-anchor="middle">הממסר בודק כמה הזיכרון מלא</text>
+    <path class="line" d="M340,60 V74 M115,74 H565"/>
+    <path class="line" d="M115,74 V90" marker-end="url(#a3)"/>
+    <path class="line" d="M340,74 V90" marker-end="url(#a3)"/>
+    <path class="line" d="M565,74 V90" marker-end="url(#a3)"/>
+
+    <rect class="stop" x="20" y="92" width="190" height="70" rx="10"/>
+    <text class="t" x="115" y="114" text-anchor="middle">אדום · 250k+</text>
+    <text class="s" x="115" y="133" text-anchor="middle">בלי עבודה חדשה.</text>
+    <text class="s" x="115" y="149" text-anchor="middle">מעבירים עכשיו.</text>
+    <rect class="amber" x="245" y="92" width="190" height="70" rx="10"/>
+    <text class="t" x="340" y="114" text-anchor="middle">כתום · 150k+</text>
+    <text class="s" x="340" y="133" text-anchor="middle">העוזרים עושים את הקריאה;</text>
+    <text class="s" x="340" y="149" text-anchor="middle">מעבירים בנקודה טובה</text>
+    <rect class="ok" x="470" y="92" width="190" height="70" rx="10"/>
+    <text class="t" x="565" y="114" text-anchor="middle">ירוק · מתחת ל-150k</text>
+    <text class="s" x="565" y="133" text-anchor="middle">ממשיכים לעבוד</text>
+    <text class="s" x="565" y="149" text-anchor="middle">כרגיל</text>
+
+    <path class="line dash" d="M565,162 V186 H340"/>
+    <text class="lbl" x="556" y="180" text-anchor="start">רק אם עוברים לנושא חדש</text>
+    <path class="line" d="M340,162 V186 M115,162 V186 H340"/>
+    <path class="line" d="M340,186 V204" marker-end="url(#a3)"/>
+
+    <rect class="chef" x="140" y="206" width="400" height="66" rx="12"/>
+    <text class="t" x="340" y="228" text-anchor="middle">כותבים פתק העברה (המקל)</text>
+    <text class="xs" x="340" y="246" text-anchor="middle">GOAL · STATE · DECISIONS · FILES</text>
+    <text class="xs" x="340" y="262" text-anchor="middle">VERIFIED vs UNVERIFIED · NEXT STEP</text>
+    <path class="line" d="M340,272 V288" marker-end="url(#a3)"/>
+
+    <polygon class="ask" points="340,290 460,325 340,360 220,325"/>
+    <text class="t" x="340" y="322" text-anchor="middle">Jev נותן ציון</text>
+    <text class="xs" x="340" y="338" text-anchor="middle">מספיק טוב? ציון 2 ומעלה מתוך 4</text>
+    <path class="line" d="M220,325 H192" marker-end="url(#a3)"/>
+    <text class="lbl" x="206" y="317" text-anchor="middle">לא</text>
+    <rect class="amber" x="20" y="300" width="170" height="50" rx="10"/>
+    <text class="t" x="105" y="321" text-anchor="middle">משלימים את החורים</text>
+    <text class="s" x="105" y="338" text-anchor="middle">וכותבים שוב</text>
+    <path class="line" d="M105,300 V239 H138" marker-end="url(#a3)"/>
+    <path class="line" d="M340,360 V383" marker-end="url(#a3)"/>
+    <text class="lbl" x="348" y="376" text-anchor="end">כן</text>
+
+    <rect class="jev" x="140" y="385" width="400" height="52" rx="12"/>
+    <text class="t" x="340" y="406" text-anchor="middle">הפתק נשמר · נפתחת לשונית Claude חדשה</text>
+    <text class="s" x="340" y="425" text-anchor="middle">עם קוד המשך כמו relay:1a2b3c4d</text>
+    <path class="line" d="M340,437 V455" marker-end="url(#a3)"/>
+
+    <rect class="you" x="140" y="457" width="400" height="52" rx="12"/>
+    <text class="t" x="340" y="478" text-anchor="middle">סשן חדש קורא את הפתק</text>
+    <text class="s" x="340" y="497" text-anchor="middle">וממשיך בדיוק מהמקום שבו הקודם עצר</text>
+  </svg>
+  </figure>
+
+  <h3>מה כותבים בפתק ההעברה?</h3>
+  <table>
+    <tr><td style="width:30%"><b class="en">GOAL</b> (מטרה)</td><td>מה אנחנו מנסים להשיג.</td></tr>
+    <tr><td><b class="en">STATE</b> (מצב)</td><td>מה כבר נעשה ומה נשאר.</td></tr>
+    <tr><td><b class="en">DECISIONS</b> (החלטות)</td><td>מה הוחלט ולמה, וגם רעיונות שנפסלו (כדי שהסשן הבא לא ינסה אותם שוב).</td></tr>
+    <tr><td><b class="en">VERIFIED vs UNVERIFIED</b></td><td>מה באמת נבדק (עם הפקודה והתוצאה) לעומת מה שרק מניחים. הסשן החדש בודק מחדש את מה שלא אומת.</td></tr>
+    <tr><td><b class="en">NEXT STEP</b> (הצעד הבא)</td><td>הדבר המדויק הבא שצריך לעשות.</td></tr>
+  </table>
+  <p style="font-size:10pt;color:var(--muted)">גם המסמך הזה נוצר אחרי העברה כזאת! הסשן הקודם התמלא, כתב פתק, וסשן חדש המשיך מאיפה שהוא עצר.</p>
+</section>
+
+<!-- ============ עמוד 7 ============ -->
+<section class="page">
+  <h2>החוקים הגדולים, בעמוד אחד</h2>
+  <ol class="rules">
+    <li><b>הבוס חושב, העוזרים מביאים.</b> תכנון, באגים מסובכים והחלטות אבטחה נשארים אצל השף. קריאה, הרצת בדיקות וביצוע הוראות ברורות עוברים לעוזרים זולים יותר.</li>
+    <li><b>משימה קטנה? פשוט עושים.</b> אם זה בערך שלושה צעדים או פחות, לא צריך עוזרים.</li>
+    <li><b>הוראות ברורות.</b> כל תדריך אומר מה המטרה, אילו קבצים בדיוק, מה החוקים, איך בודקים שזה עבד ומה להחזיר.</li>
+    <li><b>מראים את הדרך.</b> בכל דיווח יש RESULT, EVIDENCE, CONFIDENCE ו-UNVERIFIED, עם קודי יציאה אמיתיים.</li>
+    <li><b>לא סומכים, בודקים.</b> הוכחה חלשה? השף בודק בעצמו, או שהמשימה עולה רמה. אף פעם לא סתם "לנסות שוב את אותו דבר".</li>
+    <li><b>מסוכן = מבקר.</b> אבטחה, מחיקת מידע ושינויים שתוכנות אחרות תלויות בהם עוברים ביקורת בעיניים רעננות לפני שהם נחשבים גמורים.</li>
+    <li><b>המפתחות אצלכם.</b> push, פרסום, deploy, מחיקה ושליחה: רק השף עושה אותם, ורק באישור שלכם.</li>
+    <li><b>מעבירים את המקל.</b> כשהזיכרון נגמר, כותבים פתק העברה טוב וממשיכים בסשן חדש.</li>
+    <li><b>אומרים את האמת.</b> הדיווח הסופי אומר מה רץ, מה עבר ומה לא נבדק. כישלונות מדווחים מילה במילה.</li>
+  </ol>
+
+  <h3>מילים שכדאי להכיר</h3>
+  <table>
+    <tr><td style="width:24%"><b>אורקסטרטור</b></td><td>ה-AI ה"בוס" שמתכנן ומתאם, כמו מנצח או שף ראשי.</td></tr>
+    <tr><td><b>סוכן משנה</b> (Subagent)</td><td>AI עוזר שהאורקסטרטור מפעיל למשימה אחת (סייר, מריץ, בנאי, מבקר).</td></tr>
+    <tr><td><b>מודל</b></td><td>ה"מוח" של ה-AI. <span class="en">Opus 5.5</span> הוא החושב הגדול; <span class="en">Sonnet</span> מהיר וזול; <span class="en">Fable</span> הוא המוח של המבקר.</td></tr>
+    <tr><td><b>קונטקסט / טוקנים</b></td><td>הזיכרון לטווח קצר של ה-AI, וחתיכות המילים הקטנות שבהן מודדים אותו.</td></tr>
+    <tr><td><b>תדריך</b> (Brief)</td><td>ההוראות שעוזר מקבל.</td></tr>
+    <tr><td><b>Diff</b></td><td>הרשימה המדויקת של השורות שנוספו או נמחקו בשינוי.</td></tr>
+    <tr><td><b>קוד יציאה</b></td><td>המספר שתוכנה מחזירה כשהיא מסיימת: 0 = הצלחה, כל מספר אחר = בעיה.</td></tr>
+    <tr><td><b class="en">git commit / push</b></td><td>commit = שמירת "תמונה" של הקוד במחשב שלכם. push = העלאת התמונות האלה ל-GitHub בשביל אחרים.</td></tr>
+    <tr><td><b>Hook</b></td><td>תוכנה קטנה שרצה אוטומטית ברגעים מסוימים (למשל לפני שפקודה רצה). הממסר והשומר Jev הם hooks.</td></tr>
+    <tr><td><b>Jev</b></td><td>שופט AI מהיר (של TypeSafe) שעונה על שאלות קצרות כמו "כמה מסוכן / איזה מהם / זה מספיק טוב?".</td></tr>
+    <tr><td><b>העברה / ממסר</b></td><td>הפתק והמערכת שמאפשרים לסשן חדש להמשיך את העבודה.</td></tr>
+  </table>
+</section>
+
+</body>
+</html>
