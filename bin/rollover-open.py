@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import subprocess
 import sys
@@ -142,23 +143,68 @@ def editor_hosts(limit: int = 32) -> list[int]:
     return [pid for pid in hosts[1:] if pid > 0]
 
 
+def shell_ancestors(limit: int = 32) -> list[int]:
+    """Ancestor PIDs when this runs in a VS Code integrated terminal. Terminal processes are
+    not under the extension host, so `hosts` is empty there; the bridge instead matches these
+    against the shell PIDs of its own window's terminals. Empty outside VS Code or on error."""
+    if os.environ.get("TERM_PROGRAM") != "vscode":
+        return []
+    try:
+        parents = parent_map()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []  # untargeted: the last active VS Code window opens the terminal instead
+    seen, pid = [], os.getpid()
+    while pid in parents and pid not in seen and len(seen) < limit:
+        seen.append(pid)
+        pid = parents[pid]
+    return [pid for pid in seen[1:] if pid > 0]
+
+
+TERMINAL_CLIENTS = ("claude-terminal", "claude-wt")
+RELAY_TOKEN = re.compile(r"relay:[0-9a-f]{8}")
+
+
+def launch_wt(handoff: Path, resume_token: str) -> str:
+    """Open a Windows Terminal tab running the relay prompt. The prompt is built from the
+    validated token only, so it carries no shell metacharacters."""
+    prompt = f"{resume_token} continue from the saved handoff."
+    wt, claude = resolve_executable("wt"), resolve_executable("claude")
+    if not wt or not claude:
+        return f"Windows Terminal launch unavailable (wt or claude not on PATH). Open a new terminal and run: claude \"{prompt}\""
+    try:
+        # wt splits its command line into subcommands on unescaped `;`, even inside a path.
+        cwd = os.getcwd().replace(";", "\\;")
+        subprocess.run([wt, "-w", "0", "new-tab", "--title", "Claude relay", "-d", cwd,
+                        claude, prompt], check=True, capture_output=True, timeout=15)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return f"Windows Terminal launch failed ({exc}). Open a new terminal and run: claude \"{prompt}\""
+    return "Windows Terminal tab launch acknowledged (wt.exe exit 0); the relay session is starting there."
+
+
 def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 12.0) -> str:
     handoff = handoff.expanduser().resolve(strict=True)
     if not handoff.is_file():
         raise ValueError(f"handoff is not a regular file: {handoff}")
-    if client not in ("claude", "codex"):
+    if client not in ("claude", "codex", *TERMINAL_CLIENTS):
         raise ValueError(f"unknown client: {client}")
     if client == "claude" and not resume_token.startswith("relay:"):
         raise ValueError("Claude handoffs require a relay:<id> resume token")
+    if client in TERMINAL_CLIENTS and not RELAY_TOKEN.fullmatch(resume_token):
+        raise ValueError("terminal handoffs require a relay:<8 hex> resume token")
+    if client == "claude-wt":
+        return launch_wt(handoff, resume_token)
+    terminal = client == "claude-terminal"
+    what = "Claude terminal" if terminal else f"{client} tab"
     request_id = secrets.token_hex(16)
-    prompt = (f"{resume_token} continue from the saved handoff." if client == "claude"
-              else codex_prompt(handoff))
+    prompt = (codex_prompt(handoff) if client == "codex"
+              else f"{resume_token} continue from the saved handoff.")
     root = home()
     request = root / "launches" / f"{request_id}.json"
-    write_json(request, {
-        "client": client, "handoff": str(handoff), "prompt": prompt,
-        "created_at": time.time(), "hosts": editor_hosts(),
-    })
+    data = {"client": client, "handoff": str(handoff), "prompt": prompt,
+            "created_at": time.time(), "hosts": editor_hosts()}
+    if terminal:
+        data.update(token=resume_token, cwd=os.getcwd(), shells=shell_ancestors())
+    write_json(request, data)
     uri = f"vscode://coding-orchestrator.handoff-bridge/open?id={request_id}"
     ack = root / "acks" / f"{request_id}.json"
     launched = True
@@ -166,7 +212,7 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
         open_uri(uri)
     except (OSError, subprocess.CalledProcessError) as exc:
         if withdraw(request, CLAIMED_GRACE) is not False:
-            return f"Editor launch failed ({exc}). Open a new {client} tab and send: {prompt}"
+            return f"Editor launch failed ({exc}). Open a new {what} and send: {prompt}"
         launched = False  # a bridge scan already claimed it despite the failed launch
     result = wait_for_ack(ack, timeout if launched else CLAIMED_GRACE)
     if result is None and launched:
@@ -177,22 +223,25 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
             result = wait_for_ack(ack, 0)
             if result is None:
                 return (f"Editor launch was not confirmed and the request could not be withdrawn "
-                        f"({request} is locked), so a {client} tab may still open late. "
-                        f"If none appears, open a new {client} tab and send: {prompt}")
+                        f"({request} is locked), so a {what} may still open late. "
+                        f"If none appears, open a new {what} and send: {prompt}")
         elif withdrawn:
             return (f"The VS Code handoff bridge did not pick up the request within {timeout:g}s "
                     f"(VS Code still starting, or the extension is missing, disabled, or from another "
                     f"version; if this repeats, reinstall it from vscode/handoff-bridge). "
-                    f"Open a new {client} tab and send: {prompt}")
+                    f"Open a new {what} and send: {prompt}")
         else:
             result = wait_for_ack(ack, CLAIMED_GRACE)
     if result is None:
-        return f"Editor launch was requested but not confirmed. Open a new {client} tab and send: {prompt}"
+        return f"Editor launch was requested but not confirmed. Open a new {what} and send: {prompt}"
     if result.get("status") == "opened":
         if client == "codex":
             return "Codex tab launch acknowledged; handoff and continuation prompt copied. Paste and send it."
+        if terminal:
+            return ("Claude terminal tab launch acknowledged; the relay session is starting "
+                    "in a new VS Code terminal.")
         return "Claude tab launch acknowledged with the continuation prompt pre-filled. Press Enter there."
-    return f"Editor could not open the {client} tab: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
+    return f"Editor could not open the {what}: {result.get('error', 'unknown error')}. Open one and send: {prompt}"
 
 
 def wait_for_ack(path: Path, seconds: float):
@@ -262,7 +311,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     opener = sub.add_parser("open")
-    opener.add_argument("--client", choices=("codex", "claude"), required=True)
+    opener.add_argument("--client", choices=("codex", "claude", "claude-terminal", "claude-wt"), required=True)
     opener.add_argument("--handoff", type=Path, required=True)
     opener.add_argument("--resume-token", default="")
     writer = sub.add_parser("handoff")

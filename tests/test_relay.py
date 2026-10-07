@@ -120,6 +120,57 @@ class RelayTests(unittest.TestCase):
             self.assertFalse(relay_module.open_editor_prompt("relay:1234abcd"))
         self.assertIn("no handler", output.getvalue())
 
+    def test_open_client_picks_a_terminal_for_cli_sessions(self):
+        cases = [
+            ({"CLAUDE_CODE_ENTRYPOINT": "cli", "TERM_PROGRAM": "vscode", "WT_SESSION": "x"}, "win32",
+             "claude-terminal"),
+            ({"CLAUDE_CODE_ENTRYPOINT": "cli", "TERM_PROGRAM": "", "WT_SESSION": "x"}, "win32", "claude-wt"),
+            ({"CLAUDE_CODE_ENTRYPOINT": "cli", "TERM_PROGRAM": "", "WT_SESSION": "x"}, "linux", "claude"),
+            ({"CLAUDE_CODE_ENTRYPOINT": "cli", "TERM_PROGRAM": "", "WT_SESSION": ""}, "win32", "claude"),
+            ({"CLAUDE_CODE_ENTRYPOINT": "cli", "TERM_PROGRAM": "iTerm.app", "WT_SESSION": ""}, "darwin",
+             "claude"),
+            ({"CLAUDE_CODE_ENTRYPOINT": "claude-vscode", "TERM_PROGRAM": "vscode", "WT_SESSION": "x"}, "win32",
+             "claude"),
+            ({"CLAUDE_CODE_ENTRYPOINT": "", "TERM_PROGRAM": "vscode", "WT_SESSION": "x"}, "win32", "claude"),
+        ]
+        for env, platform, expected in cases:
+            with self.subTest(env=env, platform=platform), \
+                    patch.dict(os.environ, env), \
+                    patch.object(relay_module.sys, "platform", platform):
+                self.assertEqual(relay_module.open_client(), expected)
+
+    def test_terminal_client_failure_copies_instead_of_opening_the_panel(self):
+        handoffs = self.home / "relay/handoffs"
+        argv_file = Path(self.temp.name) / "helper-argv.json"
+        helper = self.home / "bin" / "rollover-open.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text(f"import json, sys\nopen({str(argv_file)!r}, 'w').write(json.dumps(sys.argv))\n"
+                          "print('Windows Terminal launch unavailable')\nsys.exit(2)\n", encoding="utf-8")
+        for env, platform, client in (({"TERM_PROGRAM": "vscode", "WT_SESSION": ""}, "linux", "claude-terminal"),
+                                      ({"TERM_PROGRAM": "", "WT_SESSION": "x"}, "win32", "claude-wt")):
+            with self.subTest(client=client), \
+                    patch.object(relay_module.sys, "platform", platform), \
+                    patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_RELAY_ROLLOVER": "open",
+                                            **env}), \
+                    patch.object(relay_module, "open_editor_prompt",
+                                 side_effect=AssertionError("panel must not open")), \
+                    patch.object(relay_module, "copy_to_clipboard", return_value=True) as copied, \
+                    patch.object(relay_module, "HANDOFFS", handoffs), \
+                    patch.object(relay_module, "STATE", self.home / "relay/state"), \
+                    patch.object(relay_module, "ROOT", self.home / "relay"), \
+                    patch.object(relay_module, "CLAUDE_HOME", self.home), \
+                    patch.object(relay_module, "jev_client", None), \
+                    patch.object(relay_module.sys, "stdin", io.StringIO(
+                        "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks")), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                relay_module.cmd_handoff(["--title", "test"])
+            argv = json.loads(argv_file.read_text(encoding="utf-8"))
+            self.assertEqual(argv[argv.index("--client") + 1], client)
+            self.assertRegex(argv[argv.index("--resume-token") + 1], r"^relay:[0-9a-f]{8}$")
+            copied.assert_called_once()
+            self.assertIn("handoff bridge failed (exit 2)", output.getvalue())
+            self.assertIn("relay prompt copied to the clipboard", output.getvalue())
+
     def test_installed_handoff_uses_shared_bridge(self):
         helper = self.home / "bin" / "rollover-open.py"
         helper.parent.mkdir(parents=True)

@@ -98,8 +98,36 @@ function targetsThisWindow(request) {
   return Array.isArray(request.hosts) && request.hosts.includes(process.pid);
 }
 
-function targetsOtherWindow(request) {
-  return Array.isArray(request.hosts) && request.hosts.length > 0 && !targetsThisWindow(request);
+// A Claude CLI session in an integrated terminal is not under the extension host, so its
+// `hosts` is empty. It lists its ancestor PIDs in `shells` instead, and the window whose own
+// terminal shell is among them owns the request.
+function nonEmpty(list) {
+  return Array.isArray(list) && list.length > 0;
+}
+
+// A terminal whose shell never started leaves processId pending forever; without a bound
+// the scan would never finish and the poll latch would stop every later request.
+const PROCESS_ID_TIMEOUT_MS = 1000;
+
+function terminalPid(terminal) {
+  let timer;
+  const timeout = new Promise(resolve => { timer = setTimeout(resolve, PROCESS_ID_TIMEOUT_MS); });
+  return Promise.race([Promise.resolve(terminal.processId), timeout]).finally(() => clearTimeout(timer));
+}
+
+async function ownsRequest(request) {
+  if (targetsThisWindow(request)) return true;
+  if (!nonEmpty(request.shells)) return false;
+  for (const terminal of vscode.window.terminals) {
+    let pid;
+    try { pid = await terminalPid(terminal); } catch { continue; }
+    if (Number.isInteger(pid) && request.shells.includes(pid)) return true;
+  }
+  return false;
+}
+
+async function targetedElsewhere(request) {
+  return (nonEmpty(request.hosts) || nonEmpty(request.shells)) && !(await ownsRequest(request));
 }
 
 function readRequest(root, id) {
@@ -120,6 +148,29 @@ async function focusSession(request) {
     throw new Error('invalid or expired focus request');
   }
   await vscode.commands.executeCommand('claude-vscode.primaryEditor.open', request.session);
+}
+
+const RELAY_TOKEN = /^relay:[0-9a-f]{8}$/;
+
+// A Claude CLI session continues in a new integrated terminal. The text is typed into a
+// shell, so it is built only from the validated token, never from request.prompt or any
+// other free text in the request, which could carry shell syntax.
+function openTerminal(request) {
+  if (typeof request.token !== 'string' || !RELAY_TOKEN.test(request.token) ||
+      typeof request.handoff !== 'string' || !Number.isFinite(request.created_at) ||
+      Math.abs(Date.now() / 1000 - request.created_at) > 300 ||
+      !fs.statSync(request.handoff).isFile()) {
+    throw new Error('invalid or expired handoff request');
+  }
+  let cwd;
+  try {
+    if (typeof request.cwd === 'string' && path.isAbsolute(request.cwd) &&
+        fs.statSync(request.cwd).isDirectory()) cwd = request.cwd;
+  } catch { /* a missing folder falls back to the terminal default */ }
+  const text = `claude "${request.token} continue from the saved handoff."`;
+  const terminal = vscode.window.createTerminal({ name: 'Claude relay', cwd });
+  terminal.show();
+  terminal.sendText(text, true);
 }
 
 async function handleUri(uri) {
@@ -150,7 +201,7 @@ async function scanPending() {
       }
     } catch { continue; }
     const request = readRequest(root, id);
-    if (request && targetsThisWindow(request)) await openRequest(root, id, false);
+    if (request && await ownsRequest(request)) await openRequest(root, id, false);
   }
 }
 
@@ -159,7 +210,7 @@ async function openRequest(root, id, viaUri) {
   let request;
   try {
     request = JSON.parse(fs.readFileSync(launch, 'utf8'));
-    if (viaUri && request && targetsOtherWindow(request)) return;  // checked before claiming
+    if (viaUri && request && await targetedElsewhere(request)) return;  // checked before claiming
     fs.unlinkSync(launch);  // consume the request so its URI cannot be replayed
   } catch (error) {
     // Already claimed through this window's other path, or withdrawn by the helper.
@@ -171,6 +222,11 @@ async function openRequest(root, id, viaUri) {
     if (request?.action === 'focus') {
       await focusSession(request);
       writeAck(root, id, { status: 'focused', session: request.session });
+      return;
+    }
+    if (request?.client === 'claude-terminal') {
+      openTerminal(request);
+      writeAck(root, id, { status: 'opened', client: 'claude-terminal' });
       return;
     }
     const isCodex = request.client === 'codex';

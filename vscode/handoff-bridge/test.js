@@ -18,6 +18,14 @@ const mockVscode = {
   window: {
     tabGroups: { all: [{ tabs }] },
     registerUriHandler: handler => { calls.push(['registered', handler]); return {}; },
+    terminals: [],
+    createTerminal: options => {
+      calls.push(['createTerminal', options]);
+      return {
+        show: () => calls.push(['show']),
+        sendText: (text, addNewLine) => calls.push(['sendText', text, addNewLine]),
+      };
+    },
   },
 };
 const originalLoad = Module._load;
@@ -27,6 +35,16 @@ Module._load = function(request, parent, isMain) {
 };
 const bridge = require('./extension');
 Module._load = originalLoad;
+
+// An await that never settles lets Node drain the loop and exit 0 without running the rest;
+// fail the run unless every test got to the end.
+let finished = false;
+process.on('exit', code => {
+  if (!finished && code === 0) {
+    console.error('handoff bridge tests did not complete');
+    process.exitCode = 1;
+  }
+});
 
 (async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-orchestrator-bridge-test-'));
@@ -390,7 +408,113 @@ Module._load = originalLoad;
       assert.match(badAck.error, /invalid or expired focus request/);
       assert.equal(fs.existsSync(path.join(root, 'launches', `${badId}.json`)), false);
     }
+    // A Claude CLI request opens a new integrated terminal. The typed text is built from the
+    // validated token only; an injected prompt is ignored.
+    const terminalText = 'claude "relay:abcd1234 continue from the saved handoff."';
+    const terminalId = '7a'.repeat(16);
+    fs.writeFileSync(path.join(root, 'launches', `${terminalId}.json`), JSON.stringify({
+      client: 'claude-terminal', handoff: outside, token: 'relay:abcd1234',
+      prompt: 'relay:abcd1234 continue."; rm -rf / #', cwd: root,
+      created_at: Date.now() / 1000, hosts: [], shells: [],
+    }));
+    calls.length = 0;
+    await bridge.handleUri({ path: '/open', query: `id=${terminalId}` });
+    assert.deepEqual(calls, [['createTerminal', { name: 'Claude relay', cwd: root }], ['show'],
+                             ['sendText', terminalText, true]]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${terminalId}.json`))),
+                     { status: 'opened', client: 'claude-terminal' });
+    assert.equal(fs.existsSync(path.join(root, 'launches', `${terminalId}.json`)), false);
+
+    // Malformed tokens and expired terminal requests are refused without a terminal.
+    for (const [badId, bad] of [
+      ['7b'.repeat(16), { token: 'relay:abcd1234; rm -rf /' }],
+      ['7c'.repeat(16), { token: 'relay:ABCD1234' }],
+      ['7d'.repeat(16), { token: undefined }],
+      ['7e'.repeat(16), { token: 'relay:abcd1234', created_at: Date.now() / 1000 - 301 }],
+    ]) {
+      fs.writeFileSync(path.join(root, 'launches', `${badId}.json`), JSON.stringify({
+        client: 'claude-terminal', handoff: outside, prompt: 'relay:abcd1234 continue',
+        cwd: root, created_at: Date.now() / 1000, ...bad,
+      }));
+      calls.length = 0;
+      await bridge.handleUri({ path: '/open', query: `id=${badId}` });
+      assert.equal(calls.length, 0);
+      const badAck = JSON.parse(fs.readFileSync(path.join(root, 'acks', `${badId}.json`)));
+      assert.equal(badAck.status, 'error');
+      assert.match(badAck.error, /invalid or expired handoff request/);
+    }
+
+    // A cwd that is not an absolute directory is omitted.
+    for (const [cwdId, cwd] of [['7f'.repeat(16), outside], ['8a'.repeat(16), 'relative'],
+                                ['8b'.repeat(16), 42]]) {
+      fs.writeFileSync(path.join(root, 'launches', `${cwdId}.json`), JSON.stringify({
+        client: 'claude-terminal', handoff: outside, token: 'relay:abcd1234', cwd,
+        created_at: Date.now() / 1000,
+      }));
+      calls.length = 0;
+      await bridge.handleUri({ path: '/open', query: `id=${cwdId}` });
+      assert.deepEqual(calls, [['createTerminal', { name: 'Claude relay', cwd: undefined }], ['show'],
+                               ['sendText', terminalText, true]]);
+    }
+
+    // A request whose shell ancestors include one of this window's terminals is opened by
+    // the scan; one naming another window's terminal is ignored by the URL and the scan.
+    mockVscode.window.terminals.push({ processId: Promise.resolve(4242) },
+                                     { processId: Promise.reject(new Error('closed')) });
+    mockVscode.window.terminals[1].processId.catch(() => {});
+    const shellId = '8c'.repeat(16);
+    fs.writeFileSync(path.join(root, 'launches', `${shellId}.json`), JSON.stringify({
+      client: 'claude-terminal', handoff: outside, token: 'relay:abcd1234', cwd: root,
+      created_at: Date.now() / 1000, hosts: [], shells: [99999, 4242],
+    }));
+    calls.length = 0;
+    await bridge.scanPending();
+    assert.deepEqual(calls.map(call => call[0]), ['createTerminal', 'show', 'sendText']);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${shellId}.json`))).status, 'opened');
+    assert.equal(fs.existsSync(path.join(root, 'launches', `${shellId}.json`)), false);
+    const otherShellId = '8d'.repeat(16);
+    const otherShell = path.join(root, 'launches', `${otherShellId}.json`);
+    fs.writeFileSync(otherShell, JSON.stringify({
+      client: 'claude-terminal', handoff: outside, token: 'relay:abcd1234', cwd: root,
+      created_at: Date.now() / 1000, hosts: [], shells: [5151],
+    }));
+    calls.length = 0;
+    await bridge.handleUri({ path: '/open', query: `id=${otherShellId}` });
+    await bridge.scanPending();
+    assert.equal(calls.length, 0);
+    assert.equal(fs.existsSync(otherShell), true);
+    assert.equal(fs.existsSync(path.join(root, 'acks', `${otherShellId}.json`)), false);
+    fs.unlinkSync(otherShell);
+    mockVscode.window.terminals.length = 0;
+
+    // A terminal whose shell never reports a process ID must not stall the scan or the URL:
+    // the lookup times out and the next terminal still matches.
+    mockVscode.window.terminals.push({ processId: new Promise(() => {}) },
+                                     { processId: Promise.resolve(6161) });
+    const stuckId = '8e'.repeat(16);
+    fs.writeFileSync(path.join(root, 'launches', `${stuckId}.json`), JSON.stringify({
+      client: 'claude-terminal', handoff: outside, token: 'relay:abcd1234', cwd: root,
+      created_at: Date.now() / 1000, hosts: [], shells: [6161],
+    }));
+    calls.length = 0;
+    await bridge.scanPending();
+    assert.deepEqual(calls.map(call => call[0]), ['createTerminal', 'show', 'sendText']);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'acks', `${stuckId}.json`))).status, 'opened');
+    const stuckUriId = '8f'.repeat(16);
+    const stuckUri = path.join(root, 'launches', `${stuckUriId}.json`);
+    fs.writeFileSync(stuckUri, JSON.stringify({
+      client: 'claude-terminal', handoff: outside, token: 'relay:abcd1234', cwd: root,
+      created_at: Date.now() / 1000, hosts: [], shells: [7171],
+    }));
+    calls.length = 0;
+    await bridge.handleUri({ path: '/open', query: `id=${stuckUriId}` });
+    assert.equal(calls.length, 0);
+    assert.equal(fs.existsSync(stuckUri), true);
+    fs.unlinkSync(stuckUri);
+    mockVscode.window.terminals.length = 0;
+
     console.log('handoff bridge tests passed');
+    finished = true;
   } finally {
     if (path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep) &&
         path.basename(root).startsWith('coding-orchestrator-bridge-test-')) {

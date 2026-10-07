@@ -151,6 +151,12 @@ Rollover has two modes:
   only). If neither launch is confirmed, it falls back to copy behaviour. On
   Windows the editor URI launch cannot be confirmed, so the prompt is copied
   as well.
+  A Claude Code CLI session continues in a new terminal instead, running
+  `claude "relay:<id> continue from the saved handoff."`: in VS Code's
+  integrated terminal, the bridge (0.7.0 or later) opens a new terminal in the
+  window that owns the session; in Windows Terminal, the helper opens a new tab
+  with `wt.exe`, which closes when `claude` exits. If that launch fails, the
+  relay copies the prompt rather than opening the extension panel.
 - **`copy`**: no tab or editor launch is attempted. The relay only copies the
   resume prompt to the clipboard and prints it. Start a new Claude session (a
   new tab or `/clear`) and paste it. The clipboard is `pbcopy` on macOS, `clip`

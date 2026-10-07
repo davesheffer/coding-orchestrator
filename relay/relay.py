@@ -73,6 +73,19 @@ def editor_scheme():
     return scheme
 
 
+def open_client():
+    """Bridge client for an "open" rollover. A CLI session continues in a new terminal:
+    VS Code's integrated terminal through the bridge, or a Windows Terminal tab via wt.exe.
+    Everything else opens the Claude extension panel."""
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT") != "cli":
+        return "claude"
+    if os.environ.get("TERM_PROGRAM") == "vscode":
+        return "claude-terminal"
+    if sys.platform == "win32" and os.environ.get("WT_SESSION"):
+        return "claude-wt"
+    return "claude"
+
+
 def open_editor_prompt(next_prompt):
     scheme = editor_scheme()
     if not scheme or sys.platform not in ("darwin", "win32"):
@@ -703,8 +716,9 @@ def cmd_handoff(argv):
     print(f"handoff saved: {path}")
     do_open = do_open and rollover_mode(cfg) == "open"
     helper = CLAUDE_HOME / "bin" / "rollover-open.py"
+    client = open_client() if do_open else "claude"
     if do_open and helper.is_file():
-        result = subprocess.run([sys.executable, str(helper), "open", "--client", "claude",
+        result = subprocess.run([sys.executable, str(helper), "open", "--client", client,
                                  "--handoff", str(path), "--resume-token", f"relay:{hid}"],
                                 capture_output=True, text=True, encoding="utf-8")
         if result.returncode == 0:
@@ -712,7 +726,8 @@ def cmd_handoff(argv):
             return
         print(f"handoff bridge failed (exit {result.returncode}): "
               f"{result.stdout.strip()} {result.stderr.strip()}".strip())
-    if do_open and open_editor_prompt(next_prompt):
+    # A terminal session must not fall back to the extension panel; it gets the prompt instead.
+    if do_open and client == "claude" and open_editor_prompt(next_prompt):
         return
     print_copy_instructions(next_prompt)
 

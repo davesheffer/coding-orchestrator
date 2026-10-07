@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -126,6 +127,121 @@ class RolloverOpenTests(unittest.TestCase):
                 patch.object(rollover, "parent_map", return_value=parents), \
                 patch.object(rollover.os, "getpid", return_value=100):
             self.assertEqual(rollover.editor_hosts(), [90, 80])
+
+    def test_claude_terminal_request_carries_token_cwd_and_shells(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "editor_hosts", return_value=[]), \
+                patch.object(rollover, "shell_ancestors", return_value=[4321, 8765]):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+            seen = []
+
+            def acknowledge(uri):
+                request_id = uri.split("id=", 1)[1]
+                seen.append(json.loads((Path(temp) / "launches" / f"{request_id}.json").read_text()))
+                rollover.write_json(Path(temp) / "acks" / f"{request_id}.json",
+                                    {"status": "opened", "client": "claude-terminal"})
+
+            with patch.object(rollover, "open_uri", side_effect=acknowledge):
+                result = rollover.launch("claude-terminal", handoff, "relay:abcd1234", timeout=0.1)
+            self.assertIn("tab launch acknowledged", result)
+            self.assertIn("VS Code terminal", result)
+            request = seen[0]
+            self.assertEqual(request["client"], "claude-terminal")
+            self.assertEqual(request["token"], "relay:abcd1234")
+            self.assertEqual(request["prompt"], "relay:abcd1234 continue from the saved handoff.")
+            self.assertEqual(request["cwd"], os.getcwd())
+            self.assertEqual(request["shells"], [4321, 8765])
+            self.assertEqual(request["hosts"], [])
+
+    def test_claude_terminal_unclaimed_request_falls_back_to_the_prompt(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "shell_ancestors", return_value=[]), \
+                patch.object(rollover, "open_uri"):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\n", encoding="utf-8")
+            result = rollover.launch("claude-terminal", handoff, "relay:abcd1234", timeout=0)
+            self.assertNotIn("acknowledged", result)
+            self.assertIn("Open a new Claude terminal and send: relay:abcd1234 continue", result)
+
+    def test_terminal_clients_reject_malformed_tokens(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                patch.object(rollover, "open_uri", side_effect=AssertionError("no launch")), \
+                patch.object(rollover.subprocess, "run", side_effect=AssertionError("no launch")):
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\n", encoding="utf-8")
+            for client in ("claude-terminal", "claude-wt"):
+                for token in ("", "relay:abcd1234; rm -rf /", "relay:ABCD1234", "relay:abcd123",
+                              "relay:abcd1234\n", "x relay:abcd1234"):
+                    with self.subTest(client=client, token=token), self.assertRaises(ValueError):
+                        rollover.launch(client, handoff, token)
+            self.assertFalse((Path(temp) / "launches").exists())
+
+    def test_shell_ancestors_only_inside_a_vscode_terminal(self):
+        parents = {100: 90, 90: 80, 80: 90}
+        with patch.dict(os.environ, {"TERM_PROGRAM": "vscode"}), \
+                patch.object(rollover, "parent_map", return_value=parents), \
+                patch.object(rollover.os, "getpid", return_value=100):
+            self.assertEqual(rollover.shell_ancestors(), [90, 80])
+        with patch.dict(os.environ, {"TERM_PROGRAM": "vscode"}), \
+                patch.object(rollover, "parent_map", side_effect=OSError("denied")):
+            self.assertEqual(rollover.shell_ancestors(), [])
+        with patch.dict(os.environ, {"TERM_PROGRAM": "WezTerm"}), \
+                patch.object(rollover, "parent_map", side_effect=AssertionError("not needed")):
+            self.assertEqual(rollover.shell_ancestors(), [])
+
+    def test_claude_wt_runs_windows_terminal_with_exact_argv(self):
+        with tempfile.TemporaryDirectory() as temp:
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\n", encoding="utf-8")
+            with patch.object(rollover, "resolve_executable", side_effect=lambda n: f"C:\\bin\\{n}.exe"), \
+                    patch.object(rollover.subprocess, "run") as run, \
+                    patch.object(rollover, "open_uri", side_effect=AssertionError("no bridge")):
+                result = rollover.launch("claude-wt", handoff, "relay:abcd1234")
+            run.assert_called_once_with(
+                ["C:\\bin\\wt.exe", "-w", "0", "new-tab", "--title", "Claude relay", "-d", os.getcwd(),
+                 "C:\\bin\\claude.exe", "relay:abcd1234 continue from the saved handoff."],
+                check=True, capture_output=True, timeout=15)
+            self.assertIn("tab launch acknowledged", result)
+            self.assertFalse((Path(temp) / "launches").exists())
+
+    def test_claude_wt_escapes_semicolons_in_cwd(self):
+        with tempfile.TemporaryDirectory() as temp:
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\n", encoding="utf-8")
+            with patch.object(rollover, "resolve_executable", side_effect=lambda n: f"C:\\bin\\{n}.exe"), \
+                    patch.object(rollover.os, "getcwd", return_value="C:\\a;b\\c"), \
+                    patch.object(rollover.subprocess, "run") as run:
+                rollover.launch("claude-wt", handoff, "relay:abcd1234")
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[argv.index("-d") + 1], "C:\\a\\;b\\c")
+
+    def test_claude_wt_unavailable_or_failed_falls_back_with_exit_2(self):
+        with tempfile.TemporaryDirectory() as temp:
+            handoff = Path(temp) / "handoff.md"
+            handoff.write_text("GOAL: continue\n", encoding="utf-8")
+            command = 'claude "relay:abcd1234 continue from the saved handoff."'
+            argv = ["open", "--client", "claude-wt", "--handoff", str(handoff),
+                    "--resume-token", "relay:abcd1234"]
+            failures = [
+                (patch.object(rollover, "resolve_executable", return_value=None), "unavailable"),
+                (patch.object(rollover.subprocess, "run",
+                              side_effect=subprocess.CalledProcessError(1, "wt")), "failed"),
+                (patch.object(rollover.subprocess, "run",
+                              side_effect=subprocess.TimeoutExpired("wt", 15)), "failed"),
+                (patch.object(rollover.subprocess, "run", side_effect=OSError("denied")), "failed"),
+            ]
+            for failure, word in failures:
+                with self.subTest(word=word), \
+                        patch.object(rollover, "resolve_executable", side_effect=lambda n: f"/bin/{n}"), \
+                        failure, \
+                        patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.assertEqual(rollover.main(argv), 2)
+                self.assertIn(f"Windows Terminal launch {word}", output.getvalue())
+                self.assertIn(f"run: {command}", output.getvalue())
 
     def test_launch_failure_after_the_bridge_claimed_still_reports_the_ack(self):
         with tempfile.TemporaryDirectory() as temp, \
