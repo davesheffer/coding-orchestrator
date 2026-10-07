@@ -1145,10 +1145,10 @@ class GateTests(unittest.TestCase):
     def test_issue_39_long_dash_c_chain(self):
         # -C accumulates like cd and is capped the same way (quadratic before: 2.5 s).
         j = os.path.join
-        start = time.monotonic()
-        targets = jev._scan_targets("git " + "-C a " * 160000 + "push", "/repo")
-        self.assertLess(time.monotonic() - start, 2.0)
-        self.assertEqual([t[:2] for t in targets], [("push", "/repo")])
+        command = "git " + "-C a " * 160000 + "push"
+        targets = []
+        self._assert_fast(lambda: targets.append(jev._scan_targets(command, "/repo")), "long -C chain")
+        self.assertEqual([t[:2] for t in targets[-1]], [("push", "/repo")])
         long_chain = "git " + "-C a " * 3000
         for command, cwd in ((long_chain + "-C b push", "/repo"),
                              (long_chain + "-C /opt/x -C y push", j("/repo", j("/opt/x", "y"))),
