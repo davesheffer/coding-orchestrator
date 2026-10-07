@@ -106,19 +106,31 @@ def managed_block(data: bytes, path: Path) -> bytes:
     return data[start:end + len(END)]
 
 
+# Fresh installs before #70 copied this repo's generated Hunch block into the global
+# file directly after ours. It is installer output, not user text, so upgrades drop it.
+STRAY_HUNCH = re.compile(
+    r"\A\s*<!-- HUNCH:START — auto-generated, do not edit by hand -->.*?<!-- HUNCH:END -->".encode(),
+    re.S)
+
+
 def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> bytes:
     block = managed_block(source, Path("source CLAUDE.md"))
+    newline = b"\r\n" if b"\r\n" in block else b"\n"
     # Install only the managed block: the source file is also this repo's own
     # project instructions, so anything outside the markers is not ours to copy.
     if existing is None or digest(existing.replace(b"\r\n", b"\n")) in LEGACY_CLAUDE_HASHES:
-        return block + b"\n"
+        return block + newline
     start, end = existing.find(START), existing.find(END)
     if start == end == -1:
-        separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
-        return existing + separator + block + b"\n"
+        separator = b"" if not existing or existing.endswith(b"\n") else newline
+        return existing + separator + block + newline
     if existing.count(START) != 1 or existing.count(END) != 1 or start > end:
         fail(f"invalid managed markers in {path}")
-    return existing[:start] + block + existing[end + len(END):]
+    tail = existing[end + len(END):]
+    stray = STRAY_HUNCH.match(tail)
+    if stray:
+        tail = tail[stray.end():] or newline
+    return existing[:start] + block + tail
 
 
 # Hook commands run through a POSIX shell (Git Bash on Windows), where the python.org

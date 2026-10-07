@@ -58,6 +58,16 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(merged, b"<!-- CODEX-ORCHESTRATOR:START -->\nrules\n"
                                  b"<!-- CODEX-ORCHESTRATOR:END -->\n")
 
+    def test_instructions_end_with_newline_in_source_line_endings(self):
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                source = (b"<!-- CODEX-ORCHESTRATOR:START -->\nrules\n"
+                          b"<!-- CODEX-ORCHESTRATOR:END -->\n").replace(b"\n", newline)
+                for existing in (None, b"", b"mine" + newline):
+                    merged = install_module.merge_instructions(existing, source, Path("AGENTS.md"))
+                    self.assertEqual(merged, (existing or b"") + source)
+                    self.assertEqual(install_module.merge_instructions(merged, source, Path("AGENTS.md")), merged)
+
     def test_fresh_install_parses_and_installs_helper(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)

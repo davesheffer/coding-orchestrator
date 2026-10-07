@@ -150,12 +150,13 @@ def managed_block(data: bytes, path: Path) -> bytes:
 
 def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> bytes:
     block = managed_block(source, Path("source AGENTS.md"))
+    newline = b"\r\n" if b"\r\n" in block else b"\n"
     # Install only the managed block, never text outside the source's markers.
     if existing is None:
-        return block + b"\n"
+        return block + newline
     start, end = existing.find(START), existing.find(END)
     if start == end == -1:
-        return existing + (b"" if not existing or existing.endswith(b"\n") else b"\n") + block
+        return existing + (b"" if not existing or existing.endswith(b"\n") else newline) + block + newline
     if existing.count(START) != 1 or existing.count(END) != 1 or start > end:
         fail(f"invalid managed markers in {path}")
     return existing[:start] + block + existing[end + len(END):]

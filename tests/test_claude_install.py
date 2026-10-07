@@ -72,12 +72,55 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(self.snapshot(), before)
 
+    def test_upgrade_removes_hunch_block_from_polluted_home(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        path = self.home / "CLAUDE.md"
+        clean = path.read_bytes()
+        newline = b"\r\n" if clean.endswith(b"\r\n") else b"\n"
+        hunch = "<!-- HUNCH:START — auto-generated, do not edit by hand -->\nrepo-only\n<!-- HUNCH:END -->\n"
+        polluted = clean + newline + hunch.encode().replace(b"\n", newline)
+        path.write_bytes(polluted)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_bytes(), clean)
+        self.assertEqual(path.with_name("CLAUDE.md.bak").read_bytes(), polluted)
+        before = self.snapshot()
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
     def test_fresh_instructions_omit_text_outside_managed_block(self):
         source = (b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n<!-- CLAUDE-ORCHESTRATOR:END -->\n\n"
                   b"<!-- HUNCH:START -->\nrepo-only\n<!-- HUNCH:END -->\n")
         merged = install_module.merge_instructions(None, source, Path("CLAUDE.md"))
         self.assertEqual(merged, b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n"
                                  b"<!-- CLAUDE-ORCHESTRATOR:END -->\n")
+
+    def test_upgrade_drops_hunch_block_copied_by_earlier_fresh_install(self):
+        block = b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n<!-- CLAUDE-ORCHESTRATOR:END -->"
+        hunch = "<!-- HUNCH:START — auto-generated, do not edit by hand -->\nrepo-only\n<!-- HUNCH:END -->".encode()
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                source = (block + b"\n").replace(b"\n", newline)
+                polluted = (block + b"\n\n" + hunch + b"\n").replace(b"\n", newline)
+                merged = install_module.merge_instructions(polluted, source, Path("CLAUDE.md"))
+                self.assertEqual(merged, source)
+                self.assertEqual(install_module.merge_instructions(merged, source, Path("CLAUDE.md")), source)
+                private = b"mine\n" + polluted + b"also mine\n"
+                self.assertEqual(install_module.merge_instructions(private, source, Path("CLAUDE.md")),
+                                 b"mine\n" + source.rstrip() + newline + b"also mine\n")
+
+    def test_upgrade_keeps_hunch_text_the_user_placed_elsewhere(self):
+        source = b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n<!-- CLAUDE-ORCHESTRATOR:END -->\n"
+        hunch = "<!-- HUNCH:START — auto-generated, do not edit by hand -->\nx\n<!-- HUNCH:END -->\n".encode()
+        for existing in (hunch + source, source + b"notes\n" + hunch):
+            with self.subTest(existing=existing):
+                self.assertEqual(install_module.merge_instructions(existing, source, Path("CLAUDE.md")), existing)
+
+    def test_fresh_instructions_keep_source_line_endings(self):
+        source = b"<!-- CLAUDE-ORCHESTRATOR:START -->\r\nrules\r\n<!-- CLAUDE-ORCHESTRATOR:END -->\r\n"
+        self.assertEqual(install_module.merge_instructions(None, source, Path("CLAUDE.md")), source)
+        self.assertEqual(install_module.merge_instructions(b"mine\r\n", source, Path("CLAUDE.md")),
+                         b"mine\r\n" + source)
 
     def test_preserves_private_instructions_settings_and_relay_config(self):
         self.home.mkdir(parents=True)
@@ -157,6 +200,7 @@ class ClaudeInstallTests(unittest.TestCase):
                 instructions = self.home.joinpath("CLAUDE.md").read_text(encoding="utf-8")
                 self.assertTrue(instructions.startswith("<!-- CLAUDE-ORCHESTRATOR:START -->"))
                 self.assertNotIn("cheap hands, expensive eyes", instructions)
+                self.assertTrue(instructions.endswith("<!-- CLAUDE-ORCHESTRATOR:END -->\n"))
                 self.assertEqual(self.home.joinpath("CLAUDE.md.bak").read_bytes(), previous)
                 upgraded_settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
                 self.assertEqual(upgraded_settings["model"], "claude-opus-5-5")
