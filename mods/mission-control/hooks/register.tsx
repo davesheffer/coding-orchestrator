@@ -17,6 +17,7 @@ import type {
 import {
   ago,
   bar,
+  capDetail,
   clip,
   clockSeconds,
   clockTime,
@@ -61,6 +62,8 @@ const sessionsCheckedAt = atom({ plugin: 'mission-control', key: 'sessionsChecke
 const activity = atom({ plugin: 'mission-control', key: 'activity' } as const, [])
 const showDetails = atom({ plugin: 'mission-control', key: 'showDetails' } as const, false)
 const openEntries = atom({ plugin: 'mission-control', key: 'openEntries' } as const, [])
+// Set by a prompt, cleared when the main loop's turn ends: the timeline's prompt line can scroll out mid-turn.
+const turnOpen = atom({ plugin: 'mission-control', key: 'turnOpen' } as const, false)
 
 const DRAWER_LINES = 20
 
@@ -346,22 +349,18 @@ async function logActivity($: EngineInterface, entry: ActivityEntry) {
   )
 }
 
+/** Closes one line; a line already closed as stale (stopped, no duration) still takes its real outcome. */
 async function endActivity($: EngineInterface, id: string, status: ActivityEntry['status']) {
   const now = await $.clock.now()
-  await update($, activity, list =>
-    list.map(one => (one.id === id && one.status === 'running' ? { ...one, status, durationMs: now - one.at } : one)),
-  )
+  const isOpen = (one: ActivityEntry) => one.status === 'running' || (one.status === 'stopped' && one.durationMs === undefined)
+  await update($, activity, list => list.map(one => (one.id === id && isOpen(one) ? { ...one, status, durationMs: now - one.at } : one)))
 }
 
-/** Whether the main loop is mid-turn: the newest prompt came after the newest turn end. */
-function isTurnOpen(list: readonly ActivityEntry[]): boolean {
-  for (let i = list.length - 1; i >= 0; i--) {
-    const id = list[i]?.id ?? ''
-    if (id.startsWith('prompt-')) return true
-    if (id.startsWith('turn-')) return false
-  }
-
-  return false
+/** Closes running lines older than STALE_MS as stopped; writes only when one changed, so idle polls draw nothing. */
+async function reapActivity($: EngineInterface, now: number) {
+  const isStale = (one: ActivityEntry) => one.status === 'running' && now - one.at > STALE_MS
+  if (!(await read($, activity)).some(isStale)) return
+  await update($, activity, list => list.map(one => (isStale(one) ? { ...one, status: 'stopped' as const } : one)))
 }
 
 /** The time a drawing measures ages against, from state alone: the poll's tick advances it while work runs. */
@@ -370,12 +369,12 @@ function drawnNow(tick: number, list: readonly ActivityEntry[], runs: readonly A
 }
 
 /** What the session is doing right now, in a few words. */
-function nowText(list: readonly ActivityEntry[], running: readonly AgentRun[], now: number): string {
+function nowText(list: readonly ActivityEntry[], running: readonly AgentRun[], now: number, isTurnOpen: boolean): string {
   const main = list.filter(one => one.who === 'main' && one.status === 'running').at(-1)
   if (main !== undefined) return `${main.text} (${seconds(now - main.at)})`
   if (running.length > 0) return `waiting on ${running.map(agent => roleOf(agent.type)).join(', ')}`
 
-  return isTurnOpen(list) ? 'thinking' : 'idle, waiting for you'
+  return isTurnOpen ? 'thinking' : 'idle, waiting for you'
 }
 
 async function refreshStatus($: EngineInterface) {
@@ -388,7 +387,7 @@ async function refreshStatus($: EngineInterface) {
   const running = list.filter(agent => agent.status === 'running')
   const zone = g === null ? '?' : g.zone.toUpperCase()
   const lines = await read($, activity)
-  const doing = nowText(lines, running, drawnNow(await read($, tick), lines, running))
+  const doing = nowText(lines, running, drawnNow(await read($, tick), lines, running), await read($, turnOpen))
   $.ui.status(clip(`${zone} ${kTokens(g?.tokens)} · now: ${doing} · ${running.length} agents`, 100))
 }
 
@@ -463,6 +462,7 @@ export const register: Register = on => {
         await pollJev($)
         await pollSessions($)
         const list = await read($, agents)
+        await reapActivity($, await $.clock.now())
         const isBusy = (await read($, activity)).some(one => one.status === 'running')
         if (isBusy || list.some(agent => agent.status === 'running')) {
           const now = await $.clock.now()
@@ -496,7 +496,8 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     try {
       const at = await $.clock.now()
-      const detail = e.text.length > 70 ? e.text.slice(0, 4000) : undefined
+      const detail = e.text.length > 70 ? capDetail(e.text) : undefined
+      await update($, turnOpen, () => true)
       await logActivity($, { id: `prompt-${at}`, at, who: 'you', text: `asked: "${clip(e.text, 70)}"`, status: 'note', detail })
     } catch {
       // the timeline is a view; a prompt never waits on it
@@ -575,7 +576,8 @@ export const register: Register = on => {
         text: `${how} (turn took ${seconds(e.durationMs)})`,
         status: e.reason === 'answer' ? 'note' : e.reason === 'aborted' ? 'stopped' : 'error',
       }).catch(() => undefined)
-      await refreshStatus($)
+      await update($, turnOpen, () => false).catch(() => undefined)
+      await refreshStatus($).catch(() => undefined)
 
       return next(e)
     }
@@ -695,7 +697,7 @@ export const register: Register = on => {
     const fill = g?.tokens === undefined ? 0 : g.tokens / g.hard
     const jevColor = j?.isOnline === true ? 'green' : j?.isOnline === false ? 'red' : 'gray'
     const jevText = j?.isOnline === true ? 'Jev ✔' : j?.isOnline === false ? `Jev ✖ ${j.lastError ?? ''}`.trim() : 'Jev ?'
-    const doing = nowText(list, running, now)
+    const doing = nowText(list, running, now, await read($, turnOpen))
     const crew = running.map(agent => `${roleOf(agent.type)} ${seconds(now - agent.startedAt)}`).join(', ')
 
     return (
@@ -739,6 +741,7 @@ export const register: Register = on => {
     const isDetailed = await read($, showDetails)
     const opened = await read($, openEntries)
     const mainNow = lines.filter(one => one.who === 'main' && one.status === 'running').at(-1)
+    const isThinking = await read($, turnOpen)
     const lastCard = cards.at(-1)
     const hunchWarnings = hunchNow.filter(call => call.level !== 'info').length
 
@@ -746,7 +749,7 @@ export const register: Register = on => {
       <Box flexDirection="column" width={width}>
         <Text bold>Now</Text>
         <Text wrap="truncate" color={mainNow === undefined && running.length === 0 ? 'gray' : 'yellow'}>
-          {'  '}main {mainNow === undefined ? (isTurnOpen(lines) ? 'thinking' : 'idle, waiting for you') : `${mainNow.text} · ${seconds(now - mainNow.at)}`}
+          {'  '}main {mainNow === undefined ? (isThinking ? 'thinking' : 'idle, waiting for you') : `${mainNow.text} · ${seconds(now - mainNow.at)}`}
         </Text>
         {running.map(agent => (
           <Text wrap="truncate" color="yellow">

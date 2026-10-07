@@ -582,11 +582,17 @@ export function toolDetail(tool: string, args: Record<string, unknown>): string 
       detail = ''
       break
     default: {
-      const rest = Object.fromEntries(Object.entries(args).filter(([key]) => !['tool', 'tool_use_id', 'agentId'].includes(key)))
+      const reserved = ['tool', 'tool_use_id', 'agentId', 'consent']
+      const rest = Object.fromEntries(Object.entries(args).filter(([key]) => !reserved.includes(key)))
       detail = tool.startsWith('mcp__') && Object.keys(rest).length > 0 ? JSON.stringify(rest, null, 2) : ''
     }
   }
 
+  return capDetail(detail)
+}
+
+/** Cuts drawer text to DETAIL_MAX characters, saying how much was left out. */
+export function capDetail(detail: string): string {
   return detail.length > DETAIL_MAX ? `${detail.slice(0, DETAIL_MAX)}\n… (${detail.length - DETAIL_MAX} more characters)` : detail
 }
 

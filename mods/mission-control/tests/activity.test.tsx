@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 
 import { describeTool, fileName, toolDetail } from '../hooks/parse'
 
@@ -27,7 +28,61 @@ describe('plain activity lines', () => {
     expect(toolDetail('Agent', { prompt: 'do the thing' })).toBe('do the thing')
     expect(toolDetail('Read', { file_path: 'x' })).toBe('')
     expect(toolDetail('Bash', { command: 'x'.repeat(5000) })).toMatch(/1000 more characters\)$/)
+    const mcp = toolDetail('mcp__x__find', { tool: 'mcp__x__find', consent: 'The user pressed "1: Yes"', query: 'q' })
+    expect(mcp).toContain('"query": "q"')
+    expect(mcp).not.toContain('consent')
   })
+})
+
+const band = ($: Parameters<TestBody>[0]) =>
+  $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 120, scroll, view: {} },
+  })
+
+test('mid-turn the band says thinking, even after the prompt line scrolls out of the timeline', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-07T10:00:00') })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: 'ok', stderr: '', interrupted: false }, text: 'ok' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+
+  await $.prompt.submit({ text: 'fix the band', wait: false, origin: { kind: 'composer' } })
+  for (let i = 0; i < 90; i++) await $.tool.call({ tool: 'Bash', command: `echo ${i}`, description: `step ${i}` })
+
+  const view = await band($)
+  expect(await view.find({ text: /now: thinking/ })).toBeDefined()
+  await view.unmount()
+})
+
+test('a call that outlives the stale limit still ends with its real outcome', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-07T10:00:00') })
+  on('ui.status', () => ({ value: undefined }))
+  let release = () => {}
+  const gate = new Promise<void>(resolve => (release = resolve))
+  on('tool.call', { tool: 'Bash' }, async (_, e) => {
+    if (e.command === 'slow') await gate
+
+    return { result: { stdout: 'ok', stderr: '', interrupted: false }, text: 'ok' }
+  })
+
+  // The slow call is still running when, 20 minutes on, another line is logged and marks it stale.
+  const slow = $.tool.call({ tool: 'Bash', command: 'slow', description: 'Long build' })
+  await clock.advance(20 * 60_000)
+  await $.tool.call({ tool: 'Bash', command: 'fast', description: 'Quick step' })
+  release()
+  await slow
+
+  const pane = await $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'mission-control',
+    props: { title: 'Mission Control', isFocused: false, bodyColumns: 100, placement: 'dock', scroll, view: {} },
+  })
+  expect(await pane.find({ text: /main +✔ run: Long build/ })).toBeDefined()
+  await pane.unmount()
 })
 
 test('a tool call shows in the timeline and its drawer opens on demand', async ($, on) => {
@@ -58,12 +113,7 @@ test('a tool call shows in the timeline and its drawer opens on demand', async (
     await pane.unmount()
   }
 
-  const band = await $.ui.mount({
-    plugin: 'mission-control',
-    surface: 'terminal',
-    component: 'AbovePrompt',
-    props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 120, scroll, view: {} },
-  })
-  expect(await band.find({ text: /now: idle, waiting for you/ })).toBeDefined()
-  await band.unmount()
+  const view = await band($)
+  expect(await view.find({ text: /now: idle, waiting for you/ })).toBeDefined()
+  await view.unmount()
 })

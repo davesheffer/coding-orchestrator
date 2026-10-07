@@ -145,6 +145,8 @@ declare module 'claude-code' {
       showDetails: boolean
       /** Timeline lines whose drawer is open, by entry id. */
       openEntries: string[]
+      /** Whether the main loop is mid-turn: set by a prompt, cleared by the main loop's turn end. */
+      turnOpen: boolean
     }
   }
 }
