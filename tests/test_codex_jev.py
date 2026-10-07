@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "codex" / "jev-hook.py"
 spec = importlib.util.spec_from_file_location("codex_jev_hook", HOOK)
 module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+# The hook binds CONFIG/STATE/LOG from CODEX_HOME at import; point it at an empty home so
+# a developer's real ~/.codex/jev config (enabled, with a key) never routes, calls or logs here.
+ISOLATED_HOME = tempfile.TemporaryDirectory()
+with patch.dict(os.environ, {"CODEX_HOME": ISOLATED_HOME.name}):
+    spec.loader.exec_module(module)
 
 UNICODE_TEXT = "\u05e9\u05dc\u05d5\u05dd \u05d0\u05da \U0001f600 \u201cquoted\u201d"
 DRIVER = r"""
