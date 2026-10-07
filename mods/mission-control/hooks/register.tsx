@@ -377,9 +377,18 @@ function nowText(list: readonly ActivityEntry[], running: readonly AgentRun[], n
   return isTurnOpen ? 'thinking' : 'idle, waiting for you'
 }
 
+/** The status line text last set by this copy of the module; a repeat of it is not sent again. */
+let shownStatus: string | undefined | null = null
+
+function setStatus($: EngineInterface, text: string | undefined) {
+  if (text === shownStatus) return
+  shownStatus = text
+  $.ui.status(text)
+}
+
 async function refreshStatus($: EngineInterface) {
   if (!(await read($, isBandHidden))) {
-    $.ui.status(undefined)
+    setStatus($, undefined)
     return
   }
   const g = await read($, gauge)
@@ -388,7 +397,7 @@ async function refreshStatus($: EngineInterface) {
   const zone = g === null ? '?' : g.zone.toUpperCase()
   const lines = await read($, activity)
   const doing = nowText(lines, running, drawnNow(await read($, tick), lines, running), await read($, turnOpen))
-  $.ui.status(clip(`${zone} ${kTokens(g?.tokens)} · now: ${doing} · ${running.length} agents`, 100))
+  setStatus($, clip(`${zone} ${kTokens(g?.tokens)} · now: ${doing} · ${running.length} agents`, 100))
 }
 
 function openPane($: EngineInterface) {
@@ -509,16 +518,15 @@ export const register: Register = on => {
   // Every tool call, from the main loop or a subagent, becomes one plain timeline line.
   on('tool.call', async ($, e, next) => {
     const id = e.tool_use_id
-    try {
+    // Logged alongside the call, not before it: the tool never waits on the timeline.
+    const logged = (async () => {
       const at = await $.clock.now()
       const args = e as unknown as Record<string, unknown>
       const text = describeTool(e.tool, args)
       const detail = toolDetail(e.tool, args) || undefined
       await logActivity($, { id, at, who: await whoOf($, e.agentId), text, status: 'running', detail })
       await refreshStatus($)
-    } catch {
-      // never block a tool on the timeline
-    }
+    })().catch(() => undefined)
 
     let status: ActivityEntry['status'] = 'stopped'
     try {
@@ -530,6 +538,8 @@ export const register: Register = on => {
 
       return result
     } finally {
+      // A fast call can settle before its line is written; close the line only once it exists.
+      await logged
       await endActivity($, id, status).catch(() => undefined)
       await refreshStatus($).catch(() => undefined)
     }

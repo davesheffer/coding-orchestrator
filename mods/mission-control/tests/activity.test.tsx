@@ -56,6 +56,35 @@ test('mid-turn the band says thinking, even after the prompt line scrolls out of
   await view.unmount()
 })
 
+test('a tool starts without waiting on the timeline', async ($, on) => {
+  // The timeline's first host call holds until the tool itself has run: logging first would deadlock.
+  let ran = () => {}
+  const toolRan = new Promise<void>(resolve => (ran = resolve))
+  on('clock.now', async () => {
+    await toolRan
+
+    return { value: Date.parse('2026-10-07T10:00:00') }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'Bash' }, () => {
+    ran()
+
+    return { result: { stdout: 'ok', stderr: '', interrupted: false }, text: 'ok' }
+  })
+
+  await $.tool.call({ tool: 'Bash', command: 'echo hi', description: 'Say hi' })
+
+  const pane = await $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'mission-control',
+    props: { title: 'Mission Control', isFocused: false, bodyColumns: 100, placement: 'dock', scroll, view: {} },
+  })
+  expect(await pane.find({ text: /main +✔ run: Say hi/ })).toBeDefined()
+  await pane.unmount()
+})
+
 test('a call that outlives the stale limit still ends with its real outcome', async ($, on) => {
   const clock = mock.clock(on, { now: Date.parse('2026-10-07T10:00:00') })
   on('ui.status', () => ({ value: undefined }))
