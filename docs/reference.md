@@ -1,7 +1,9 @@
-# Coding Orchestrator
+# Coding Orchestrator: full reference
+
+The friendly overview is in the [README](../README.md). This page has every detail.
 
 [![CI](https://github.com/davesheffer/coding-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/davesheffer/coding-orchestrator/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../LICENSE)
 
 **In plain words:** it turns your AI coder into a team. One smart boss plans
 the work and double-checks every result. Cheaper helpers do the reading,
@@ -17,7 +19,7 @@ with the orchestrator.
 **Experimental release.** This is a configurable workflow bundle for people who
 are comfortable reviewing assistant settings. Installers and helper behavior
 have automated coverage; model access, native delegation, and isolation depend
-on your client and environment. Check the [validation record](docs/client-validation.md)
+on your client and environment. Check the [validation record](client-validation.md)
 before relying on a particular platform or client version.
 
 Every subagent reports `RESULT`, `EVIDENCE`, `CONFIDENCE`, and `UNVERIFIED`.
@@ -429,7 +431,7 @@ Mission Control is a Claude Code mod that shows the orchestrator at work:
 
 The installer does not install it. Copy `mods/mission-control` to
 `~/.claude/mods/mission-control` and follow its
-[README](mods/mission-control/README.md) to load it in every session.
+[README](../mods/mission-control/README.md) to load it in every session.
 
 ### Codex
 
@@ -561,8 +563,8 @@ MCP/tool restrictions, and records actual model usage. The known MCP names in ro
 files are not a wildcard for future servers. The launcher remains dependent on
 the host's Codex sandbox; a prompt alone does not replace enforcement. Other
 platforms retain the verified native/manual launch workflow. See
-[routing and fallbacks](docs/agent-routing.md) for commands and limitations.
-The [optimization audit](docs/optimization-research.md) records the current routing
+[routing and fallbacks](agent-routing.md) for commands and limitations.
+The [optimization audit](optimization-research.md) records the current routing
 change, measured limits, source research, and the experiments needed to compare
 cost per correctly completed task.
 
@@ -573,19 +575,19 @@ the orchestrator must report that limitation and keep the work in the main
 session, unless you explicitly authorize a different boundary. The installer
 does not change firewall settings. See the [Windows sandbox documentation](https://learn.chatgpt.com/docs/windows/windows-sandbox).
 
-An [optional last-resort network fallback](docs/agent-routing.md#optional-network-exception)
+An [optional last-resort network fallback](agent-routing.md#optional-network-exception)
 can be approved per role. The launcher tries isolation first on every run and
 retains file-access limits and disabled external tools. Installation grants no
 exception. Model-unavailable errors before any work can try Luna -> 6.1 Sol -> 6 Sol
 for scout/runner; builder tries 6.1 Sol -> 6 Sol. Tests, partial work and unknown
 errors are never blindly retried. The older
-[critic-only manual workflow](docs/critic-network-fallback.md) remains available.
+[critic-only manual workflow](critic-network-fallback.md) remains available.
 
 Codex uses native compaction within the current session. A transcript-based
-gauge is documented in [the proposal](codex/CONTEXT-GAUGE.md); it is **not
+gauge is documented in [the proposal](../codex/CONTEXT-GAUGE.md); it is **not
 implemented or installed**. For an explicit fresh-session handoff, both clients
 use the same `bin/rollover-open.py` launch protocol and the local
-[VS Code handoff bridge](vscode/handoff-bridge/README.md). The Claude relay
+[VS Code handoff bridge](../vscode/handoff-bridge/README.md). The Claude relay
 supplies its saved handoff to that bridge; Codex supplies a self-contained
 handoff when asked to roll over.
 
@@ -682,7 +684,7 @@ preserves unrelated hooks, exercises custom-home handoffs without installation
 environment variables, and verifies bounded transcript reads.
 
 Before claiming compatibility with a client release, complete the
-[native client acceptance checks](docs/client-validation.md). Those require
+[native client acceptance checks](client-validation.md). Those require
 installed, authenticated clients and are separate from the offline Python suite.
 
 Credentials, personal MCP configuration, per-project assistant configuration,
@@ -693,9 +695,9 @@ Previously named `claude-orchestrator`; the repository now covers both clients.
 ## Contributing
 
 Changes reach `main` through pull requests only, with passing CI and one
-approval. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks to run,
+approval. See [CONTRIBUTING.md](../CONTRIBUTING.md) for setup, the checks to run,
 and the house rules.
 
 ## License
 
-[MIT](LICENSE), copyright David Sheffer.
+[MIT](../LICENSE), copyright David Sheffer.
