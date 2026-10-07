@@ -40,9 +40,9 @@ class ClaudeInstallTests(unittest.TestCase):
         text = (ROOT / "agents" / f"{name}.md").read_bytes().decode("utf-8")
         return install_module.fill_placeholders(text, {
             "__ROLE_GUARD__": json.dumps(
-                f"{install_module.hook_python()} "
+                f"{shlex.quote(install_module.pinned_python())} "
                 f"{shlex.quote((self.home / 'bin/role-guard.py').as_posix())} || exit 2"),
-            "__RO__": f"{install_module.hook_python()} "
+            "__RO__": f"{shlex.quote(install_module.pinned_python())} "
                       f"{shlex.quote((self.home / 'bin/ro.py').as_posix())}",
         }).encode("utf-8")
 
@@ -91,8 +91,19 @@ class ClaudeInstallTests(unittest.TestCase):
         value = json.loads(line.split("command:", 1)[1].strip())
         self.assertIn("role-guard.py", value)
         self.assertTrue(value.endswith("|| exit 2"))
-        self.assertEqual(shlex.split(value)[-4], (self.home / "bin/role-guard.py").as_posix())
+        tokens = shlex.split(value)
+        self.assertEqual(tokens[0], install_module.pinned_python())
+        self.assertEqual(tokens[-4], (self.home / "bin/role-guard.py").as_posix())
         self.assertEqual((self.home / "agents/scout.md").read_bytes(), self.rendered_agent("scout"))
+
+    def test_scout_commands_use_pinned_python(self):
+        python = install_module.pinned_python()
+        self.assertTrue(os.path.isabs(python), python)
+        self.assertEqual(self.run_install().returncode, 0)
+        text = (self.home / "agents/scout.md").read_text(encoding="utf-8")
+        line = next(l for l in text.splitlines() if l.strip().startswith("command:"))
+        self.assertEqual(shlex.split(json.loads(line.split("command:", 1)[1].strip()))[0], python)
+        self.assertIn(f"{shlex.quote(python)} {shlex.quote((self.home / 'bin/ro.py').as_posix())}", text)
 
     def test_role_frontmatter_rejects_unquoted_yaml_colon(self):
         source = (ROOT / "agents/scout.md").read_bytes()

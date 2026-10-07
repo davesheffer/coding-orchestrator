@@ -14,6 +14,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -145,6 +146,14 @@ OWNED_PYTHONS = ("python3", "python")
 
 def hook_python() -> str:
     return "python" if os.name == "nt" else "python3"
+
+
+def pinned_python() -> str:
+    """Base interpreter for scout commands, so a PATH-planted `python` (e.g. a repo .venv) is never used."""
+    python = Path(getattr(sys, "_base_executable", "") or sys.executable).as_posix()
+    if not python or not os.path.isabs(python):
+        fail(f"cannot pin an absolute Python interpreter (got {python!r})")
+    return python
 
 
 def fill_placeholders(text: str, values: dict[str, str]) -> str:
@@ -360,8 +369,9 @@ def main(argv: list[str] | None = None) -> int:
         validate_role(source, data, name)
         managed_sources[dest / "agents" / f"{name}.md"] = fill_placeholders(data.decode("utf-8"), {
             "__ROLE_GUARD__": json.dumps(
-                f"{hook_python()} {shlex.quote((dest / 'bin' / 'role-guard.py').as_posix())} || exit 2"),
-            "__RO__": f"{hook_python()} {shlex.quote((dest / 'bin' / 'ro.py').as_posix())}",
+                f"{shlex.quote(pinned_python())} "
+                f"{shlex.quote((dest / 'bin' / 'role-guard.py').as_posix())} || exit 2"),
+            "__RO__": f"{shlex.quote(pinned_python())} {shlex.quote((dest / 'bin' / 'ro.py').as_posix())}",
         }).encode("utf-8")
     managed_sources[dest / "relay" / "relay.py"] = (root / "relay" / "relay.py").read_bytes()
     managed_sources[dest / "bin" / "pr-status"] = (root / "bin" / "pr-status").read_bytes()

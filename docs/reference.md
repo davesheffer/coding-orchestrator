@@ -37,7 +37,8 @@ sending messages stay with the orchestrator and the user's authorization.
 
 On Claude Code, scout is enforced: a frontmatter PreToolUse hook (`bin/role-guard.py`) limits Bash to the
 `bin/ro.py` read verbs (log, diff, show, status, blame, issues, issue, prs, pr) and fails closed if the
-interpreter is missing. Remaining fail-open cases are a hook timeout and agent files loaded from an
+interpreter is missing. Scout commands run the Python interpreter pinned at install time; rerun the
+installer after moving or upgrading Python (until then scout Bash fails closed). Remaining fail-open cases are a hook timeout and agent files loaded from an
 untrusted project folder (Claude Code skips their frontmatter hooks). `ro.py` refuses repos whose local
 config defines filters, fsmonitor, diff commands, gpg programs, or includes; filter drivers from your
 own global config (for example git-lfs) still run. Critic, builder, and runner remain instruction-only.

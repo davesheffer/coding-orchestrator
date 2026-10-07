@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "bin" / "role-guard.py"
 RO = ROOT / "bin" / "ro.py"
+PY = shlex.quote(Path(sys.executable).as_posix())
 
 
 def run_guard(command=None, raw=None, tool_input=None):
@@ -24,8 +25,8 @@ def run_guard(command=None, raw=None, tool_input=None):
 class RoleGuardTests(unittest.TestCase):
     def test_allowed_commands(self):
         ro = RO.as_posix()
-        for command in (f"python {ro} log -n 5", f"python3 '{ro}' status",
-                        f'python "{ro}" diff --stat HEAD~1..HEAD', f"python {ro} pr 12"):
+        for command in (f"{PY} {ro} log -n 5", f"{PY} '{ro}' status",
+                        f'{PY} "{ro}" diff --stat HEAD~1..HEAD', f"{PY} {ro} pr 12"):
             with self.subTest(command=command):
                 result = run_guard(command)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -33,15 +34,30 @@ class RoleGuardTests(unittest.TestCase):
 
     def test_denied_commands(self):
         ro = RO.as_posix()
-        for command in ("ls", "cat x", f"python {ro} log; rm x", f"python {ro} log > f",
-                        f"python {ro} log | sh", "$(x)", f"python {ro} log `x`",
-                        f"GIT_X=1 python {ro} log", "python other.py log", f"python {ro} evil",
-                        f"python {ro} log\nrm x", f"env python {ro} log", "python -c 'print(1)'",
-                        f"python {ro}", "", f"python {ro} log && ls", f"python {ro} log\x00"):
+        for command in ("ls", "cat x", f"{PY} {ro} log; rm x", f"{PY} {ro} log > f",
+                        f"{PY} {ro} log | sh", "$(x)", f"{PY} {ro} log `x`",
+                        f"GIT_X=1 {PY} {ro} log", f"{PY} other.py log", f"{PY} {ro} evil",
+                        f"{PY} {ro} log\nrm x", f"env {PY} {ro} log", f"{PY} -c 'print(1)'",
+                        f"{PY} {ro}", "", f"{PY} {ro} log && ls", f"{PY} {ro} log\x00"):
             with self.subTest(command=command):
                 result = run_guard(command)
                 self.assertEqual(result.returncode, 2)
                 self.assertTrue(result.stderr.startswith(b"role-guard: denied:"))
+
+    def test_bare_and_foreign_interpreters_are_denied(self):
+        ro = RO.as_posix()
+        for command in (f"python {ro} log", f"python3 {ro} log", f"python '{ro}' status",
+                        f"C:/x/python.exe {ro} log", f"/x/python3 {ro} log",
+                        f"'C:/x/python.exe' '{ro}' log"):
+            with self.subTest(command=command):
+                result = run_guard(command)
+                self.assertEqual(result.returncode, 2)
+                self.assertTrue(result.stderr.startswith(b"role-guard: denied:"))
+
+    @unittest.skipUnless(os.name == "nt", "case-insensitive paths on Windows only")
+    def test_uppercase_prefix_allowed_on_windows(self):
+        command = f"{PY} {shlex.quote(RO.as_posix())} log".upper().replace(" LOG", " log")
+        self.assertEqual(run_guard(command).returncode, 0)
 
     def test_unc_and_home_paths_are_denied_without_resolving(self):
         for command in ("python //host/share/ro.py log", r"python \\\\host\\share\\ro.py log",
@@ -58,21 +74,25 @@ class RoleGuardTests(unittest.TestCase):
         guard = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(guard)
 
+        real_norm = guard.norm
+
         def boom(path):
-            raise AssertionError(f"norm called for {path!r}")
+            if path != sys.executable and Path(path) != Path(sys.executable):
+                raise AssertionError(f"norm called for {path!r}")
+            return real_norm(path)
         guard.norm = boom
         for path in ("//host/share/ro.py", r"\\host\share\ro.py", "/\\host/ro.py", "\\ro.py",
                      "~/ro.py", "C:ro.py", "C:/a/ro.py:ads", ""):
             with self.subTest(path=path):
                 self.assertFalse(guard.local_path(path))
-                self.assertFalse(guard.allowed(f"python '{path}' log"))
+                self.assertFalse(guard.allowed(f"{PY} '{path}' log"))
         for path in ("C:/a/ro.py", "C:\\a\\ro.py", "/a/ro.py", "bin/ro.py", "..\\ro.py"):
             with self.subTest(path=path):
                 self.assertTrue(guard.local_path(path))
 
     def test_backslash_form_of_real_path(self):
         variant = str(RO).replace("/", "\\")
-        result = run_guard(f"python '{variant}' log")
+        result = run_guard(f"{PY} '{variant}' log")
         self.assertEqual(result.returncode, 0 if os.name == "nt" else 2, result.stderr)
 
     def test_path_check_is_lexical_and_absolute(self):
@@ -86,10 +106,10 @@ class RoleGuardTests(unittest.TestCase):
         os.path.realpath = boom
         try:
             ro = RO.as_posix()
-            self.assertTrue(guard.allowed(f"python '{ro}' log"))
-            self.assertTrue(guard.allowed(f"python '{RO.parent.as_posix()}/sub/../ro.py' log"))
-            self.assertFalse(guard.allowed("python bin/ro.py log"))
-            self.assertFalse(guard.allowed("python ./ro.py log"))
+            self.assertTrue(guard.allowed(f"{PY} '{ro}' log"))
+            self.assertTrue(guard.allowed(f"{PY} '{RO.parent.as_posix()}/sub/../ro.py' log"))
+            self.assertFalse(guard.allowed(f"{PY} bin/ro.py log"))
+            self.assertFalse(guard.allowed(f"{PY} ./ro.py log"))
         finally:
             os.path.realpath = real
 
@@ -100,9 +120,9 @@ class RoleGuardTests(unittest.TestCase):
             for source in (GUARD, RO):
                 shutil.copy(source, bin_dir / source.name)
             ro = shlex.quote((bin_dir / "ro.py").as_posix())
-            for command, code in ((f"python {ro} status", 0), (f"python {ro} log -n 3", 0),
-                                  (f"python {ro} evil", 2), (f"python {ro} log; ls", 2),
-                                  (f"python {ro} log $(x)", 2), (f"python {ro}", 2)):
+            for command, code in ((f"{PY} {ro} status", 0), (f"{PY} {ro} log -n 3", 0),
+                                  (f"{PY} {ro} evil", 2), (f"{PY} {ro} log; ls", 2),
+                                  (f"{PY} {ro} log $(x)", 2), (f"{PY} {ro}", 2)):
                 with self.subTest(command=command):
                     raw = json.dumps({"tool_input": {"command": command}}).encode("utf-8")
                     result = subprocess.run([sys.executable, str(bin_dir / "role-guard.py")],

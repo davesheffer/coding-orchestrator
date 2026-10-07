@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""PreToolUse guard for the scout role: Bash may only run `python ro.py <verb> ...`.
+"""PreToolUse guard for the scout role: Bash may only run `<interpreter> ro.py <verb> ...`.
 
+The only accepted interpreter is the one running this guard (sys.executable, pinned at install
+time in the hook command); bare `python`/`python3` are denied since PATH may be repo-controlled.
 Exit 0 allows; exit 2 blocks. Any error blocks. Keep this tiny and fast: a hook
 timeout fails open.
 """
@@ -33,23 +35,25 @@ def local_path(path: str) -> bool:
 
 
 def rendered_prefixes() -> list[str]:
-    """The exact `python '<ro.py>' ` prefixes the installer renders; the install path may hold ( ) & !."""
-    return [f"{py} {shlex.quote(ro.as_posix())} " for py in ("python", "python3")
-            for ro in (RO, RO_AS_INSTALLED)]
+    """The exact `'<python>' '<ro.py>' ` prefixes the installer renders; the install path may hold ( ) & !."""
+    py = shlex.quote(Path(sys.executable).as_posix())
+    return [f"{py} {shlex.quote(ro.as_posix())} " for ro in (RO, RO_AS_INSTALLED)]
 
 
 def allowed(command: object) -> bool:
     if not isinstance(command, str) or not command.strip():
         return False
     for prefix in rendered_prefixes():
-        if command.startswith(prefix):
+        head = command[:len(prefix)]
+        if (head.lower() == prefix.lower()) if os.name == "nt" else (head == prefix):
             rest = command[len(prefix):]
             return not FORBIDDEN.search(rest) and (shlex.split(rest) or [""])[0] in VERBS
     if FORBIDDEN.search(command):
         return False
     tokens = shlex.split(command, posix=True)
-    return (len(tokens) >= 3 and tokens[0] in ("python", "python3") and local_path(tokens[1])
-            and os.path.isabs(tokens[1])
+    return (len(tokens) >= 3 and local_path(tokens[0]) and os.path.isabs(tokens[0])
+            and norm(tokens[0]) == norm(sys.executable)
+            and local_path(tokens[1]) and os.path.isabs(tokens[1])
             and norm(tokens[1]) in (norm(str(RO)), norm(str(RO_AS_INSTALLED)))
             and tokens[2] in VERBS)
 
@@ -62,7 +66,7 @@ def main() -> int:
     except Exception:
         pass
     print("role-guard: denied: scout Bash is read-only. Use the Read/Grep/Glob tools, or run "
-          f"`python {RO.as_posix()} <verb>` with verb one of: {', '.join(VERBS)}.", file=sys.stderr)
+          f"`{shlex.quote(Path(sys.executable).as_posix())} {shlex.quote(RO.as_posix())} <verb>` with verb one of: {', '.join(VERBS)}.", file=sys.stderr)
     return 2
 
 
