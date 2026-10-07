@@ -63,12 +63,21 @@ class ClaudeInstallTests(unittest.TestCase):
         instructions = (self.home / "CLAUDE.md").read_text(encoding="utf-8")
         expected_command = f"{install_module.hook_python()} {shlex.quote(str(helper))}"
         self.assertIn(f"using `{expected_command}`", instructions)
+        self.assertTrue(instructions.startswith("<!-- CLAUDE-ORCHESTRATOR:START -->"))
+        self.assertTrue(instructions.endswith("<!-- CLAUDE-ORCHESTRATOR:END -->\n"))
         if os.name == "posix":
             self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
         before = self.snapshot()
         again = self.run_install()
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(self.snapshot(), before)
+
+    def test_fresh_instructions_omit_text_outside_managed_block(self):
+        source = (b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n<!-- CLAUDE-ORCHESTRATOR:END -->\n\n"
+                  b"<!-- HUNCH:START -->\nrepo-only\n<!-- HUNCH:END -->\n")
+        merged = install_module.merge_instructions(None, source, Path("CLAUDE.md"))
+        self.assertEqual(merged, b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n"
+                                 b"<!-- CLAUDE-ORCHESTRATOR:END -->\n")
 
     def test_preserves_private_instructions_settings_and_relay_config(self):
         self.home.mkdir(parents=True)

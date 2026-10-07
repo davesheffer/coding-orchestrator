@@ -108,8 +108,10 @@ def managed_block(data: bytes, path: Path) -> bytes:
 
 def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> bytes:
     block = managed_block(source, Path("source CLAUDE.md"))
+    # Install only the managed block: the source file is also this repo's own
+    # project instructions, so anything outside the markers is not ours to copy.
     if existing is None or digest(existing.replace(b"\r\n", b"\n")) in LEGACY_CLAUDE_HASHES:
-        return source
+        return block + b"\n"
     start, end = existing.find(START), existing.find(END)
     if start == end == -1:
         separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
