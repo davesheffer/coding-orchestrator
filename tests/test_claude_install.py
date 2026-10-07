@@ -36,6 +36,16 @@ class ClaudeInstallTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(INSTALL), *args], env=env,
                               text=True, capture_output=True)
 
+    def rendered_agent(self, name):
+        text = (ROOT / "agents" / f"{name}.md").read_bytes().decode("utf-8")
+        return install_module.fill_placeholders(text, {
+            "__ROLE_GUARD__": json.dumps(
+                f"{shlex.quote(install_module.pinned_python())} "
+                f"{shlex.quote((self.home / 'bin/role-guard.py').as_posix())} || exit 2"),
+            "__RO__": f"{shlex.quote(install_module.pinned_python())} "
+                      f"{shlex.quote((self.home / 'bin/ro.py').as_posix())}",
+        }).encode("utf-8")
+
     def snapshot(self):
         if not self.home.exists():
             return {}
@@ -70,6 +80,62 @@ class ClaudeInstallTests(unittest.TestCase):
         before = self.snapshot()
         again = self.run_install()
         self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_scout_guard_command_is_valid_yaml_with_apostrophe_home(self):
+        self.home = Path(self.temp.name) / "o'brien"
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = (self.home / "agents/scout.md").read_text(encoding="utf-8")
+        line = next(l for l in text.splitlines() if l.strip().startswith("command:"))
+        value = json.loads(line.split("command:", 1)[1].strip())
+        self.assertIn("role-guard.py", value)
+        self.assertTrue(value.endswith("|| exit 2"))
+        tokens = shlex.split(value)
+        self.assertEqual(tokens[0], install_module.pinned_python())
+        self.assertEqual(tokens[-4], (self.home / "bin/role-guard.py").as_posix())
+        self.assertEqual((self.home / "agents/scout.md").read_bytes(), self.rendered_agent("scout"))
+
+    def test_scout_commands_use_pinned_python(self):
+        python = install_module.pinned_python()
+        self.assertTrue(os.path.isabs(python), python)
+        self.assertEqual(self.run_install().returncode, 0)
+        text = (self.home / "agents/scout.md").read_text(encoding="utf-8")
+        line = next(l for l in text.splitlines() if l.strip().startswith("command:"))
+        self.assertEqual(shlex.split(json.loads(line.split("command:", 1)[1].strip()))[0], python)
+        self.assertIn(f"{shlex.quote(python)} {shlex.quote((self.home / 'bin/ro.py').as_posix())}", text)
+
+    def test_role_frontmatter_rejects_unquoted_yaml_colon(self):
+        source = (ROOT / "agents/scout.md").read_bytes()
+        install_module.validate_role(Path("scout.md"), source, "scout")
+        broken = source.replace(b"enforced; a role", b"enforced: a role")
+        self.assertNotEqual(broken, source)
+        with self.assertRaisesRegex(ValueError, "quote this YAML value"):
+            install_module.validate_role(Path("scout.md"), broken, "scout")
+        for name in install_module.ROLE_NAMES:
+            data = (ROOT / "agents" / f"{name}.md").read_bytes()
+            install_module.validate_role(Path(f"{name}.md"), data, name)
+
+    def test_scout_role_is_rendered_with_guard_and_helpers(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        text = (self.home / "agents/scout.md").read_text(encoding="utf-8")
+        self.assertNotIn("__ROLE_GUARD__", text)
+        self.assertNotIn("__RO__", text)
+        self.assertIn("role-guard.py' || exit 2", text)
+        line = next(l for l in text.splitlines() if l.strip().startswith("command:"))
+        value = line.split("command:", 1)[1].strip()
+        self.assertTrue(value.startswith('"') and value.endswith('"'))
+        self.assertNotIn("\\", value)
+        self.assertIn("role-guard.py", value)
+        self.assertTrue(value.endswith(" || exit 2\""))
+        self.assertEqual(json.loads(value), value[1:-1])
+        self.assertIn((self.home / "bin/ro.py").as_posix(), text)
+        for name in ("role-guard.py", "ro.py"):
+            self.assertEqual((self.home / "bin" / name).read_bytes(), (ROOT / "bin" / name).read_bytes())
+        before = self.snapshot()
+        again = self.run_install()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn("backup", again.stdout)
         self.assertEqual(self.snapshot(), before)
 
     def test_upgrade_removes_hunch_block_from_polluted_home(self):
@@ -206,7 +272,7 @@ class ClaudeInstallTests(unittest.TestCase):
                 self.assertEqual(upgraded_settings["model"], "claude-opus-5-5")
                 for name in ("scout", "runner", "builder", "critic"):
                     path = self.home / "agents" / f"{name}.md"
-                    self.assertEqual(path.read_bytes(), (ROOT / "agents" / path.name).read_bytes())
+                    self.assertEqual(path.read_bytes(), self.rendered_agent(name))
                     self.assertTrue(path.with_name(path.name + ".bak").exists())
                 before = self.snapshot()
                 self.assertEqual(self.run_install().returncode, 0)
@@ -225,7 +291,7 @@ class ClaudeInstallTests(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(role.with_name("scout.md.bak").read_bytes(), old_release)
-        self.assertEqual(role.read_bytes(), (ROOT / "agents/scout.md").read_bytes())
+        self.assertEqual(role.read_bytes(), self.rendered_agent("scout"))
         files = json.loads(manifest_path.read_text(encoding="utf-8"))["files"]
         self.assertIn("agents/scout.md", files)
         self.assertTrue(all("\\" not in key for key in files))

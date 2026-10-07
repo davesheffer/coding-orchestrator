@@ -19,7 +19,7 @@ Use the installed named roles. For built-in agents, explicitly select `sonnet` f
 - Launch independent, delegation-sized units together; respect concurrency limits and avoid overlapping edits. Large Workflow orchestration with dozens of agents requires an explicit user request.
 - Batch independent calls, inspect every result, bound output, and preserve real exit codes. Keep edits, dependencies, approvals, and waits sequential.
 - Delegate bounded reading and noisy execution when their benefit exceeds briefing and verification overhead. Keep tiny known-file tasks and decided edits in the main session. Do not invent usage estimates.
-- For a yes/no, choice or score judgement about files whose text you don't need, `__ASK_JEV__ -q '<questions json>' <paths>` asks Jev without loading them (`--help-questions` shows the format; exit 3 means Jev is off, so read instead). Include the command in scout briefs.
+- For a yes/no, choice or score judgement about files whose text you don't need, `__ASK_JEV__ -q '<questions json>' <paths>` asks Jev without loading them (`--help-questions` shows the format; exit 3 means Jev is off, so read instead). Scouts cannot run it (their Bash is limited to `ro.py` read verbs), so run it yourself or brief a runner.
 - Query PR/CI state once using `__PR_STATUS__`. Networked polling stays in the main session unless runner network access was explicitly authorized.
 
 ## Briefing and trust
