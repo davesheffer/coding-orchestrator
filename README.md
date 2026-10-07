@@ -3,6 +3,12 @@
 [![CI](https://github.com/davesheffer/coding-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/davesheffer/coding-orchestrator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+**In plain words:** it turns your AI coder into a team. One smart boss plans
+the work and double-checks every result. Cheaper helpers do the reading,
+running, and building. When a chat gets too long, the boss writes a handoff
+note and a fresh session picks up where it left off. A live dashboard
+(Mission Control) shows what everyone is doing right now.
+
 An orchestrator and four reusable subagent roles for **Claude Code and Codex**.
 The principle is **cheap hands, expensive eyes**: delegate bounded reading,
 command execution, and implementation; keep design, judgment, and verification
@@ -409,6 +415,22 @@ which is removed after `handoff_ttl_hours`. Independently of Jev, a handoff
 (including any NEXT PROMPT text) is kept in the private `relay/handoffs/<id>.md`
 for the same period.
 
+#### Optional: Mission Control
+
+Mission Control is a Claude Code mod that shows the orchestrator at work:
+
+- **`/orch`** opens a pane with what is happening now, a plain-language
+  timeline of every tool call (▸ opens the full command), running subagents
+  and their report-card grades, and the Jev decision feed.
+- **The band** above the prompt shows the relay zone, context size, and
+  `now: …`, such as `thinking` mid-turn or `idle, waiting for you`.
+  `/orch band` hides or shows it.
+- **`/sessions`** lists open Claude Code sessions and switches VS Code to one.
+
+The installer does not install it. Copy `mods/mission-control` to
+`~/.claude/mods/mission-control` and follow its
+[README](mods/mission-control/README.md) to load it in every session.
+
 ### Codex
 
 ```sh
@@ -629,6 +651,7 @@ runner. No credentials are included.
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
 | `bin/pr-status` | Shared PR/CI helper |
 | `bin/rollover-open.py`, `vscode/handoff-bridge/` | Shared handoff protocol and VS Code tab bridge |
+| `mods/mission-control/` | Optional Claude Code mod: live `/orch` dashboard, activity timeline, and `/sessions` switcher |
 | `bin/jev_client.py`, `bin/jev-route.py`, `bin/jev-guard.py`, `bin/jev-report.py`, `bin/ask-jev.py`, `bin/eval-jev-routing.py` | Opt-in TypeSafe Jev hooks (routing, risk gate, report check), ask-about-files command, log and spend report, routing eval |
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
@@ -666,6 +689,12 @@ Credentials, personal MCP configuration, per-project assistant configuration,
 personal status lines, and permission allowlists do not belong in this bundle.
 
 Previously named `claude-orchestrator`; the repository now covers both clients.
+
+## Contributing
+
+Changes reach `main` through pull requests only, with passing CI and one
+approval. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks to run,
+and the house rules.
 
 ## License
 
