@@ -513,3 +513,139 @@ export function ago(ms: number): string {
 
   return `${Math.round(s / 86400)}d`
 }
+
+// Activity: one short plain-language line per thing the session does.
+
+const HUNCH_VERB: Record<string, string> = {
+  context: 'brief on',
+  check_constraints: 'check rules for',
+  why: 'why',
+  bug_lineage: 'past bugs for',
+  blast_radius: 'blast radius of',
+  get_dependents: 'dependents of',
+  current_decision: 'current decision on',
+  record_decision: 'record decision',
+  record_correction: 'record correction',
+  record_finding: 'record finding',
+  capture_decision: 'capture decision',
+  merge_verdict: 'merge verdict for',
+  pr_impact: 'PR impact of',
+  conformance: 'conformance check',
+  escalations: 'open escalations',
+  structure: 'repo map',
+  query: 'search',
+  verify: 'check',
+}
+
+/** The last segment of a path, for a short label. */
+export function fileName(path: string): string {
+  return path.split(/[\\/]+/).filter(Boolean).at(-1) ?? path
+}
+
+export function clip(value: string, max: number): string {
+  const line = value.replace(/\s+/g, ' ').trim()
+
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line
+}
+
+/** `hh:mm:ss`, local time. */
+export function clockSeconds(ms: number): string {
+  const date = new Date(ms)
+
+  return `${clockTime(ms)}:${String(date.getSeconds()).padStart(2, '0')}`
+}
+
+const DETAIL_MAX = 4000
+
+/** The full text behind a timeline line (a command, a prompt, an edit), for its drawer; '' when the line says it all. */
+export function toolDetail(tool: string, args: Record<string, unknown>): string {
+  let detail: string
+  switch (tool) {
+    case 'Bash':
+    case 'PowerShell':
+      detail = text(args.command)
+      break
+    case 'Agent':
+      detail = text(args.prompt)
+      break
+    case 'Edit':
+      detail = `${text(args.file_path)}\n--- old\n${text(args.old_string)}\n+++ new\n${text(args.new_string)}`
+      break
+    case 'Write':
+      detail = `${text(args.file_path)}\n${text(args.content)}`
+      break
+    case 'Read':
+    case 'Glob':
+    case 'Grep':
+    case 'ToolSearch':
+    case 'Skill':
+      detail = ''
+      break
+    default: {
+      const rest = Object.fromEntries(Object.entries(args).filter(([key]) => !['tool', 'tool_use_id', 'agentId'].includes(key)))
+      detail = tool.startsWith('mcp__') && Object.keys(rest).length > 0 ? JSON.stringify(rest, null, 2) : ''
+    }
+  }
+
+  return detail.length > DETAIL_MAX ? `${detail.slice(0, DETAIL_MAX)}\n… (${detail.length - DETAIL_MAX} more characters)` : detail
+}
+
+/** What a tool call does, in a few plain words: `read parse.ts`, `start critic (fable): Review diff`. */
+export function describeTool(tool: string, args: Record<string, unknown>): string {
+  const file = fileName(text(args.file_path) || text(args.notebook_path) || text(args.path))
+  const hunch = hunchName(tool)
+  if (hunch !== undefined) {
+    const { target } = hunchInvocation(hunch, args)
+    const verb = HUNCH_VERB[hunch] ?? hunch.replace(/_/g, ' ')
+
+    return clip(`Hunch: ${verb}${target === '' ? '' : ` ${target}`}`, 80)
+  }
+
+  switch (tool) {
+    case 'Bash':
+    case 'PowerShell': {
+      const command = text(args.command)
+      const cli = hunchCli(command)
+      const what = text(args.description) || command
+      if (cli?.name === 'verify') return clip(`check: ${what}`, 80)
+
+      return clip(`run: ${what}`, 80)
+    }
+    case 'Read':
+      return `read ${file}`
+    case 'Edit':
+    case 'NotebookEdit':
+      return `edit ${file}`
+    case 'Write':
+      return `write ${file}`
+    case 'Grep':
+      return clip(`search for "${text(args.pattern)}"${file === '' ? '' : ` in ${file}`}`, 80)
+    case 'Glob':
+      return clip(`find files ${text(args.pattern)}`, 80)
+    case 'Agent': {
+      const role = roleOf(text(args.subagent_type) || 'general-purpose')
+      const model = text(args.model)
+
+      return clip(`start ${role}${model === '' ? '' : ` (${model})`}: ${text(args.description)}`, 80)
+    }
+    case 'SendMessage':
+      return 'message an agent'
+    case 'Skill':
+      return `load skill ${text(args.skill)}`
+    case 'ToolSearch':
+      return 'load tool definitions'
+    case 'WebSearch':
+      return clip(`web search "${text(args.query)}"`, 80)
+    case 'WebFetch':
+      return clip(`fetch ${text(args.url).replace(/^https?:\/\//, '').split('/')[0] ?? ''}`, 80)
+    case 'AskUserQuestion':
+      return 'ask you a question'
+    case 'Artifact':
+      return `artifact ${text(args.action) || 'publish'}`
+  }
+
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(tool)
+  if (mcp !== null) return clip(`${mcp[1]?.replace(/^claude_ai_/, '')}: ${mcp[2]?.replace(/_/g, ' ')}`, 80)
+
+  return tool
+}

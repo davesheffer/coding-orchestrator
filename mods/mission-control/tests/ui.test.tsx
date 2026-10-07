@@ -40,9 +40,15 @@ test('the pane draws its sections with nothing yet recorded', async $ => {
       requestId: 'mission-control',
       props: { title: 'Mission Control', isFocused: false, bodyColumns: 60, placement: 'dock', scroll, view: {} },
     })
+    expect(await ui.find({ text: /idle, waiting for you/ })).toBeDefined()
+    expect(await ui.find({ text: /Nothing yet/ })).toBeDefined()
+    expect(await ui.find({ text: /No subagents running/ })).toBeUndefined()
+    expect(await ui.find({ key: 'band' })).toBeDefined()
+
+    await ui.press({ key: 'details' })
     expect(await ui.find({ text: /No subagents running/ })).toBeDefined()
     expect(await ui.find({ text: /No role reports yet/ })).toBeDefined()
-    expect(await ui.find({ key: 'band' })).toBeDefined()
+    await ui.press({ key: 'details' })
 
     await ui.unmount()
   }

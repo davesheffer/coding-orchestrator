@@ -7,8 +7,10 @@ A Claude Code mod (a plugin of function hooks) that shows the orchestrator's sta
 **Band above the prompt**
 
 ```
-● AMBER 162k/250k ██████░░░░  Jev ✔  🧠 hunch 5 ⚠1  ⚙ scout·sonnet, builder·sonnet  last runner HIGH  [ orch ] [ 🗂 9 ] [ hide ]
+● AMBER 162k/250k ██████░░░░  Jev ✔  🧠 hunch 5 ⚠1  now: run: Run unit tests (12s)  agents: critic 2m  [ orch ] [ 🗂 9 ] [ hide ]
 ```
+
+- `now:` what the main loop is doing this moment, in plain words (`read parse.ts`, `run: <the command's description>`, `waiting on critic`, `thinking`, `idle, waiting for you`), and which subagents run and for how long.
 
 - The relay zone (GREEN / AMBER / RED) and context tokens, against `relay/config.json` `soft_tokens` / `hard_tokens`.
 - Whether Jev is online, or the reason it is not (for example `NoApiKey`).
@@ -18,6 +20,14 @@ A Claude Code mod (a plugin of function hooks) that shows the orchestrator's sta
 - `🗂 N`: how many Claude Code sessions are registered on this machine; it opens the `/sessions` pane.
 
 **`/orch` pane**
+
+By default the pane is short:
+
+- Now: what the main loop and each running subagent is doing, and for how long.
+- Timeline: the last 15 things that happened, newest first, one line each: time, who (`you`, `main`, or the role), ✔ / ✖ / ■ / ▶, a few plain words, and how long it took. Every tool call is a line (`read parse.ts`, `edit register.tsx`, `run: Run unit tests`, `Hunch: check rules for lib/a.dart`, `start critic (fable): Review diff`), as are your prompts, each subagent finishing and each turn ending. A line with more behind it (the full shell command, an agent's brief, an edit's old and new text, a long prompt) has a ▸ button that opens it as a drawer below the line; ▾ closes it.
+- Summary: context use and what the zone means, agents running and the last report's confidence, Hunch calls and warnings, Jev online or not.
+
+`details` opens the full sections below:
 
 - Relay: the gauge, the session's cost and what the zone asks of you.
 - In flight: the running subagents and how long each has run.

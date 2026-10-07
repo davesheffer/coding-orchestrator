@@ -111,6 +111,21 @@ export type SessionRow = {
   updatedAt: number
 }
 
+/** One line of the activity timeline: a prompt, a tool call, an agent finishing, a turn ending. */
+export type ActivityEntry = {
+  /** The tool_use_id for a tool call; a made-up id otherwise. */
+  id: string
+  at: number
+  /** `you`, `main`, or the subagent role. */
+  who: string
+  /** A few plain words: `read parse.ts`, `run: Run unit tests`. */
+  text: string
+  status: 'running' | 'ok' | 'error' | 'stopped' | 'note'
+  durationMs?: number
+  /** The full command, prompt or edit, shown in the line's drawer when opened. */
+  detail?: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'mission-control': {
@@ -124,6 +139,12 @@ declare module 'claude-code' {
       sessions: SessionRow[]
       /** When the session registry was last polled, rounded down to 30 s so the pane's ages redraw. */
       sessionsCheckedAt: number
+      /** The newest activity lines, oldest first. */
+      activity: ActivityEntry[]
+      /** Whether the /orch pane shows its full report cards, Hunch calls and Jev log. */
+      showDetails: boolean
+      /** Timeline lines whose drawer is open, by entry id. */
+      openEntries: string[]
     }
   }
 }

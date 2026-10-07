@@ -163,10 +163,12 @@ test('a live MCP call lands in the pane and a BLOCK verdict toasts', async ($, o
       requestId: 'mission-control',
       props: { title: 'Mission Control', isFocused: false, bodyColumns: 100, placement: 'dock', scroll, view: {} },
     })
+    await pane.press({ key: 'details' })
     expect(await pane.find({ text: new RegExp(`${TASK} · 2 calls`) })).toBeDefined()
     expect(await pane.find({ text: /context 1 · merge_verdict 1/ })).toBeDefined()
     expect(await pane.find({ text: /verdict BLOCK · staged/ })).toBeDefined()
     expect(await pane.find({ text: /Brief for lib\/a\.dart/ })).toBeDefined()
+    await pane.press({ key: 'details' })
     await pane.unmount()
 
     const band = await $.ui.mount({
@@ -229,6 +231,7 @@ test('task verify through Bash records its exit code and toasts a failure', asyn
     requestId: 'mission-control',
     props: { title: 'Mission Control', isFocused: false, bodyColumns: 100, placement: 'dock', scroll, view: {} },
   })
+  await pane.press({ key: 'details' })
   expect(await pane.find({ text: /verify 2/ })).toBeDefined()
   expect(await pane.find({ text: /exit 0/ })).toBeDefined()
   await pane.unmount()
@@ -263,6 +266,7 @@ test('an interrupted call is marked interrupted, without a failure toast', async
     requestId: 'mission-control',
     props: { title: 'Mission Control', isFocused: false, bodyColumns: 100, placement: 'dock', scroll, view: {} },
   })
+  await pane.press({ key: 'details' })
   expect(await pane.find({ text: /interrupted/ })).toBeDefined()
   await pane.unmount()
 

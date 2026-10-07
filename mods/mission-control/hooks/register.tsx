@@ -1,11 +1,26 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
-import type { AgentRun, Gauge, HunchCall, HunchConstraint, HunchLevel, HunchLog, JevStatus, ReportCard, SessionRow, Zone } from '../types'
+import type {
+  ActivityEntry,
+  AgentRun,
+  Gauge,
+  HunchCall,
+  HunchConstraint,
+  HunchLevel,
+  HunchLog,
+  JevStatus,
+  ReportCard,
+  SessionRow,
+  Zone,
+} from '../types'
 import {
   ago,
   bar,
+  clip,
+  clockSeconds,
   clockTime,
+  describeTool,
   hunchCli,
   hunchInvocation,
   hunchName,
@@ -24,6 +39,8 @@ import {
   sessionRow,
   sessionRows,
   shortModel,
+  STALE_MS,
+  toolDetail,
   wasInterrupted,
   zoneOf,
 } from './parse'
@@ -41,8 +58,32 @@ const isBandHidden = atom({ plugin: 'mission-control', key: 'isBandHidden' } as 
 const tick = atom({ plugin: 'mission-control', key: 'tick' } as const, 0)
 const sessions = atom({ plugin: 'mission-control', key: 'sessions' } as const, [])
 const sessionsCheckedAt = atom({ plugin: 'mission-control', key: 'sessionsCheckedAt' } as const, 0)
+const activity = atom({ plugin: 'mission-control', key: 'activity' } as const, [])
+const showDetails = atom({ plugin: 'mission-control', key: 'showDetails' } as const, false)
+const openEntries = atom({ plugin: 'mission-control', key: 'openEntries' } as const, [])
+
+const DRAWER_LINES = 20
 
 const HUNCH_KEEP = 40
+const ACTIVITY_KEEP = 80
+const TIMELINE_ROWS = 15
+
+const ACTIVITY_MARK: Record<ActivityEntry['status'], string> = { running: '▶', ok: '✔', error: '✖', stopped: '■', note: '·' }
+
+const ACTIVITY_COLOR: Record<ActivityEntry['status'], string | undefined> = {
+  running: 'yellow',
+  ok: 'green',
+  error: 'red',
+  stopped: 'gray',
+  note: undefined,
+}
+
+const ZONE_PLAIN: Record<Zone, string> = {
+  green: 'keep going',
+  amber: 'getting full, hand off soon',
+  red: 'full, hand off now',
+  unknown: 'not measured yet',
+}
 
 const HUNCH_COLOR: Record<HunchLevel, string | undefined> = { info: undefined, warn: 'yellow', alert: 'red' }
 
@@ -286,18 +327,69 @@ async function settleHunchCall($: EngineInterface, id: string, why: 'interrupted
   await refreshStatus($)
 }
 
+async function whoOf($: EngineInterface, agentId: string | undefined): Promise<string> {
+  if (agentId === undefined) return 'main'
+  const run = (await read($, agents)).find(agent => agent.id === agentId)
+
+  return roleOf(run?.type ?? 'agent')
+}
+
+/** Adds or replaces one timeline line; running lines older than STALE_MS are closed as stopped. */
+async function logActivity($: EngineInterface, entry: ActivityEntry) {
+  await update($, activity, list =>
+    [
+      ...list
+        .filter(one => one.id !== entry.id)
+        .map(one => (one.status === 'running' && entry.at - one.at > STALE_MS ? { ...one, status: 'stopped' as const } : one)),
+      entry,
+    ].slice(-ACTIVITY_KEEP),
+  )
+}
+
+async function endActivity($: EngineInterface, id: string, status: ActivityEntry['status']) {
+  const now = await $.clock.now()
+  await update($, activity, list =>
+    list.map(one => (one.id === id && one.status === 'running' ? { ...one, status, durationMs: now - one.at } : one)),
+  )
+}
+
+/** Whether the main loop is mid-turn: the newest prompt came after the newest turn end. */
+function isTurnOpen(list: readonly ActivityEntry[]): boolean {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const id = list[i]?.id ?? ''
+    if (id.startsWith('prompt-')) return true
+    if (id.startsWith('turn-')) return false
+  }
+
+  return false
+}
+
+/** The time a drawing measures ages against, from state alone: the poll's tick advances it while work runs. */
+function drawnNow(tick: number, list: readonly ActivityEntry[], runs: readonly AgentRun[]): number {
+  return Math.max(tick, ...list.map(one => one.at), ...runs.map(run => run.startedAt))
+}
+
+/** What the session is doing right now, in a few words. */
+function nowText(list: readonly ActivityEntry[], running: readonly AgentRun[], now: number): string {
+  const main = list.filter(one => one.who === 'main' && one.status === 'running').at(-1)
+  if (main !== undefined) return `${main.text} (${seconds(now - main.at)})`
+  if (running.length > 0) return `waiting on ${running.map(agent => roleOf(agent.type)).join(', ')}`
+
+  return isTurnOpen(list) ? 'thinking' : 'idle, waiting for you'
+}
+
 async function refreshStatus($: EngineInterface) {
   if (!(await read($, isBandHidden))) {
     $.ui.status(undefined)
     return
   }
   const g = await read($, gauge)
-  const j = await read($, jev)
-  const running = (await read($, agents)).filter(agent => agent.status === 'running').length
+  const list = await read($, agents)
+  const running = list.filter(agent => agent.status === 'running')
   const zone = g === null ? '?' : g.zone.toUpperCase()
-  const jevMark = j?.isOnline === false ? 'Jev off' : j?.isOnline === true ? 'Jev on' : 'Jev ?'
-  const hunchCount = taskCalls(await read($, hunch)).length
-  $.ui.status(`${zone} ${kTokens(g?.tokens)} · ${running} agents · ${jevMark} · hunch ${hunchCount}`)
+  const lines = await read($, activity)
+  const doing = nowText(lines, running, drawnNow(await read($, tick), lines, running))
+  $.ui.status(clip(`${zone} ${kTokens(g?.tokens)} · now: ${doing} · ${running.length} agents`, 100))
 }
 
 function openPane($: EngineInterface) {
@@ -371,7 +463,8 @@ export const register: Register = on => {
         await pollJev($)
         await pollSessions($)
         const list = await read($, agents)
-        if (list.some(agent => agent.status === 'running')) {
+        const isBusy = (await read($, activity)).some(one => one.status === 'running')
+        if (isBusy || list.some(agent => agent.status === 'running')) {
           const now = await $.clock.now()
           await update($, tick, () => now)
         }
@@ -399,6 +492,48 @@ export const register: Register = on => {
 
     return { text: `Sessions opened: ${count} registered.` }
   })
+
+  on('prompt.submit', async ($, e, next) => {
+    try {
+      const at = await $.clock.now()
+      const detail = e.text.length > 70 ? e.text.slice(0, 4000) : undefined
+      await logActivity($, { id: `prompt-${at}`, at, who: 'you', text: `asked: "${clip(e.text, 70)}"`, status: 'note', detail })
+    } catch {
+      // the timeline is a view; a prompt never waits on it
+    }
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // Every tool call, from the main loop or a subagent, becomes one plain timeline line.
+  on('tool.call', async ($, e, next) => {
+    const id = e.tool_use_id
+    try {
+      const at = await $.clock.now()
+      const args = e as unknown as Record<string, unknown>
+      const text = describeTool(e.tool, args)
+      const detail = toolDetail(e.tool, args) || undefined
+      await logActivity($, { id, at, who: await whoOf($, e.agentId), text, status: 'running', detail })
+      await refreshStatus($)
+    } catch {
+      // never block a tool on the timeline
+    }
+
+    let status: ActivityEntry['status'] = 'stopped'
+    try {
+      const result = await next(e)
+      if (!next.signal.aborted) {
+        const isStopped = result.deny === undefined && wasInterrupted(result.result, resultText(result))
+        status = isStopped ? 'stopped' : result.deny !== undefined || result.isError === true ? 'error' : 'ok'
+      }
+
+      return result
+    } finally {
+      await endActivity($, id, status).catch(() => undefined)
+      await refreshStatus($).catch(() => undefined)
+    }
+    // An observer: whatever went wrong here, the call itself goes on (or replays what it settled to).
+  }).catch(($, e, next) => next(e))
 
   on('session.measure', async ($, e, next) => {
     await measure($, e.context.tokens, e.context.window, e.context.percent, e.cost?.usd)
@@ -430,7 +565,20 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const agentId = e.agentId
-    if (agentId === undefined) return next(e)
+    if (agentId === undefined) {
+      const at = await $.clock.now()
+      const how = e.reason === 'answer' ? 'answered' : e.reason === 'aborted' ? 'stopped' : 'ended with an error'
+      await logActivity($, {
+        id: `turn-${at}`,
+        at,
+        who: 'main',
+        text: `${how} (turn took ${seconds(e.durationMs)})`,
+        status: e.reason === 'answer' ? 'note' : e.reason === 'aborted' ? 'stopped' : 'error',
+      }).catch(() => undefined)
+      await refreshStatus($)
+
+      return next(e)
+    }
 
     const now = await $.clock.now()
     const status: AgentRun['status'] = e.reason === 'answer' ? 'done' : e.reason === 'aborted' ? 'aborted' : 'error'
@@ -468,6 +616,16 @@ export const register: Register = on => {
         $.ui.toast(`⚠ ${roleOf(type)} report weak: ${why}; verify before relying on it`, { timeoutMs: 8000 })
       }
     }
+    const verdict = card.result === '' ? '' : `: ${card.result}`
+    const graded = card.hasAnyField ? ` (${card.confidence} confidence)` : ''
+    await logActivity($, {
+      id: `agent-end-${agentId}`,
+      at: now,
+      who: roleOf(type),
+      text: clip(status === 'done' ? `finished${graded}${verdict}` : `${status}`, 90),
+      status: status === 'done' ? 'ok' : status === 'aborted' ? 'stopped' : 'error',
+      durationMs: run === undefined ? undefined : now - run.startedAt,
+    }).catch(() => undefined)
     await refreshStatus($)
 
     return next(e)
@@ -526,20 +684,19 @@ export const register: Register = on => {
     const g = await read($, gauge)
     const j = await read($, jev)
     const running = (await read($, agents)).filter(agent => agent.status === 'running')
-    const last = (await read($, reports)).at(-1)
     const hunchNow = taskCalls(await read($, hunch))
     const hunchLevel = loudest(hunchNow)
     const sessionCount = (await read($, sessions)).length
     const isWide = e.props.bodyColumns >= 100
+    const list = await read($, activity)
+    const now = drawnNow(await read($, tick), list, running)
 
     const zone: Zone = g?.zone ?? 'unknown'
     const fill = g?.tokens === undefined ? 0 : g.tokens / g.hard
     const jevColor = j?.isOnline === true ? 'green' : j?.isOnline === false ? 'red' : 'gray'
     const jevText = j?.isOnline === true ? 'Jev ✔' : j?.isOnline === false ? `Jev ✖ ${j.lastError ?? ''}`.trim() : 'Jev ?'
-    const crew =
-      running.length === 0
-        ? 'idle'
-        : running.map(agent => `${roleOf(agent.type)}·${agent.model}`).join(', ')
+    const doing = nowText(list, running, now)
+    const crew = running.map(agent => `${roleOf(agent.type)} ${seconds(now - agent.startedAt)}`).join(', ')
 
     return (
       <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
@@ -553,15 +710,10 @@ export const register: Register = on => {
           {hunchNow.some(call => call.status === 'running') ? '…' : ''}
           {hunchLevel !== 'info' ? ` ⚠${hunchNow.filter(call => call.level !== 'info').length}` : ''}
         </Text>
-        <Text wrap="truncate">
-          {'⚙'} {crew}
+        <Text wrap="truncate" color={doing.startsWith('idle') ? 'gray' : 'yellow'}>
+          now: {doing}
         </Text>
-        {last !== undefined && (
-          <Text color={CONFIDENCE_COLOR[last.confidence]}>
-            last {roleOf(last.type)} {last.confidence.toUpperCase()}
-            {last.unverified > 0 ? ` ⚠${last.unverified}` : ''}
-          </Text>
-        )}
+        {crew !== '' && <Text wrap="truncate">agents: {crew}</Text>}
         <Button key="open" label="orch" onPress={() => openPane($)} />
         <Button key="sessions" label={`🗂 ${sessionCount}`} onPress={() => openSessions($)} />
         <Button key="hide" label="hide" onPress={() => setBandHidden($, true)} />
@@ -579,13 +731,111 @@ export const register: Register = on => {
     const hunchNow = taskCalls(hunchLog)
     const counts = new Map<string, number>()
     for (const call of hunchNow) counts.set(call.name, (counts.get(call.name) ?? 0) + 1)
-    const now = Math.max(await read($, tick), ...list.map(agent => agent.startedAt))
+    const now = drawnNow(await read($, tick), await read($, activity), list)
     const width = Math.max(20, e.props.bodyColumns)
     const zone: Zone = g?.zone ?? 'unknown'
     const running = list.filter(agent => agent.status === 'running')
+    const lines = await read($, activity)
+    const isDetailed = await read($, showDetails)
+    const opened = await read($, openEntries)
+    const mainNow = lines.filter(one => one.who === 'main' && one.status === 'running').at(-1)
+    const lastCard = cards.at(-1)
+    const hunchWarnings = hunchNow.filter(call => call.level !== 'info').length
 
     return (
       <Box flexDirection="column" width={width}>
+        <Text bold>Now</Text>
+        <Text wrap="truncate" color={mainNow === undefined && running.length === 0 ? 'gray' : 'yellow'}>
+          {'  '}main {mainNow === undefined ? (isTurnOpen(lines) ? 'thinking' : 'idle, waiting for you') : `${mainNow.text} · ${seconds(now - mainNow.at)}`}
+        </Text>
+        {running.map(agent => (
+          <Text wrap="truncate" color="yellow">
+            {'  '}
+            {roleOf(agent.type)} ({agent.model}) {agent.description} · {seconds(now - agent.startedAt)}
+            {agent.isBackground ? ' · background' : ''}
+          </Text>
+        ))}
+
+        <Text bold>Timeline</Text>
+        {lines.length === 0 && <Text dimColor>{'  '}Nothing yet.</Text>}
+        {lines
+          .slice(-TIMELINE_ROWS)
+          .reverse()
+          .map(one => {
+            const isOpen = one.detail !== undefined && opened.includes(one.id)
+            const drawer = isOpen ? (one.detail ?? '').split(/\r?\n/) : []
+
+            return (
+              <Box key={`line-${one.id}`} flexDirection="column">
+                <Box flexDirection="row" columnGap={1}>
+                  {one.detail !== undefined ? (
+                    <Button
+                      key={`drawer-${one.id}`}
+                      label={isOpen ? '▾' : '▸'}
+                      onPress={() => update($, openEntries, ids => (ids.includes(one.id) ? ids.filter(id => id !== one.id) : [...ids, one.id].slice(-20)))}
+                    />
+                  ) : (
+                    <Text> </Text>
+                  )}
+                  <Text wrap="truncate" color={one.status === 'note' ? undefined : ACTIVITY_COLOR[one.status]} dimColor={one.status === 'note'}>
+                    {clockSeconds(one.at)} {clip(one.who, 8).padEnd(8)} {ACTIVITY_MARK[one.status]} {one.text}
+                    {one.status === 'running'
+                      ? ` · ${seconds(now - one.at)}`
+                      : one.durationMs !== undefined && one.durationMs >= 1000
+                        ? ` · ${seconds(one.durationMs)}`
+                        : ''}
+                  </Text>
+                </Box>
+                {drawer.slice(0, DRAWER_LINES).map(line => (
+                  <Text dimColor wrap="truncate">
+                    {'      │ '}
+                    {line}
+                  </Text>
+                ))}
+                {drawer.length > DRAWER_LINES && <Text dimColor>{`      │ … ${drawer.length - DRAWER_LINES} more lines`}</Text>}
+              </Box>
+            )
+          })}
+
+        <Text bold>Summary</Text>
+        <Text wrap="truncate" color={ZONE_COLOR[zone]}>
+          {'  '}context {kTokens(g?.tokens)} of {kTokens(g?.hard)} · {zone.toUpperCase()} · {ZONE_PLAIN[zone]}
+          {g?.usd !== undefined ? ` · $${g.usd.toFixed(2)}` : ''}
+        </Text>
+        <Text wrap="truncate">
+          {'  '}agents {running.length} running
+          {lastCard !== undefined
+            ? ` · last report: ${roleOf(lastCard.type)} ${lastCard.confidence}${lastCard.unverified > 0 ? `, ${lastCard.unverified} unverified` : ''}`
+            : ''}
+        </Text>
+        <Text wrap="truncate" color={HUNCH_COLOR[loudest(hunchNow)]}>
+          {'  '}hunch {hunchNow.length} call{hunchNow.length === 1 ? '' : 's'} · {hunchWarnings === 0 ? 'no warnings' : `${hunchWarnings} warning${hunchWarnings === 1 ? '' : 's'}`}
+        </Text>
+        <Text wrap="truncate" color={j?.isOnline === false ? 'red' : undefined}>
+          {'  '}jev {j?.isOnline === true ? 'online' : j?.isOnline === false ? `offline (${j.lastError ?? 'unavailable'})` : 'unknown'}
+        </Text>
+
+        <Box flexDirection="row" columnGap={1}>
+          <Button key="details" label={isDetailed ? 'hide details' : 'details'} onPress={() => update($, showDetails, shown => !shown)} />
+          <Button
+            key="band"
+            label="toggle band"
+            onPress={async () => setBandHidden($, !(await read($, isBandHidden)))}
+          />
+          <Button
+            key="clear"
+            label="clear done"
+            onPress={async () => {
+              await update($, agents, all => all.filter(agent => agent.status === 'running'))
+              await update($, activity, all => all.filter(one => one.status === 'running'))
+              const now = await $.clock.now()
+              await update($, hunch, log => ({ ...log, calls: reapStale(log.calls, now).filter(call => call.status === 'running') }))
+            }}
+          />
+        </Box>
+
+        {isDetailed && (
+        <Box flexDirection="column">
         <Text bold>Relay</Text>
         <Text color={ZONE_COLOR[zone]}>
           {zone.toUpperCase()} {bar(g?.tokens === undefined ? 0 : g.tokens / g.hard, Math.min(24, width - 22))}{' '}
@@ -678,23 +928,8 @@ export const register: Register = on => {
             {entry.ts.slice(11, 16)} {entry.feature.padEnd(13)} {entry.summary}
           </Text>
         ))}
-
-        <Box flexDirection="row" columnGap={1}>
-          <Button
-            key="band"
-            label="toggle band"
-            onPress={async () => setBandHidden($, !(await read($, isBandHidden)))}
-          />
-          <Button
-            key="clear"
-            label="clear done"
-            onPress={async () => {
-              await update($, agents, all => all.filter(agent => agent.status === 'running'))
-              const now = await $.clock.now()
-              await update($, hunch, log => ({ ...log, calls: reapStale(log.calls, now).filter(call => call.status === 'running') }))
-            }}
-          />
         </Box>
+        )}
       </Box>
     )
   })
