@@ -51,6 +51,13 @@ class CodexInstallTests(unittest.TestCase):
         with mock.patch.object(install_module.os, "name", "posix"):
             self.assertIn("jev-hook.py", install_module.hook_command(self.home / "a%b"))
 
+    def test_fresh_instructions_omit_text_outside_managed_block(self):
+        source = (b"<!-- CODEX-ORCHESTRATOR:START -->\nrules\n<!-- CODEX-ORCHESTRATOR:END -->\n\n"
+                  b"<!-- HUNCH:START -->\nrepo-only\n<!-- HUNCH:END -->\n")
+        merged = install_module.merge_instructions(None, source, Path("AGENTS.md"))
+        self.assertEqual(merged, b"<!-- CODEX-ORCHESTRATOR:START -->\nrules\n"
+                                 b"<!-- CODEX-ORCHESTRATOR:END -->\n")
+
     def test_fresh_install_parses_and_installs_helper(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)

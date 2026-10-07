@@ -150,8 +150,9 @@ def managed_block(data: bytes, path: Path) -> bytes:
 
 def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> bytes:
     block = managed_block(source, Path("source AGENTS.md"))
+    # Install only the managed block, never text outside the source's markers.
     if existing is None:
-        return source
+        return block + b"\n"
     start, end = existing.find(START), existing.find(END)
     if start == end == -1:
         return existing + (b"" if not existing or existing.endswith(b"\n") else b"\n") + block
