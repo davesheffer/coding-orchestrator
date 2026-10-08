@@ -119,6 +119,9 @@ describe('main-session-only actions', () => {
     expect(mainOnlyLabel('Bash', 'rm -rf ${HOME}')).toBe('a destructive delete')
     expect(mainOnlyLabel('Bash', 'timeout -s KILL 60 git push')).toBe('git push')
     expect(mainOnlyLabel('Bash', '"git" push')).toBe('git push')
+    expect(mainOnlyLabel('Bash', 'echo "git push" | bash')).toBe('git push')
+    expect(mainOnlyLabel('Bash', 'bash --norc -c "git push"')).toBe('git push')
+    expect(mainOnlyLabel('Bash', 'bash <<-EOF\n\tgit push\n\tEOF')).toBe('git push')
     expect(isCheck('bash -c "npm test" || true')).toBe(false)
     expect(isCheck('bash -c "npm test" | tail -5')).toBe(false)
     expect(isCheck('bash -c "npm test"')).toBe(true)
@@ -135,6 +138,8 @@ describe('main-session-only actions', () => {
     expect(mainOnlyLabel('Bash', 'bash <<EOF\n' + 'bash -c "ls"\n'.repeat(2000) + 'EOF\ngit push')).toBe('a command too long or nested to read')
     expect(isOutward('Bash', Array(500).fill('bash -c "ls"').join('; ') + '; git push')).toBe(true)
     expect(isCheck('npm test; ' + 'x '.repeat(40000))).toBe(false)
+    expect(mainOnlyLabel('Bash', 'cat <<EOF\n' + '  \n'.repeat(16000) + 'x')).toBe(undefined)
+    expect(mainOnlyLabel('Bash', 'cat <<EOF\n' + '\n'.repeat(63000) + 'x')).toBe(undefined)
     expect(Date.now() - started).toBeLessThan(1000)
   })
 

@@ -96,7 +96,7 @@ const WRAPPERS: RegExp[] = [
 const SHELLS = /^(bash|sh|zsh|dash|ksh)(\s|$)/
 
 /** Heads whose arguments are code: their own quoted text and remainder are read as commands too. */
-const CODE_HEADS = /^((bash|sh|zsh|dash|ksh)(\s+-(?!-)\S+)*\s+-[a-zA-Z]*c|eval|ssh(\s+(-[ilpoFJ]\s+(?!-)\S+|-\S+))*\s+(?!-)\S+|su\s+(\S+\s+)*-c|script\s+(\S+\s+)*-c)(\s|$)/
+const CODE_HEADS = /^((bash|sh|zsh|dash|ksh)(\s+--[\w-]+|\s+-(?!-)\S+)*\s+-[a-zA-Z]*c|eval|ssh(\s+(-[ilpoFJ]\s+(?!-)\S+|-\S+))*\s+(?!-)\S+|su\s+(\S+\s+)*-c|script\s+(\S+\s+)*-c)(\s|$)/
 
 function unwrap(cmd: string): string {
   let current = cmd.trim()
@@ -140,7 +140,7 @@ function parse(line: string, depth: number, state: State): Simple[] {
   // Heredoc bodies are data unless the line feeds them to a shell; the marker stays where the body was read.
   const bodies: string[] = []
   const noHeredocs = joined.replace(
-    /^([^\n]*?)<<-?\s*(['"\\]?)(\w+)\2([^\n]*)\n([\s\S]*?)\n\s*\3[ \t]*(?=\n|$)/gm,
+    /^([^\n]*?)<<-?\s*(['"\\]?)(\w+)\2([^\n]*)\n([\s\S]*?)\n[ \t]*\3[ \t]*(?=\n|$)/gm,
     (_all, before: string, _q: string, _word: string, rest: string, body: string) => {
       bodies.push(body)
 
@@ -160,6 +160,7 @@ function parse(line: string, depth: number, state: State): Simple[] {
 
   const pieces = noComments.split(/(\n|;|&&|\|\||\||(?<![<>&])&(?![>&])|\$\(|`|\(|\)|\}|\bfi\b|\bdone\b)/)
   const simple: Simple[] = []
+  let piped: string[] = []
 
   for (let index = 0; index < pieces.length && !state.isTruncated; index += 2) {
     const after = (pieces[index + 1] ?? '').trim()
@@ -187,6 +188,8 @@ function parse(line: string, depth: number, state: State): Simple[] {
     for (const [, ref] of cmd.matchAll(HEREDOC_REF)) {
       if (isShell) code.push(bodies[Number(ref)] ?? '')
     }
+    if (isShell) code.push(...piped)
+    piped = after === '|' ? [...cmd.matchAll(QUOTE_REF)].map(([, ref]) => (quoted[Number(ref)] ?? '').replace(/^\u0000/, '')) : []
 
     const shown = cmd.replace(HEREDOC_REF, ' ').trim()
     const inner: Simple[] = []
