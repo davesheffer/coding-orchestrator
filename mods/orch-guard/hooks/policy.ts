@@ -62,27 +62,41 @@ export function routeVerdict(args: AgentArgs, isSubagent: boolean): string | und
 /** One simple command of a shell line and the operator that follows it (`''` at the end). */
 export type Simple = { cmd: string; after: string }
 
-/** Prefixes that run the command after them: stripped until the real command heads the line. */
+/** A parsed line; `isTruncated` when it was too long or too nested to read in full. */
+export type Parsed = { simple: Simple[]; isTruncated: boolean }
+
+const MAX_LINE = 64_000
+const MAX_SIMPLE = 400
+const MAX_HEREDOCS = 40
+const MAX_DEPTH = 3
+
+/**
+ * Prefixes that run the command after them: stripped until the real command heads the line. Each
+ * alternative is written so a token can match one way only (no exponential backtracking).
+ */
 const WRAPPERS: RegExp[] = [
   /^\w+=\S*\s+/,
   /^\\(?=\w)/,
   /^(time|command|exec|nohup|builtin|then|do|else|elif|if|while|until|!|\{)\s+/,
-  /^(sudo|doas)(\s+(-[ugCDhpr]\s*\S+|--\S+|-\w+))*\s+/,
-  /^env(\s+(-[uSC]\s*\S+|-\w+|\w+=\S*))*\s+/,
-  /^nice(\s+-n\s*-?\d+|\s+-\d+|\s+--adjustment=\S+)?\s+/,
-  /^(timeout|gtimeout)(\s+-\S+(\s+\d\S*)?)*\s+\d\S*\s+/,
-  /^xargs(\s+(-[IdEsnLPa]\s*\S+|--\S+|-\w+))*\s+/,
-  /^(uv|poetry|pipenv|pdm|hatch|rye)\s+run(\s+-\S+)*\s+/,
+  /^(sudo|doas)(\s+(-[ugCDhpr]\s+(?!-)\S+|-\S+))*\s+/,
+  /^env(\s+(-[uSC]\s+(?!-)\S+|-\S+|\w+=\S*))*\s+/,
+  /^nice(\s+-n\s+-?\d+|\s+-\S+)?\s+/,
+  /^(timeout|gtimeout)(\s+(-[sk]\s+(?!-)\S+|-\S+))*\s+\d\S*\s+/,
+  /^xargs(\s+(-[IdEsnLPa]\s+(?!-)\S+|-\S+))*\s+/,
+  /^(uv|poetry|pipenv|pdm|hatch|rye)\s+run(\s+(--(with|python|extra|group|package|directory|project)\s+(?!-)\S+|-\S+))*\s+/,
   /^coverage\s+run(\s+-\S+)*\s+/,
-  /^python[\d.]*(\s+-[WXO]\s*\S+|\s+-[a-zA-Z]+)*\s+-m\s+/,
+  /^python[\d.]*(\s+(-[WXQ]\s+(?!-)\S+|-(?!m\s)\S+))*\s+-m\s+/,
   /^(npx|bunx|pnpx)(\s+-\S+)*\s+(--\s+)?/,
   /^(npm|pnpm|yarn)\s+(exec|dlx)(\s+-\S+)*\s+(--\s+)?/,
   /^bundle\s+exec\s+/,
   /^(\S*\/)(?=[\w.-]+(\s|$))/,
 ]
 
-/** Heads whose arguments are themselves shell code: their quoted text and remainder are read as commands too. */
-const SHELLS = /^(bash|sh|zsh|dash|ksh|eval|ssh(\s+-\S+(\s+\S+)?)*\s+\S+|su\s+(\S+\s+)*-c|script\s+(\S+\s+)*-c|watch|parallel)(\s|$)/
+/** Shells: a heredoc or pipe they read is code. */
+const SHELLS = /^(bash|sh|zsh|dash|ksh)(\s|$)/
+
+/** Heads whose arguments are code: their own quoted text and remainder are read as commands too. */
+const CODE_HEADS = /^((bash|sh|zsh|dash|ksh)(\s+-(?!-)\S+)*\s+-[a-zA-Z]*c|eval|ssh(\s+(-[ilpoFJ]\s+(?!-)\S+|-\S+))*\s+(?!-)\S+|su\s+(\S+\s+)*-c|script\s+(\S+\s+)*-c)(\s|$)/
 
 function unwrap(cmd: string): string {
   let current = cmd.trim()
@@ -95,59 +109,118 @@ function unwrap(cmd: string): string {
   return current
 }
 
-/**
- * The simple commands a shell line runs, each with the operator after it. Quoted text, heredoc bodies
- * and comments are removed and wrappers (`VAR=x`, `sudo`, `env`, `timeout 60`, `xargs`, `npx`, a path
- * before the binary) stripped, so `grep "git push"` or a commit message never reads as a push. Code a
- * shell runs (`bash -c "…"`, `eval`, `ssh host …`, a heredoc fed to a shell, `"$(…)"`) is read as well.
- */
-export function simpleCommands(line: string, depth = 0): Simple[] {
-  const joined = line.replace(/\\\r?\n/g, ' ')
-  const inner: string[] = []
+/** Quoted text that is one plain word reads as that word (`"git" push`, `'/opt/node'`); anything else becomes a placeholder. */
+const PLAIN = /^[\w./@:+=,%~$-]+$/
+const QUOTE_REF = /__Q(\d+)__/g
+const HEREDOC_REF = /__H(\d+)__/g
 
-  // Heredoc bodies are data, unless a shell reads them as code.
+type State = { count: number; isTruncated: boolean }
+
+/**
+ * Reads a shell line as the simple commands it runs. Quoted text, heredoc bodies and comments are
+ * data, and wrappers (`VAR=x`, `sudo`, `env`, `timeout 60`, `xargs`, `npx`, `uv run`, a path before
+ * the binary) are stripped, so `grep "git push"` or a commit message never reads as a push. Code a
+ * shell runs (`bash -c "…"`, `eval`, `ssh host …`, a heredoc fed to a shell, `"$(…)"`) is read in place,
+ * its last command taking the operator after the shell, so `bash -c "npm test" || true` still hides
+ * the exit code. Long or deeply nested lines come back `isTruncated`, never slowly.
+ */
+export function parseLine(line: string): Parsed {
+  const heredocs = (line.match(/<</g) ?? []).length
+  if (line.length > MAX_LINE || heredocs > MAX_HEREDOCS) return { simple: [], isTruncated: true }
+
+  const state: State = { count: 0, isTruncated: false }
+  const simple = parse(line, 0, state)
+
+  return { simple, isTruncated: state.isTruncated }
+}
+
+function parse(line: string, depth: number, state: State): Simple[] {
+  const joined = line.replace(/\\\r?\n/g, ' ').replace(/\$\{(\w+)\}/g, '$$$1')
+
+  // Heredoc bodies are data unless the line feeds them to a shell; the marker stays where the body was read.
+  const bodies: string[] = []
   const noHeredocs = joined.replace(
     /^([^\n]*?)<<-?\s*(['"\\]?)(\w+)\2([^\n]*)\n([\s\S]*?)\n\s*\3[ \t]*(?=\n|$)/gm,
     (_all, before: string, _q: string, _word: string, rest: string, body: string) => {
-      const heads = before.split(/;|&&|\|\||\||&/).map(part => unwrap(part))
-      if (heads.some(head => SHELLS.test(head))) inner.push(body)
+      bodies.push(body)
 
-      return `${before} ${rest}`
+      return `${before} ${rest} __H${bodies.length - 1}__`
     },
   )
 
-  // Quoted text: kept aside for shells and for command substitution inside double quotes.
   const quoted: string[] = []
   const noQuotes = noHeredocs.replace(/'([^']*)'|"((?:[^"\\]|\\.)*)"/g, (_all, single: string | undefined, double: string | undefined) => {
     const text = single ?? double ?? ''
-    quoted.push(text)
-    if (double !== undefined) for (const match of text.matchAll(/\$\(([^)]*)\)|`([^`]*)`/g)) inner.push(match[1] ?? match[2] ?? '')
+    if (text !== '' && PLAIN.test(text)) return text
+    quoted.push(double !== undefined ? `\u0000${text}` : text)
 
-    return 'Q'
+    return `__Q${quoted.length - 1}__`
   })
   const noComments = noQuotes.replace(/(^|\s)#[^\n]*/g, ' ')
 
   const pieces = noComments.split(/(\n|;|&&|\|\||\||(?<![<>&])&(?![>&])|\$\(|`|\(|\)|\}|\bfi\b|\bdone\b)/)
   const simple: Simple[] = []
-  for (let index = 0; index < pieces.length; index += 2) {
+
+  for (let index = 0; index < pieces.length && !state.isTruncated; index += 2) {
+    const after = (pieces[index + 1] ?? '').trim()
     const cmd = unwrap(pieces[index] ?? '')
     if (cmd === '') continue
-    simple.push({ cmd, after: (pieces[index + 1] ?? '').trim() })
-    if (SHELLS.test(cmd)) {
-      inner.push(cmd.replace(SHELLS, ' '))
-      inner.push(...quoted)
+    if (++state.count > MAX_SIMPLE) {
+      state.isTruncated = true
+      break
     }
-  }
 
-  if (depth < 3) {
-    for (const code of inner) simple.push(...simpleCommands(code, depth + 1))
+    const isCode = CODE_HEADS.test(cmd)
+    const isShell = isCode || SHELLS.test(cmd)
+    const code: string[] = []
+    // The remainder of `eval git push` / `ssh host git push` runs too.
+    if (isCode) code.push(cmd.replace(CODE_HEADS, ' ').replace(QUOTE_REF, ' ').replace(HEREDOC_REF, ' '))
+    for (const [, ref] of cmd.matchAll(QUOTE_REF)) {
+      const text = quoted[Number(ref)] ?? ''
+      const isDouble = text.startsWith('\u0000')
+      const plain = isDouble ? text.slice(1) : text
+      if (isCode) code.push(plain)
+      // Command substitution runs inside double quotes whatever the command.
+      else if (isDouble) for (const match of plain.matchAll(/\$\(([^)]*)\)|`([^`]*)`/g)) code.push(match[1] ?? match[2] ?? '')
+    }
+    // A heredoc's marker sits on the last piece of its line, so `cat <<EOF | bash` lands on bash.
+    for (const [, ref] of cmd.matchAll(HEREDOC_REF)) {
+      if (isShell) code.push(bodies[Number(ref)] ?? '')
+    }
+
+    const shown = cmd.replace(HEREDOC_REF, ' ').trim()
+    const inner: Simple[] = []
+    if (depth >= MAX_DEPTH && code.length > 0) {
+      state.isTruncated = true
+    } else {
+      for (const text of code) inner.push(...parse(text, depth + 1, state))
+    }
+
+    // The shell's own operator applies to every command that ends one of its code chunks.
+    simple.push({ cmd: shown, after }, ...inner.map(one => (isShell && one.after === '' ? { cmd: one.cmd, after } : one)))
   }
 
   return simple
 }
 
+export function simpleCommands(line: string): Simple[] {
+  return parseLine(line).simple
+}
+
 export function commandsOf(line: string): string[] {
-  return simpleCommands(line).map(one => one.cmd)
+  return parseLine(line).simple.map(one => one.cmd)
+}
+
+/** A bounded raw-text look, for when the parser cannot be trusted (too long, or it failed). */
+const RAW_SHIP = /\b(push|publish|deploy|release|merge|apply|upload)\b/
+const RAW_MAIN_ONLY = /\b(push|publish|deploy|release|upload|reset|clean|rm|curl|wget|gh|kubectl|terraform|helm|pr-status|__PR_STATUS__)\b/
+
+export function mightShip(tool: string, command: string | undefined): boolean {
+  return tool === 'Bash' ? RAW_SHIP.test(command ?? '') : MCP_OUTWARD.test(tool)
+}
+
+export function mightBeMainOnly(tool: string, command: string | undefined): boolean {
+  return tool === 'Bash' ? RAW_MAIN_ONLY.test(command ?? '') : MCP_WRITE.test(tool)
 }
 
 type Rule = { label: string; pattern: RegExp }
@@ -192,12 +265,13 @@ const MCP_WRITE = /^mcp__.+__(create|merge|send|delete|push|update|publish|trash
 /** The rule a subagent's call breaks by being outside the main session, if any. */
 export function mainOnlyLabel(tool: string, command: string | undefined): string | undefined {
   if (tool === 'Bash' && command !== undefined) {
-    for (const simple of commandsOf(command)) {
-      const rule = MAIN_ONLY.find(one => one.pattern.test(simple))
+    const parsed = parseLine(command)
+    for (const { cmd } of parsed.simple) {
+      const rule = MAIN_ONLY.find(one => one.pattern.test(cmd))
       if (rule !== undefined) return rule.label
     }
 
-    return undefined
+    return parsed.isTruncated && mightBeMainOnly(tool, command) ? 'a command too long or nested to read' : undefined
   }
 
   return MCP_WRITE.test(tool) ? 'an outward MCP write' : undefined
@@ -210,7 +284,11 @@ const OUTWARD = new RegExp(
 const MCP_OUTWARD = /^mcp__github__(create_pull_request|merge_pull_request|push_files|create_or_update_file|enable_pr_auto_merge)$/
 
 export function isOutward(tool: string, command: string | undefined): boolean {
-  return tool === 'Bash' ? commandsOf(command ?? '').some(simple => OUTWARD.test(simple)) : MCP_OUTWARD.test(tool)
+  if (tool !== 'Bash') return MCP_OUTWARD.test(tool)
+
+  const parsed = parseLine(command ?? '')
+
+  return parsed.simple.some(one => OUTWARD.test(one.cmd)) || (parsed.isTruncated && mightShip(tool, command))
 }
 
 /** Commands that count as a check when they head a simple command (after wrappers): tests, builds, linters, type-checkers, `task verify`. */
@@ -234,9 +312,8 @@ const CHECK = new RegExp(
     String.raw`node\s+(--test\b|\S*test\S*\.m?[jt]s\b)`,
     String.raw`bash\s+-n\b`,
     String.raw`claude\s+plugin\s+(test|validate)\b`,
-    // The hunch launcher, as its prompt hook prints it: a quoted node path and a quoted script.
-    String.raw`((Q|\S*node)\s+)?(Q|\S*hunch\S*|index\.js)\s+task\s+verify\b`,
-    String.raw`hunch\s+task\s+verify\b`,
+    // The hunch launcher as its prompt hook prints it (quoted node path and script), or the hunch CLI.
+    String.raw`(\S*node\s+)?\S*hunch\S*\s+task\s+verify\b`,
   ]
     .map(alt => `^${alt}`)
     .join('|'),
@@ -254,7 +331,9 @@ export function isCheck(command: string, extra = ''): boolean {
   } catch {
     custom = undefined
   }
-  const simple = simpleCommands(command)
+  const parsed = parseLine(command)
+  if (parsed.isTruncated) return false
+  const simple = parsed.simple
   const hasPipefail = /pipefail|PIPESTATUS/.test(command)
   const hasErrexit = /\bset\s+-\w*e/.test(command)
 
@@ -272,6 +351,9 @@ export function isCheck(command: string, extra = ''): boolean {
 /** Paths a shell may write to without touching the work: temp, devices, caches. */
 const SCRATCH = /^(&|\/tmp\/|\/dev\/|\/var\/tmp\/|\/proc\/|\$TMPDIR|\$\{TMPDIR|~\/\.cache\/|\$HOME\/\.cache\/)/
 
+const PLACEHOLDER = /^__Q\d+__$/
+const SCRIPT = /^[sy]([^\w\s]).*\1.*\1\w*$/
+
 /** Shell commands that edit files in place, whatever their targets. */
 const EDITS =
   /^(sed\s+(\S+\s+)*(-[a-zA-Z]*i\S*|--in-place\S*)|perl\s+(\S+\s+)*-[a-zA-Z]*i|patch\b|truncate\b|git\s+((apply|am|restore|merge|pull|cherry-pick|rebase|revert)\b|checkout\s+(\S+\s+)*--(\s|$)|stash\s+(pop|apply)\b)|prettier\s+(\S+\s+)*--write|black\b|isort\b|ruff\s+(format|(\S+\s+)*--fix)|eslint\s+(\S+\s+)*--fix|gofmt\s+(\S+\s+)*-w|cargo\s+fmt|rustfmt\b|clang-format\s+(\S+\s+)*-i)/
@@ -280,19 +362,23 @@ const EDITS =
 export function shellWrites(command: string): string[] {
   const written: string[] = []
 
-  for (const { cmd } of simpleCommands(command)) {
+  const parsed = parseLine(command)
+  if (parsed.isTruncated) return ['?']
+
+  for (const { cmd } of parsed.simple) {
     const words = cmd.split(/\s+/)
-    for (const match of cmd.matchAll(/(^|[^<>&\d])>{1,2}\s*(\S+)/g)) {
+    for (const match of cmd.matchAll(/(^|[^<>])[&\d]?>{1,2}\s*(\S+)/g)) {
       const target = match[2] ?? ''
-      if (!SCRATCH.test(target)) written.push(target === 'Q' ? '?' : target)
+      if (!SCRATCH.test(target)) written.push(PLACEHOLDER.test(target) ? '?' : target)
     }
     if (/^(cp|mv|install|rsync|ln)\b/.test(cmd)) {
       const target = words[words.length - 1] ?? ''
-      if (!SCRATCH.test(target)) written.push(target === 'Q' ? '?' : target)
+      if (!SCRATCH.test(target)) written.push(PLACEHOLDER.test(target) ? '?' : target)
     } else if (/^tee\b/.test(cmd)) {
       written.push(...words.slice(1).filter(word => !word.startsWith('-') && !SCRATCH.test(word)))
     } else if (EDITS.test(cmd)) {
-      const paths = words.slice(1).filter(word => /[./]/.test(word) && !word.startsWith('-') && !SCRATCH.test(word))
+      // A sed/perl script (`s/a/b/`) is not a path.
+      const paths = words.slice(1).filter(word => /[./]/.test(word) && !word.startsWith('-') && !SCRATCH.test(word) && !SCRIPT.test(word) && !PLACEHOLDER.test(word))
       written.push(...(paths.length > 0 ? paths : ['?']))
     }
   }

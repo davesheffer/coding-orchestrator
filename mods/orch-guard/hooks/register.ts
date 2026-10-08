@@ -10,6 +10,8 @@ import {
   isOutward,
   isRisky,
   mainOnlyLabel,
+  mightBeMainOnly,
+  mightShip,
   needsCheck,
   outwardBlockers,
   parseCard,
@@ -196,14 +198,12 @@ export const register: Register = (on, options) => {
     return result
     // A guard failure never blocks ordinary work; an outward ship it could not check is refused instead.
   }).catch(($, e, next) => {
-    let isShip = false
-    try {
-      isShip = mode === 'enforce' && !next.called && e.agentId === undefined && isOutward(e.tool, e.tool === 'Bash' ? e.command : undefined)
-    } catch {
-      isShip = false
-    }
+    // Never re-run the parser that may just have failed: a bounded raw-text look decides.
+    const command = e.tool === 'Bash' ? e.command : undefined
+    const isHeld =
+      mode === 'enforce' && !next.called && (e.agentId === undefined ? mightShip(e.tool, command) : mightBeMainOnly(e.tool, command))
 
-    return isShip ? { deny: 'orch-guard: its ship check failed, so this push/publish is held. The person can run `/orch-guard reset` and retry.' } : next(e)
+    return isHeld ? { deny: 'orch-guard: its check failed on this call, so it is held. Simplify the command, or the person can run `/orch-guard reset` and retry.' } : next(e)
   })
 
   on('agent.spawn', async ($, e, next) => {

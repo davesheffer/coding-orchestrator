@@ -109,6 +109,35 @@ describe('main-session-only actions', () => {
     expect(mainOnlyLabel('Bash', 'curl -sSX POST https://x')).toBe('a send')
   })
 
+  test('quoted arguments are code only for -c, eval and ssh', async () => {
+    expect(mainOnlyLabel('Bash', 'bash scripts/x.sh "git push"')).toBe(undefined)
+    expect(mainOnlyLabel('Bash', 'bash -c "ls" && echo "git push"')).toBe(undefined)
+    expect(mainOnlyLabel('Bash', `bash -c 'echo "git push is blocked"'`)).toBe(undefined)
+    expect(mainOnlyLabel('Bash', 'ssh -i key host ls')).toBe(undefined)
+    expect(isOutward('Bash', 'eval "$(pyenv init -)" && git commit -m "git push"')).toBe(false)
+    expect(mainOnlyLabel('Bash', 'cat <<EOF | bash\ngit push\nEOF')).toBe('git push')
+    expect(mainOnlyLabel('Bash', 'rm -rf ${HOME}')).toBe('a destructive delete')
+    expect(mainOnlyLabel('Bash', 'timeout -s KILL 60 git push')).toBe('git push')
+    expect(mainOnlyLabel('Bash', '"git" push')).toBe('git push')
+    expect(isCheck('bash -c "npm test" || true')).toBe(false)
+    expect(isCheck('bash -c "npm test" | tail -5')).toBe(false)
+    expect(isCheck('bash -c "npm test"')).toBe(true)
+    expect(isCheck("'rm' 'x' task verify")).toBe(false)
+    expect(shellWrites('sed -i s/auth/x/ f.py')).toEqual(['f.py'])
+    expect(shellWrites('cmd &> log')).toEqual(['log'])
+  })
+
+  test('pathological lines stay fast and fail closed', async () => {
+    const started = Date.now()
+    expect(mainOnlyLabel('Bash', 'python' + ' -W'.repeat(3000) + ' z')).toBe(undefined)
+    expect(mainOnlyLabel('Bash', 'python' + ' -Werror'.repeat(30) + ' x; git push')).toBe('git push')
+    expect(mainOnlyLabel('Bash', 'sudo' + ' -u -u'.repeat(2000) + ' z')).toBe(undefined)
+    expect(mainOnlyLabel('Bash', 'bash <<EOF\n' + 'bash -c "ls"\n'.repeat(2000) + 'EOF\ngit push')).toBe('a command too long or nested to read')
+    expect(isOutward('Bash', Array(500).fill('bash -c "ls"').join('; ') + '; git push')).toBe(true)
+    expect(isCheck('npm test; ' + 'x '.repeat(40000))).toBe(false)
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
+
   test('ordinary work is not', async () => {
     expect(mainOnlyLabel('Bash', 'rm -rf dist && npm run build')).toBe(undefined)
     expect(mainOnlyLabel('Bash', 'rm -rf node_modules/.cache')).toBe(undefined)
