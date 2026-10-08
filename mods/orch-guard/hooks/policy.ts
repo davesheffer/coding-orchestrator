@@ -59,50 +59,130 @@ export function routeVerdict(args: AgentArgs, isSubagent: boolean): string | und
   return undefined
 }
 
+/** One simple command of a shell line and the operator that follows it (`''` at the end). */
+export type Simple = { cmd: string; after: string }
+
+/** Prefixes that run the command after them: stripped until the real command heads the line. */
+const WRAPPERS: RegExp[] = [
+  /^\w+=\S*\s+/,
+  /^\\(?=\w)/,
+  /^(time|command|exec|nohup|builtin|then|do|else|elif|if|while|until|!|\{)\s+/,
+  /^(sudo|doas)(\s+(-[ugCDhpr]\s*\S+|--\S+|-\w+))*\s+/,
+  /^env(\s+(-[uSC]\s*\S+|-\w+|\w+=\S*))*\s+/,
+  /^nice(\s+-n\s*-?\d+|\s+-\d+|\s+--adjustment=\S+)?\s+/,
+  /^(timeout|gtimeout)(\s+-\S+(\s+\d\S*)?)*\s+\d\S*\s+/,
+  /^xargs(\s+(-[IdEsnLPa]\s*\S+|--\S+|-\w+))*\s+/,
+  /^(uv|poetry|pipenv|pdm|hatch|rye)\s+run(\s+-\S+)*\s+/,
+  /^coverage\s+run(\s+-\S+)*\s+/,
+  /^python[\d.]*(\s+-[WXO]\s*\S+|\s+-[a-zA-Z]+)*\s+-m\s+/,
+  /^(npx|bunx|pnpx)(\s+-\S+)*\s+(--\s+)?/,
+  /^(npm|pnpm|yarn)\s+(exec|dlx)(\s+-\S+)*\s+(--\s+)?/,
+  /^bundle\s+exec\s+/,
+  /^(\S*\/)(?=[\w.-]+(\s|$))/,
+]
+
+/** Heads whose arguments are themselves shell code: their quoted text and remainder are read as commands too. */
+const SHELLS = /^(bash|sh|zsh|dash|ksh|eval|ssh(\s+-\S+(\s+\S+)?)*\s+\S+|su\s+(\S+\s+)*-c|script\s+(\S+\s+)*-c|watch|parallel)(\s|$)/
+
+function unwrap(cmd: string): string {
+  let current = cmd.trim()
+  for (let round = 0; round < 12; round++) {
+    const rule = WRAPPERS.find(one => one.test(current))
+    if (rule === undefined) break
+    current = current.replace(rule, '').trim()
+  }
+
+  return current
+}
+
 /**
- * The simple commands a shell line runs, each with quoted text, heredoc bodies and comments removed,
- * and leading `VAR=value`, `sudo`, `time`, `env`, `command` and `exec` stripped: so `grep "git push"`
- * or a commit message naming a command never reads as running it.
+ * The simple commands a shell line runs, each with the operator after it. Quoted text, heredoc bodies
+ * and comments are removed and wrappers (`VAR=x`, `sudo`, `env`, `timeout 60`, `xargs`, `npx`, a path
+ * before the binary) stripped, so `grep "git push"` or a commit message never reads as a push. Code a
+ * shell runs (`bash -c "…"`, `eval`, `ssh host …`, a heredoc fed to a shell, `"$(…)"`) is read as well.
  */
-export function commandsOf(line: string): string[] {
-  const noHeredocs = line.replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2[ \t]*(?=\n|$)/g, ' ')
-  const noQuotes = noHeredocs.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ' Q ')
+export function simpleCommands(line: string, depth = 0): Simple[] {
+  const joined = line.replace(/\\\r?\n/g, ' ')
+  const inner: string[] = []
+
+  // Heredoc bodies are data, unless a shell reads them as code.
+  const noHeredocs = joined.replace(
+    /^([^\n]*?)<<-?\s*(['"\\]?)(\w+)\2([^\n]*)\n([\s\S]*?)\n\s*\3[ \t]*(?=\n|$)/gm,
+    (_all, before: string, _q: string, _word: string, rest: string, body: string) => {
+      const heads = before.split(/;|&&|\|\||\||&/).map(part => unwrap(part))
+      if (heads.some(head => SHELLS.test(head))) inner.push(body)
+
+      return `${before} ${rest}`
+    },
+  )
+
+  // Quoted text: kept aside for shells and for command substitution inside double quotes.
+  const quoted: string[] = []
+  const noQuotes = noHeredocs.replace(/'([^']*)'|"((?:[^"\\]|\\.)*)"/g, (_all, single: string | undefined, double: string | undefined) => {
+    const text = single ?? double ?? ''
+    quoted.push(text)
+    if (double !== undefined) for (const match of text.matchAll(/\$\(([^)]*)\)|`([^`]*)`/g)) inner.push(match[1] ?? match[2] ?? '')
+
+    return 'Q'
+  })
   const noComments = noQuotes.replace(/(^|\s)#[^\n]*/g, ' ')
 
-  return noComments
-    .split(/\n|;|&&|\|\||\||&|\$\(|`|\(|\)/)
-    .map(part => part.trim().replace(/^((\w+=\S*|sudo|time|env|command|exec|nohup)\s+)+/, '').trim())
-    .filter(part => part !== '')
+  const pieces = noComments.split(/(\n|;|&&|\|\||\||(?<![<>&])&(?![>&])|\$\(|`|\(|\)|\}|\bfi\b|\bdone\b)/)
+  const simple: Simple[] = []
+  for (let index = 0; index < pieces.length; index += 2) {
+    const cmd = unwrap(pieces[index] ?? '')
+    if (cmd === '') continue
+    simple.push({ cmd, after: (pieces[index + 1] ?? '').trim() })
+    if (SHELLS.test(cmd)) {
+      inner.push(cmd.replace(SHELLS, ' '))
+      inner.push(...quoted)
+    }
+  }
+
+  if (depth < 3) {
+    for (const code of inner) simple.push(...simpleCommands(code, depth + 1))
+  }
+
+  return simple
+}
+
+export function commandsOf(line: string): string[] {
+  return simpleCommands(line).map(one => one.cmd)
 }
 
 type Rule = { label: string; pattern: RegExp }
 
-const GIT = String.raw`git(\s+(-[cC]\s+\S+|--\S+))*\s+`
-const GH_PR = String.raw`gh\s+pr(\s+(-R|--repo)\s+\S+)*\s+`
+const GIT = String.raw`git(\s+(-[cC]\s*\S+|--\S+))*\s+`
+const GH_OPTS = String.raw`(\s+(-R|--repo)(=|\s+)\S+)*`
+const GH_PR = String.raw`gh${GH_OPTS}\s+pr${GH_OPTS}\s+`
+const GH = String.raw`gh${GH_OPTS}\s+`
 
 /** Actions CLAUDE.md keeps in the main session, matched at the head of a simple command. */
 const MAIN_ONLY: Rule[] = [
   { label: 'git push', pattern: new RegExp(`^${GIT}push\\b`) },
   {
     label: 'a GitHub write',
-    pattern: new RegExp(`^(${GH_PR}(create|merge|close|comment|review|edit|ready)\\b|gh\\s+(release\\s+(create|delete|upload)|issue\\s+(create|comment|close|edit)|repo\\s+(create|delete|edit)|api)\\b)`),
+    pattern: new RegExp(`^(${GH_PR}(create|merge|close|comment|review|edit|ready)\\b|${GH}(release\\s+(create|delete|upload)|issue\\s+(create|comment|close|edit)|repo\\s+(create|delete|edit)|api)\\b)`),
   },
-  { label: 'a publish', pattern: /^((npm|pnpm|yarn|bun)\s+publish|twine\s+upload|cargo\s+publish|docker\s+push|gem\s+push|vsce\s+publish|ovsx\s+publish)\b/ },
+  { label: 'a publish', pattern: /^((npm|pnpm|yarn|bun)\s+publish|twine\s+upload|cargo\s+publish|docker(\s+compose)?\s+push|gem\s+push|vsce\s+publish|ovsx\s+publish)\b/ },
   {
     label: 'a deploy',
-    pattern: /^(kubectl\s+(apply|delete|rollout)|terraform\s+(apply|destroy)|helm\s+(install|upgrade|uninstall)|vercel(\s+deploy)?\s+--prod|netlify\s+deploy|fly\s+deploy|firebase\s+deploy)\b/,
+    pattern: /^(kubectl\s+(apply|delete|rollout)|terraform\s+(apply|destroy)|helm\s+(install|upgrade|uninstall)|vercel(\s+deploy)?(\s+\S+)*\s+--prod|netlify\s+deploy|fly\s+deploy|firebase\s+deploy)\b/,
   },
   {
     label: 'a destructive delete',
-    pattern: /^rm\s+(-\S*\s+)*(\/|~|\$HOME|\.\.|\.git)(\s|\/?$)/,
+    pattern: new RegExp(
+      String.raw`^rm\s+(-\S*\s+)*((\/|~|\$HOME|\$\{HOME\}|\$PWD|\.\.?|\.git)\/?\*?|\*)(\s|$)` +
+        String.raw`|^${GIT}(reset\s+(\S+\s+)*--hard|clean\s+(\S+\s+)*-\S*f|branch\s+(\S+\s+)*-D|checkout\s+(\S+\s+)*(--\s+)?\.(\s|$)|stash\s+(drop|clear))`,
+    ),
   },
   {
     label: 'a send',
-    pattern: /^(curl|wget)\b.*(\s(-X|--request)\s*(POST|PUT|PATCH|DELETE)\b|\s(-d|--data\S*|-F|--form|-T|--upload-file|--post-data)\b)|^(sendmail|mail)\b/,
+    pattern: /^(curl|wget)\b.*(\s(-[a-zA-Z]*X|--request)(=|\s*)(POST|PUT|PATCH|DELETE)\b|\s(-[a-zA-Z]*[dFT]|--data\S*|--form\S*|--json|--upload-file|--post-data|--post-file|--method=\S+)\b)|^(sendmail|mail)\b/,
   },
   {
     label: 'networked PR/CI polling',
-    pattern: new RegExp(`^(\\S*/)?pr-status(\\s|$)|^__PR_STATUS__|^(${GH_PR}(checks|view|status)|gh\\s+run\\s+(watch|view|list))\\b`),
+    pattern: new RegExp(`^pr-status(\\s|$)|^__PR_STATUS__|^(${GH_PR}(checks|view|status)|${GH}run\\s+(watch|view|list))\\b`),
   },
 ]
 
@@ -125,7 +205,7 @@ export function mainOnlyLabel(tool: string, command: string | undefined): string
 
 /** Calls that ship work out of the session: the boundary where checks and critic review are due. */
 const OUTWARD = new RegExp(
-  `^(${GIT}push\\b(?!.*\\s(--dry-run|-n)\\b)|${GH_PR}(create|merge)\\b|gh\\s+release\\s+create\\b|(npm|pnpm|yarn|bun)\\s+publish\\b|twine\\s+upload\\b|cargo\\s+publish\\b|docker\\s+push\\b|vsce\\s+publish\\b|kubectl\\s+apply\\b|terraform\\s+apply\\b|helm\\s+(install|upgrade)\\b|netlify\\s+deploy\\b|fly\\s+deploy\\b|firebase\\s+deploy\\b)`,
+  `^(${GIT}push\\b(?!.*\\s(--dry-run|-n)\\b)|${GH_PR}(create|merge)\\b|${GH}release\\s+create\\b|(npm|pnpm|yarn|bun)\\s+publish\\b|twine\\s+upload\\b|cargo\\s+publish\\b|docker(\\s+compose)?\\s+push\\b|vsce\\s+publish\\b|kubectl\\s+apply\\b|terraform\\s+apply\\b|helm\\s+(install|upgrade)\\b|netlify\\s+deploy\\b|fly\\s+deploy\\b|firebase\\s+deploy\\b)`,
 )
 const MCP_OUTWARD = /^mcp__github__(create_pull_request|merge_pull_request|push_files|create_or_update_file|enable_pr_auto_merge)$/
 
@@ -133,26 +213,30 @@ export function isOutward(tool: string, command: string | undefined): boolean {
   return tool === 'Bash' ? commandsOf(command ?? '').some(simple => OUTWARD.test(simple)) : MCP_OUTWARD.test(tool)
 }
 
-/** Commands that count as a check when they head a simple command: tests, builds, linters, type-checkers, `task verify`. */
+/** Commands that count as a check when they head a simple command (after wrappers): tests, builds, linters, type-checkers, `task verify`. */
 const CHECK = new RegExp(
   [
-    String.raw`(python3?\s+-m\s+)?(pytest|unittest|compileall|mypy|tox|nox)\b`,
-    String.raw`(npx\s+)?(jest|vitest|mocha|tsc|pyright|eslint|playwright\s+test)\b`,
+    String.raw`(pytest|py\.test|unittest|compileall|mypy|tox|nox)\b`,
+    String.raw`(jest|vitest|mocha|tsc|pyright|eslint|playwright\s+test)\b`,
+    String.raw`(yarn|pnpm)\s+(jest|vitest|mocha|tsc|eslint)\b`,
     String.raw`(ruff|flake8)\b`,
-    String.raw`(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck|check)\b`,
-    String.raw`cargo\s+(test|build|check|clippy)\b`,
+    String.raw`(npm|pnpm|yarn|bun)\s+(t|test|tests)\b`,
+    String.raw`(npm|pnpm|yarn|bun)\s+run\s+(test|tests|build|lint|typecheck|check|ci|verify|validate)\S*`,
+    String.raw`(npm|pnpm|yarn|bun)\s+(build|lint|typecheck|check)\b`,
+    String.raw`cargo\s+(test|build|check|clippy|nextest)\b`,
     String.raw`go\s+(test|build|vet)\b`,
     String.raw`dotnet\s+(test|build)\b`,
-    String.raw`(gradle|\./gradlew|mvn)\s+\S*(test|build|check|verify)`,
-    String.raw`make\s+(\S+\s+)*(test|check|lint|build|ci)\b`,
+    String.raw`(gradle|gradlew|mvn|mvnw)\s+\S*(test|build|check|verify)`,
+    String.raw`make\s+(\S+\s+)*(test|tests|check|lint|build|ci|verify)\b`,
     String.raw`(ctest|rspec|phpunit)\b`,
-    String.raw`(bundle\s+exec\s+)?rake\s+(test|spec)\b`,
+    String.raw`rake\s+(test|spec)\b`,
     String.raw`(deno|swift)\s+test\b`,
     String.raw`node\s+(--test\b|\S*test\S*\.m?[jt]s\b)`,
     String.raw`bash\s+-n\b`,
     String.raw`claude\s+plugin\s+(test|validate)\b`,
-    String.raw`\S*node\s+\S*hunch\S*\s+task\s+verify\b`,
-    String.raw`(\S*/)?hunch\s+task\s+verify\b`,
+    // The hunch launcher, as its prompt hook prints it: a quoted node path and a quoted script.
+    String.raw`((Q|\S*node)\s+)?(Q|\S*hunch\S*|index\.js)\s+task\s+verify\b`,
+    String.raw`hunch\s+task\s+verify\b`,
   ]
     .map(alt => `^${alt}`)
     .join('|'),
@@ -160,30 +244,60 @@ const CHECK = new RegExp(
 
 /**
  * Whether a Bash line is a check whose exit code speaks for itself: a check heads one of its commands,
- * no `--help`, and no pipe or `|| ...` that could hide its exit code (unless `set -o pipefail`).
+ * no `--help`, and nothing after it can hide its exit code (a pipe without `pipefail`/`PIPESTATUS`,
+ * `||`, or a later command after `;` without `set -e`).
  */
 export function isCheck(command: string, extra = ''): boolean {
-  const simple = commandsOf(command)
   let custom: RegExp | undefined
   try {
     custom = extra.trim() === '' ? undefined : new RegExp(`^(${extra})`)
   } catch {
     custom = undefined
   }
-  const hasCheck = simple.some(one => !/\s--help\b/.test(one) && (CHECK.test(one) || custom?.test(one) === true))
-  const stripped = command.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ' ')
-  const masks = /\|\|/.test(stripped) || (/(^|[^|])\|([^|]|$)/.test(stripped) && !/pipefail/.test(stripped))
+  const simple = simpleCommands(command)
+  const hasPipefail = /pipefail|PIPESTATUS/.test(command)
+  const hasErrexit = /\bset\s+-\w*e/.test(command)
 
-  return hasCheck && !masks
+  return simple.some((one, index) => {
+    if (/\s--help\b/.test(one.cmd) || !(CHECK.test(one.cmd) || custom?.test(one.cmd) === true)) return false
+    const isLast = index === simple.length - 1
+    if (one.after === '|') return hasPipefail
+    if (one.after === '||') return false
+    if (one.after === '&&' || one.after === '') return true
+
+    return isLast || hasErrexit
+  })
 }
 
-/** Bash lines that may change tracked files (not read-only by the tool's own check). */
-const WRITES =
-  /^(sed\s+(-\S*\s+)*-i|perl\s+(-\S*\s+)*-i|tee\b|patch\b|mv\b|cp\b|truncate\b|git\s+(apply|am|checkout\s+(\S+\s+)*--|restore|merge|pull|cherry-pick|rebase|revert|stash\s+(pop|apply))\b)|\s>{1,2}\s*(?!&|\/dev\/null)\S/
+/** Paths a shell may write to without touching the work: temp, devices, caches. */
+const SCRATCH = /^(&|\/tmp\/|\/dev\/|\/var\/tmp\/|\/proc\/|\$TMPDIR|\$\{TMPDIR|~\/\.cache\/|\$HOME\/\.cache\/)/
 
-/** Whether a Bash line may have edited files the Edit tools never saw. */
-export function mayWrite(command: string): boolean {
-  return commandsOf(command).some(simple => WRITES.test(simple))
+/** Shell commands that edit files in place, whatever their targets. */
+const EDITS =
+  /^(sed\s+(\S+\s+)*(-[a-zA-Z]*i\S*|--in-place\S*)|perl\s+(\S+\s+)*-[a-zA-Z]*i|patch\b|truncate\b|git\s+((apply|am|restore|merge|pull|cherry-pick|rebase|revert)\b|checkout\s+(\S+\s+)*--(\s|$)|stash\s+(pop|apply)\b)|prettier\s+(\S+\s+)*--write|black\b|isort\b|ruff\s+(format|(\S+\s+)*--fix)|eslint\s+(\S+\s+)*--fix|gofmt\s+(\S+\s+)*-w|cargo\s+fmt|rustfmt\b|clang-format\s+(\S+\s+)*-i)/
+
+/** The files a Bash line may have changed that the Edit tools never saw: `['?']` when it cannot tell which. */
+export function shellWrites(command: string): string[] {
+  const written: string[] = []
+
+  for (const { cmd } of simpleCommands(command)) {
+    const words = cmd.split(/\s+/)
+    for (const match of cmd.matchAll(/(^|[^<>&\d])>{1,2}\s*(\S+)/g)) {
+      const target = match[2] ?? ''
+      if (!SCRATCH.test(target)) written.push(target === 'Q' ? '?' : target)
+    }
+    if (/^(cp|mv|install|rsync|ln)\b/.test(cmd)) {
+      const target = words[words.length - 1] ?? ''
+      if (!SCRATCH.test(target)) written.push(target === 'Q' ? '?' : target)
+    } else if (/^tee\b/.test(cmd)) {
+      written.push(...words.slice(1).filter(word => !word.startsWith('-') && !SCRATCH.test(word)))
+    } else if (EDITS.test(cmd)) {
+      const paths = words.slice(1).filter(word => /[./]/.test(word) && !word.startsWith('-') && !SCRATCH.test(word))
+      written.push(...(paths.length > 0 ? paths : ['?']))
+    }
+  }
+
+  return [...new Set(written)]
 }
 
 const DOCS = /\.(md|mdx|txt|rst|adoc)$|(^|\/)docs\/|(^|\/)(LICENSE|CHANGELOG|AUTHORS|NOTICE)[^/]*$|(^|\/)\.(gitignore|gitattributes|editorconfig)$/i
@@ -237,7 +351,8 @@ export function touch(entries: readonly Touched[], path: string, at: number, cap
 
 /** Drops the entries a check or review that started at `since` covered. */
 export function settle(entries: readonly Touched[], since: number, only?: readonly string[]): Touched[] {
-  return entries.filter(one => one.at > since || (only !== undefined && !only.includes(one.path)))
+  // A change in the same millisecond as the start stays pending: fail closed.
+  return entries.filter(one => one.at >= since || (only !== undefined && !only.includes(one.path)))
 }
 
 export type Card = {

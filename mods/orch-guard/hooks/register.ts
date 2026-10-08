@@ -10,13 +10,13 @@ import {
   isOutward,
   isRisky,
   mainOnlyLabel,
-  mayWrite,
   needsCheck,
   outwardBlockers,
   parseCard,
   roleFor,
   routeVerdict,
   settle,
+  shellWrites,
   summary,
   touch,
 } from './policy'
@@ -29,18 +29,21 @@ type Mode = 'enforce' | 'warn' | 'off'
 /** Origins that are the person's own gesture: a waiver or reset from anywhere else is refused. */
 const PERSON = new Set(['composer', 'bridge', 'sdk'])
 
-/** The ledger, with entries an earlier version stored as bare paths read as touched at 0. */
-async function current($: EngineInterface): Promise<GuardLedger> {
-  const raw = await read($, ledger)
+/** Entries an earlier version stored as bare paths read as touched at 0. */
+function normalise(raw: GuardLedger): GuardLedger {
   const fix = (list: readonly (Touched | string)[]): Touched[] => list.map(one => (typeof one === 'string' ? { path: one, at: 0 } : one))
 
   return { ...raw, uncheckedEdits: fix(raw.uncheckedEdits), riskyPending: fix(raw.riskyPending) }
 }
 
+async function current($: EngineInterface): Promise<GuardLedger> {
+  return normalise(await read($, ledger))
+}
+
+/** Applies `fn` with compare-and-set, so parallel tool calls never drop each other's entries. */
 async function change($: EngineInterface, fn: (one: GuardLedger) => GuardLedger) {
-  const next = fn(await current($))
-  await update($, ledger, () => next)
-  const text = summary(next)
+  await update($, ledger, raw => fn(normalise(raw)))
+  const text = summary(await current($))
   $.ui.status(text === '' ? undefined : text)
 }
 
@@ -174,15 +177,34 @@ export const register: Register = (on, options) => {
           uncheckedEdits: isPassing ? settle(one.uncheckedEdits, startedAt) : one.uncheckedEdits,
           lastCheck: { at: startedAt, command, isPassing },
         }))
-      } else if (result.isReadOnly !== true && mayWrite(command)) {
-        const at = await $.clock.now()
-        await change($, one => ({ ...one, uncheckedEdits: touch(one.uncheckedEdits, `bash: ${clip(command, 50)}`, at), waiver: null }))
+      } else if (result.isReadOnly !== true) {
+        const written = shellWrites(command)
+        if (written.length > 0) {
+          const at = await $.clock.now()
+          const label = `bash: ${clip(command, 50)}`
+          const risky = written.filter(one => one !== '?' && isRisky(one, riskyPattern))
+          // An inferred shell write keeps the person's waiver: only the Edit tools close it.
+          await change($, one => ({
+            ...one,
+            uncheckedEdits: written.some(path => path === '?' || needsCheck(path)) ? touch(one.uncheckedEdits, label, at) : one.uncheckedEdits,
+            riskyPending: risky.reduce((list, path) => touch(list, path, at), one.riskyPending),
+          }))
+        }
       }
     }
 
     return result
-    // A guard failure never blocks work: the call goes on as if the guard were absent.
-  }).catch(($, e, next) => next(e))
+    // A guard failure never blocks ordinary work; an outward ship it could not check is refused instead.
+  }).catch(($, e, next) => {
+    let isShip = false
+    try {
+      isShip = mode === 'enforce' && !next.called && e.agentId === undefined && isOutward(e.tool, e.tool === 'Bash' ? e.command : undefined)
+    } catch {
+      isShip = false
+    }
+
+    return isShip ? { deny: 'orch-guard: its ship check failed, so this push/publish is held. The person can run `/orch-guard reset` and retry.' } : next(e)
+  })
 
   on('agent.spawn', async ($, e, next) => {
     const result = await next(e)

@@ -7,7 +7,7 @@ import {
   isOutward,
   isRisky,
   mainOnlyLabel,
-  mayWrite,
+  shellWrites,
   needsCheck,
   outwardBlockers,
   parseCard,
@@ -77,6 +77,38 @@ describe('main-session-only actions', () => {
     expect(isOutward('Bash', 'npm test && git push -u origin b')).toBe(true)
   })
 
+  test('shell wrappers do not hide a push', async () => {
+    for (const line of [
+      'bash -c "git push"',
+      "sh -c 'git push'",
+      'eval git push',
+      'eval "git push origin main"',
+      'echo origin | xargs git push',
+      'sudo -u me git push',
+      'env -i git push',
+      'timeout 60 git push',
+      'nice git push',
+      'ssh host git push',
+      '{ git push; }',
+      'if true; then git push; fi',
+      'echo "$(git push)"',
+      'bash <<EOF\ngit push\nEOF',
+      '/usr/bin/git push',
+      '\\git push',
+      'FOO="a b" git push',
+      'git -c user.name="A B" push',
+      'gh --repo o/r pr create',
+    ]) {
+      expect([line, mainOnlyLabel('Bash', line) !== undefined]).toEqual([line, true])
+    }
+    expect(mainOnlyLabel('Bash', 'git reset --hard HEAD~1')).toBe('a destructive delete')
+    expect(mainOnlyLabel('Bash', 'git clean -fdx')).toBe('a destructive delete')
+    expect(mainOnlyLabel('Bash', 'git checkout -- .')).toBe('a destructive delete')
+    expect(mainOnlyLabel('Bash', 'rm -rf ~')).toBe('a destructive delete')
+    expect(mainOnlyLabel('Bash', 'rm -rf ./build')).toBe(undefined)
+    expect(mainOnlyLabel('Bash', 'curl -sSX POST https://x')).toBe('a send')
+  })
+
   test('ordinary work is not', async () => {
     expect(mainOnlyLabel('Bash', 'rm -rf dist && npm run build')).toBe(undefined)
     expect(mainOnlyLabel('Bash', 'rm -rf node_modules/.cache')).toBe(undefined)
@@ -107,11 +139,28 @@ describe('classification', () => {
     expect(isCheck('cd mods && npm test')).toBe(true)
     expect(isCheck('node --test')).toBe(true)
     expect(isCheck('just test', 'just\\s+test')).toBe(true)
-    expect(mayWrite("sed -i 's/a/b/' src/auth.ts")).toBe(true)
-    expect(mayWrite('cat > src/x.py <<EOF\nprint(1)\nEOF')).toBe(true)
-    expect(mayWrite('git apply fix.diff')).toBe(true)
-    expect(mayWrite('npm test 2>/dev/null')).toBe(false)
-    expect(mayWrite('git diff > /dev/null')).toBe(false)
+    expect(shellWrites("sed -i 's/a/b/' src/auth.ts")).toEqual(['src/auth.ts'])
+    expect(shellWrites('cat > src/x.py <<EOF\nprint(1)\nEOF')).toEqual(['src/x.py'])
+    expect(shellWrites('cat <<EOF > src/y.py\nprint(1)\nEOF')).toEqual(['src/y.py'])
+    expect(shellWrites('git apply fix.diff')).toEqual(['fix.diff'])
+    expect(shellWrites('git checkout -- .')).toEqual(['.'])
+    expect(shellWrites('npm test 2>/dev/null')).toEqual([])
+    expect(shellWrites('git diff > /dev/null')).toEqual([])
+    expect(shellWrites('ls > /tmp/x && cp f /tmp/ && echo x > /dev/stderr')).toEqual([])
+    expect(shellWrites('npm test 2>&1')).toEqual([])
+    // The prescribed hunch launcher, quoted exactly as its hook prints it.
+    expect(isCheck("'/opt/node22/bin/node' '/root/.npm/_npx/206b/node_modules/@davesheffer/hunch/dist/cli/index.js' task verify htask_x -- python -m pytest")).toBe(true)
+    expect(isCheck('timeout 300 claude plugin test .')).toBe(true)
+    expect(isCheck('uv run pytest')).toBe(true)
+    expect(isCheck('coverage run -m pytest')).toBe(true)
+    expect(isCheck('python3.12 -W error -m pytest')).toBe(true)
+    expect(isCheck('./node_modules/.bin/tsc --noEmit')).toBe(true)
+    expect(isCheck('npx --no-install tsc')).toBe(true)
+    expect(isCheck('PYTHONPATH=. pytest')).toBe(true)
+    expect(isCheck('npm t')).toBe(true)
+    expect(isCheck('git diff --quiet || pytest')).toBe(true)
+    expect(isCheck('pytest 2>&1 | tail -n 50; exit ${PIPESTATUS[0]}')).toBe(true)
+    expect(isCheck('pytest; echo done')).toBe(false)
     expect(isOutward('Bash', 'git push -u origin feature')).toBe(true)
     expect(isOutward('Bash', 'git pull origin main')).toBe(false)
     expect(isOutward('mcp__github__create_pull_request', undefined)).toBe(true)
@@ -191,7 +240,7 @@ describe('in the engine', () => {
   })
 
   test('a push after an unchecked edit is refused, and allowed once a check passes', async ($, on) => {
-    mock.clock(on)
+    const clock = mock.clock(on)
     const pushes: string[] = []
     on('tool.call', ($, e) => {
       if (e.tool === 'Bash' && /git push/.test(e.command)) pushes.push(e.command)
@@ -199,6 +248,7 @@ describe('in the engine', () => {
     })
 
     await $.tool.call({ tool: 'Edit', file_path: '/repo/src/format.ts', old_string: 'a', new_string: 'b' })
+    await clock.advance(10)
     const refused = await $.tool.call({ tool: 'Bash', command: 'git push -u origin feature' })
     expect(refusal(refused)).toContain('no passing check')
     expect(pushes).toEqual([])
@@ -209,7 +259,7 @@ describe('in the engine', () => {
   })
 
   test('a risky edit needs a critic, and /orch-guard waive lets the next push through', async ($, on) => {
-    mock.clock(on)
+    const clock = mock.clock(on)
     const pushes: string[] = []
     on('tool.call', ($, e) => {
       if (e.tool === 'Bash' && /git push/.test(e.command)) pushes.push(e.command)
@@ -217,6 +267,7 @@ describe('in the engine', () => {
     })
 
     await $.tool.call({ tool: 'Edit', file_path: '/repo/claude/install.py', old_string: 'a', new_string: 'b' })
+    await clock.advance(10)
     await $.tool.call({ tool: 'Bash', command: 'python -m unittest discover -s tests' })
     const refused = await $.tool.call({ tool: 'Bash', command: 'git push' })
     expect(refusal(refused)).toContain('critic')
@@ -287,6 +338,35 @@ describe('in the engine', () => {
     status = 'async_launched'
     const launched = await $.tool.call({ tool: 'Agent', description: 'd', prompt: 'p', subagent_type: 'scout', run_in_background: false })
     expect(launched.context ?? []).toEqual([])
+  })
+
+  test('parallel edits are all kept', async ($, on) => {
+    mock.clock(on)
+    on('tool.call', () => ({ result: 'ok', text: 'ok' }) as never)
+    await Promise.all([
+      $.tool.call({ tool: 'Edit', file_path: '/repo/src/a.ts', old_string: 'a', new_string: 'b' }),
+      $.tool.call({ tool: 'Edit', file_path: '/repo/src/b.ts', old_string: 'a', new_string: 'b' }),
+    ])
+    const refused = await $.tool.call({ tool: 'Bash', command: 'git push' })
+    expect(refusal(refused)).toContain('a.ts')
+    expect(refusal(refused)).toContain('b.ts')
+  })
+
+  test('an edit in the same millisecond as a check start stays pending', async ($, on) => {
+    mock.clock(on)
+    let release = () => {}
+    const held = new Promise<void>(resolve => {
+      release = resolve
+    })
+    on('tool.call', async ($, e) => {
+      if (e.tool === 'Bash' && e.command === 'npm test') await held
+      return { result: 'ok', text: 'ok' } as never
+    })
+    const check = $.tool.call({ tool: 'Bash', command: 'npm test' })
+    await $.tool.call({ tool: 'Edit', file_path: '/repo/src/x.ts', old_string: 'a', new_string: 'b' })
+    release()
+    await check
+    expect(refusal(await $.tool.call({ tool: 'Bash', command: 'git push' }))).toContain('x.ts')
   })
 
   test('warn mode lets the call run', { options: { mode: 'warn' } }, async ($, on) => {
