@@ -66,6 +66,10 @@ Then start a new session. That's it. 🎉
 `~/.claude/mods/mission-control` and see its [README](mods/mission-control/README.md).
 Then type `/orch` in Claude Code.
 
+**orch-guard** is optional too. It enforces these rules when a tool is called: role models,
+no pushes from subagents, checks after the last edit, and a critic before risky work ships.
+See its [README](mods/orch-guard/README.md).
+
 ## 🔄 Updating
 
 ```sh

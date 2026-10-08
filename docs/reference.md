@@ -433,6 +433,16 @@ The installer does not install it. Copy `mods/mission-control` to
 `~/.claude/mods/mission-control` and follow its
 [README](../mods/mission-control/README.md) to load it in every session.
 
+**orch-guard** (`mods/orch-guard/`) enforces the rules above when a tool is
+called, instead of only showing them. It refuses an `Agent` call that would
+inherit the main model or send a role on the wrong model, and refuses push,
+publish, deploy, delete, send and PR polling inside a subagent. It also refuses
+a push or publish while edits have no passing check after them, or while risky
+files have no critic `SHIP`. After a weak role report, it leaves the model a
+verify-or-escalate reminder. `/orch-guard` shows what blocks a push. The person
+can let one push through with `/orch-guard waive <reason>`. The installer does
+not install it either; see its [README](../mods/orch-guard/README.md).
+
 ### Codex
 
 ```sh
@@ -654,6 +664,7 @@ runner. No credentials are included.
 | `bin/pr-status` | Shared PR/CI helper |
 | `bin/rollover-open.py`, `vscode/handoff-bridge/` | Shared handoff protocol and VS Code tab bridge |
 | `mods/mission-control/` | Optional Claude Code mod: live `/orch` dashboard, activity timeline, and `/sessions` switcher |
+| `mods/orch-guard/` | Optional Claude Code mod: enforces role models, main-session-only actions, checks after edits, and critic review before push/publish |
 | `bin/jev_client.py`, `bin/jev-route.py`, `bin/jev-guard.py`, `bin/jev-report.py`, `bin/ask-jev.py`, `bin/eval-jev-routing.py` | Opt-in TypeSafe Jev hooks (routing, risk gate, report check), ask-about-files command, log and spend report, routing eval |
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |

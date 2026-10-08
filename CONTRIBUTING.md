@@ -39,11 +39,13 @@ python -m unittest discover -s tests -v
 node vscode/handoff-bridge/test.js
 ```
 
-Changed the Mission Control mod (`mods/mission-control/`)? Also run:
+Changed a mod (`mods/mission-control/` or `mods/orch-guard/`)? Also run, for that mod:
 
 ```bash
 claude plugin validate mods/mission-control
 claude plugin test mods/mission-control
+claude plugin validate mods/orch-guard
+claude plugin test mods/orch-guard
 ```
 
 Test installers safely with `./install.sh --dry-run` (or
@@ -58,7 +60,7 @@ without touching your setup.
 | `codex/` | Codex installer and its roles |
 | `relay/` | Hands a long chat off to a fresh session |
 | `bin/` | Small helper commands (PR status, rollover, Jev) |
-| `mods/` | The Mission Control pane for Claude Code |
+| `mods/` | Claude Code mods: the Mission Control pane and the orch-guard rule enforcer |
 | `vscode/` | VS Code extension that opens handoff tabs |
 | `tests/` | Python tests for all of the above |
 | `docs/` | Longer explanations and research |

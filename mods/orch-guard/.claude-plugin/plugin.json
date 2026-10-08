@@ -1,0 +1,21 @@
+{
+  "name": "orch-guard",
+  "version": "0.1.0",
+  "description": "Enforces the coding-orchestrator rules at tool-call time: role/model routing, main-session-only actions, checks after the last edit, and critic review before risky work ships.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Mode",
+      "description": "enforce: refuse calls that break a rule. warn: let them run and remind the model. off: only track.",
+      "options": ["enforce", "warn", "off"],
+      "default": "enforce"
+    },
+    "riskyPattern": {
+      "type": "string",
+      "title": "Extra risky paths",
+      "description": "A regular expression; edited paths it matches also need a critic SHIP before push or publish.",
+      "default": ""
+    }
+  }
+}
