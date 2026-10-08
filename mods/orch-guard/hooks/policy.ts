@@ -1,4 +1,4 @@
-import type { CriticVerdict, GuardLedger, Role } from '../types'
+import type { CriticVerdict, GuardLedger, Role, Touched } from '../types'
 
 /** CLAUDE.md's routing table: the model each named role runs on. */
 export const ROLE_MODELS: Record<Role, string> = {
@@ -8,8 +8,8 @@ export const ROLE_MODELS: Record<Role, string> = {
   critic: 'fable',
 }
 
-/** Agent types that pin their own model (or, for `fork`, cannot take one). */
-const SELF_PINNED = new Set(['statusline-setup', 'claude-code-guide', 'fork'])
+/** Built-in agent types that inherit the main session's model when no `model` is given. */
+const INHERITING = new Set(['general-purpose', 'Explore', 'Plan', 'claude'])
 
 export const EMPTY_LEDGER: GuardLedger = {
   uncheckedEdits: [],
@@ -51,35 +51,58 @@ export function routeVerdict(args: AgentArgs, isSubagent: boolean): string | und
       : `the ${role} role runs on ${expected}. Drop \`model\` or set model: '${expected}'.`
   }
 
-  if (args.model === undefined && !SELF_PINNED.has(type)) {
+  // Other agent types (plugins', the user's) may pin a model in their own definition.
+  if (args.model === undefined && INHERITING.has(type)) {
     return `'${type}' would inherit the main session's model. Use a named role (scout, runner, builder, critic), or pass model: 'sonnet' for bounded reading, exact checks or a specified change ('fable' only for critic-style review).`
   }
 
   return undefined
 }
 
+/**
+ * The simple commands a shell line runs, each with quoted text, heredoc bodies and comments removed,
+ * and leading `VAR=value`, `sudo`, `time`, `env`, `command` and `exec` stripped: so `grep "git push"`
+ * or a commit message naming a command never reads as running it.
+ */
+export function commandsOf(line: string): string[] {
+  const noHeredocs = line.replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2[ \t]*(?=\n|$)/g, ' ')
+  const noQuotes = noHeredocs.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ' Q ')
+  const noComments = noQuotes.replace(/(^|\s)#[^\n]*/g, ' ')
+
+  return noComments
+    .split(/\n|;|&&|\|\||\||&|\$\(|`|\(|\)/)
+    .map(part => part.trim().replace(/^((\w+=\S*|sudo|time|env|command|exec|nohup)\s+)+/, '').trim())
+    .filter(part => part !== '')
+}
+
 type Rule = { label: string; pattern: RegExp }
 
-/** Actions CLAUDE.md keeps in the main session: push, publish, deploy, delete, send, networked PR polling. */
+const GIT = String.raw`git(\s+(-[cC]\s+\S+|--\S+))*\s+`
+const GH_PR = String.raw`gh\s+pr(\s+(-R|--repo)\s+\S+)*\s+`
+
+/** Actions CLAUDE.md keeps in the main session, matched at the head of a simple command. */
 const MAIN_ONLY: Rule[] = [
-  { label: 'git push', pattern: /\bgit\s+push\b/ },
+  { label: 'git push', pattern: new RegExp(`^${GIT}push\\b`) },
   {
     label: 'a GitHub write',
-    pattern: /\bgh\s+(pr\s+(create|merge|close|comment|review|edit)|release\s+create|issue\s+(create|comment|close|edit)|api\b)/,
+    pattern: new RegExp(`^(${GH_PR}(create|merge|close|comment|review|edit|ready)\\b|gh\\s+(release\\s+(create|delete|upload)|issue\\s+(create|comment|close|edit)|repo\\s+(create|delete|edit)|api)\\b)`),
   },
-  { label: 'a publish', pattern: /\b((npm|pnpm|yarn)\s+publish|twine\s+upload|cargo\s+publish|docker\s+push|gem\s+push|vsce\s+publish)\b/ },
+  { label: 'a publish', pattern: /^((npm|pnpm|yarn|bun)\s+publish|twine\s+upload|cargo\s+publish|docker\s+push|gem\s+push|vsce\s+publish|ovsx\s+publish)\b/ },
   {
     label: 'a deploy',
-    pattern: /\b(kubectl\s+(apply|delete)|terraform\s+(apply|destroy)|helm\s+(install|upgrade|uninstall)|vercel\s+(deploy|--prod)|netlify\s+deploy|fly\s+deploy|firebase\s+deploy)\b/,
+    pattern: /^(kubectl\s+(apply|delete|rollout)|terraform\s+(apply|destroy)|helm\s+(install|upgrade|uninstall)|vercel(\s+deploy)?\s+--prod|netlify\s+deploy|fly\s+deploy|firebase\s+deploy)\b/,
   },
   {
     label: 'a destructive delete',
-    pattern: /\brm\s+-(?:[a-zA-Z]*r[a-zA-Z]*f|[a-zA-Z]*f[a-zA-Z]*r)\b|\bgit\s+(branch\s+-D|reset\s+--hard|clean\s+-[a-z]*f|push\s+--delete)\b/,
+    pattern: /^rm\s+(-\S*\s+)*(\/|~|\$HOME|\.\.|\.git)(\s|\/?$)/,
   },
-  { label: 'a send', pattern: /\b(curl|wget)\b[^|;&]*\s-X\s*(POST|PUT|PATCH|DELETE)\b|\bsendmail\b/ },
+  {
+    label: 'a send',
+    pattern: /^(curl|wget)\b.*(\s(-X|--request)\s*(POST|PUT|PATCH|DELETE)\b|\s(-d|--data\S*|-F|--form|-T|--upload-file|--post-data)\b)|^(sendmail|mail)\b/,
+  },
   {
     label: 'networked PR/CI polling',
-    pattern: /\bpr-status\b|__PR_STATUS__|\bgh\s+(pr\s+(checks|view|status)|run\s+(watch|view|list))\b/,
+    pattern: new RegExp(`^(\\S*/)?pr-status(\\s|$)|^__PR_STATUS__|^(${GH_PR}(checks|view|status)|gh\\s+run\\s+(watch|view|list))\\b`),
   },
 ]
 
@@ -89,40 +112,97 @@ const MCP_WRITE = /^mcp__.+__(create|merge|send|delete|push|update|publish|trash
 /** The rule a subagent's call breaks by being outside the main session, if any. */
 export function mainOnlyLabel(tool: string, command: string | undefined): string | undefined {
   if (tool === 'Bash' && command !== undefined) {
-    return MAIN_ONLY.find(rule => rule.pattern.test(command))?.label
+    for (const simple of commandsOf(command)) {
+      const rule = MAIN_ONLY.find(one => one.pattern.test(simple))
+      if (rule !== undefined) return rule.label
+    }
+
+    return undefined
   }
 
   return MCP_WRITE.test(tool) ? 'an outward MCP write' : undefined
 }
 
 /** Calls that ship work out of the session: the boundary where checks and critic review are due. */
-const OUTWARD = /\bgit\s+push\b|\bgh\s+(pr\s+(create|merge)|release\s+create)\b|\b((npm|pnpm|yarn)\s+publish|twine\s+upload|cargo\s+publish|docker\s+push|vsce\s+publish)\b|\b(kubectl\s+apply|terraform\s+apply|helm\s+(install|upgrade)|netlify\s+deploy|fly\s+deploy|firebase\s+deploy)\b/
+const OUTWARD = new RegExp(
+  `^(${GIT}push\\b(?!.*\\s(--dry-run|-n)\\b)|${GH_PR}(create|merge)\\b|gh\\s+release\\s+create\\b|(npm|pnpm|yarn|bun)\\s+publish\\b|twine\\s+upload\\b|cargo\\s+publish\\b|docker\\s+push\\b|vsce\\s+publish\\b|kubectl\\s+apply\\b|terraform\\s+apply\\b|helm\\s+(install|upgrade)\\b|netlify\\s+deploy\\b|fly\\s+deploy\\b|firebase\\s+deploy\\b)`,
+)
 const MCP_OUTWARD = /^mcp__github__(create_pull_request|merge_pull_request|push_files|create_or_update_file|enable_pr_auto_merge)$/
 
 export function isOutward(tool: string, command: string | undefined): boolean {
-  return tool === 'Bash' ? OUTWARD.test(command ?? '') : MCP_OUTWARD.test(tool)
+  return tool === 'Bash' ? commandsOf(command ?? '').some(simple => OUTWARD.test(simple)) : MCP_OUTWARD.test(tool)
 }
 
-/** Commands that count as a check: tests, builds, linters, type-checkers, `task verify`. */
-const CHECK =
-  /\b(pytest|unittest|compileall|jest|vitest|mocha|tsc|mypy|pyright|ruff|eslint|flake8|clippy|gradle|mvn|playwright\s+test)\b|\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck|check)\b|\bcargo\s+(test|build|check)\b|\bgo\s+(test|build|vet)\b|\bdotnet\s+(test|build)\b|\bmake\b|\bbash\s+-n\b|\bclaude\s+plugin\s+(test|validate)\b|\btask\s+verify\b|\bnode\s+\S*test\S*\.m?js\b/
+/** Commands that count as a check when they head a simple command: tests, builds, linters, type-checkers, `task verify`. */
+const CHECK = new RegExp(
+  [
+    String.raw`(python3?\s+-m\s+)?(pytest|unittest|compileall|mypy|tox|nox)\b`,
+    String.raw`(npx\s+)?(jest|vitest|mocha|tsc|pyright|eslint|playwright\s+test)\b`,
+    String.raw`(ruff|flake8)\b`,
+    String.raw`(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck|check)\b`,
+    String.raw`cargo\s+(test|build|check|clippy)\b`,
+    String.raw`go\s+(test|build|vet)\b`,
+    String.raw`dotnet\s+(test|build)\b`,
+    String.raw`(gradle|\./gradlew|mvn)\s+\S*(test|build|check|verify)`,
+    String.raw`make\s+(\S+\s+)*(test|check|lint|build|ci)\b`,
+    String.raw`(ctest|rspec|phpunit)\b`,
+    String.raw`(bundle\s+exec\s+)?rake\s+(test|spec)\b`,
+    String.raw`(deno|swift)\s+test\b`,
+    String.raw`node\s+(--test\b|\S*test\S*\.m?[jt]s\b)`,
+    String.raw`bash\s+-n\b`,
+    String.raw`claude\s+plugin\s+(test|validate)\b`,
+    String.raw`\S*node\s+\S*hunch\S*\s+task\s+verify\b`,
+    String.raw`(\S*/)?hunch\s+task\s+verify\b`,
+  ]
+    .map(alt => `^${alt}`)
+    .join('|'),
+)
 
-export function isCheck(command: string): boolean {
-  return CHECK.test(command)
+/**
+ * Whether a Bash line is a check whose exit code speaks for itself: a check heads one of its commands,
+ * no `--help`, and no pipe or `|| ...` that could hide its exit code (unless `set -o pipefail`).
+ */
+export function isCheck(command: string, extra = ''): boolean {
+  const simple = commandsOf(command)
+  let custom: RegExp | undefined
+  try {
+    custom = extra.trim() === '' ? undefined : new RegExp(`^(${extra})`)
+  } catch {
+    custom = undefined
+  }
+  const hasCheck = simple.some(one => !/\s--help\b/.test(one) && (CHECK.test(one) || custom?.test(one) === true))
+  const stripped = command.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ' ')
+  const masks = /\|\|/.test(stripped) || (/(^|[^|])\|([^|]|$)/.test(stripped) && !/pipefail/.test(stripped))
+
+  return hasCheck && !masks
 }
 
-const DOCS = /\.(md|mdx|txt|rst|adoc)$|(^|\/)docs\//i
+/** Bash lines that may change tracked files (not read-only by the tool's own check). */
+const WRITES =
+  /^(sed\s+(-\S*\s+)*-i|perl\s+(-\S*\s+)*-i|tee\b|patch\b|mv\b|cp\b|truncate\b|git\s+(apply|am|checkout\s+(\S+\s+)*--|restore|merge|pull|cherry-pick|rebase|revert|stash\s+(pop|apply))\b)|\s>{1,2}\s*(?!&|\/dev\/null)\S/
+
+/** Whether a Bash line may have edited files the Edit tools never saw. */
+export function mayWrite(command: string): boolean {
+  return commandsOf(command).some(simple => WRITES.test(simple))
+}
+
+const DOCS = /\.(md|mdx|txt|rst|adoc)$|(^|\/)docs\/|(^|\/)(LICENSE|CHANGELOG|AUTHORS|NOTICE)[^/]*$|(^|\/)\.(gitignore|gitattributes|editorconfig)$/i
 
 /** Edits that need a check after them: anything but prose. */
 export function needsCheck(path: string): boolean {
   return !DOCS.test(path)
 }
 
-const RISKY =
-  /(auth|security|secret|token|credential|crypt|password|permission|sandbox|migrat|schema|payment|billing|deploy|install|guard|concurren|mutex|\.github\/workflows\/|Dockerfile|\.sql$|(^|\/)hooks?\.json$|settings(\.local)?\.json$)/i
+const RISKY_WORDS =
+  'auth|security|secrets?|credentials?|crypto|passwords?|permissions?|sandbox|migrations?|schema|payments?|billing|deploy|install|guard|concurrency|mutex|tokens?'
+const RISKY = new RegExp(
+  `(^|[/_.-])(${RISKY_WORDS})([/_.-]|$)|\\.github/workflows/|(^|/)Dockerfile|\\.sql$|(^|/)hooks?\\.json$|(^|/)settings(\\.local)?\\.json$`,
+  'i',
+)
 
-/** Edits that need a critic SHIP before they ship (CLAUDE.md: risky work needs critic review). */
+/** Code edits that need a critic SHIP before they ship (CLAUDE.md: risky work needs critic review). Prose never does. */
 export function isRisky(path: string, extra: string): boolean {
+  if (DOCS.test(path)) return false
   if (RISKY.test(path)) return true
   if (extra.trim() === '') return false
 
@@ -140,7 +220,7 @@ export function outwardBlockers(ledger: GuardLedger): string[] {
 
   if (unchecked.length > 0) {
     const failing = ledger.lastCheck !== null && !ledger.lastCheck.isPassing ? ` (last check failed: ${clip(ledger.lastCheck.command, 60)})` : ''
-    reasons.push(`${unchecked.length} edited file(s) have no passing check after the last edit${failing}: ${list(unchecked)}. Run the covering tests/build first.`)
+    reasons.push(`${unchecked.length} edit(s) have no passing check after them${failing}: ${list(unchecked)}. Run the covering tests/build in the foreground, without a pipe that hides the exit code.`)
   }
   if (ledger.riskyPending.length > 0) {
     const verdict = ledger.critic === null ? 'no critic has reviewed them' : `the last critic verdict was ${ledger.critic.verdict}`
@@ -148,6 +228,16 @@ export function outwardBlockers(ledger: GuardLedger): string[] {
   }
 
   return reasons
+}
+
+/** Adds or refreshes an entry, keeping the newest `cap`. */
+export function touch(entries: readonly Touched[], path: string, at: number, cap = 50): Touched[] {
+  return [...entries.filter(one => one.path !== path), { path, at }].slice(-cap)
+}
+
+/** Drops the entries a check or review that started at `since` covered. */
+export function settle(entries: readonly Touched[], since: number, only?: readonly string[]): Touched[] {
+  return entries.filter(one => one.at > since || (only !== undefined && !only.includes(one.path)))
 }
 
 export type Card = {
@@ -160,7 +250,7 @@ export type Card = {
 }
 
 const FIELDS = ['RESULT', 'EVIDENCE', 'CONFIDENCE', 'UNVERIFIED'] as const
-const HEADER = /^\s*[#>*\-\s]*\b(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)\b\s*:?(.*)$/i
+const HEADER = /^\s*[#>\-\s]*(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)\s*:(.*)$/
 const NOTHING = /^(none|n\/a|nothing|-|—|no(ne)?\.?)$/i
 const BULLET = /^\s*([-*•]|\d+[.)])\s+/
 
@@ -172,7 +262,7 @@ export function parseCard(answer: string): Card {
   for (const raw of answer.split(/\r?\n/)) {
     const header = HEADER.exec(raw.replace(/\*\*/g, ''))
     if (header !== null) {
-      current = (header[1] ?? '').toUpperCase()
+      current = header[1] ?? ''
       const rest = (header[2] ?? '').trim()
       sections.set(current, rest === '' ? [] : [rest])
     } else if (current !== undefined) {
@@ -241,18 +331,14 @@ export function summary(ledger: GuardLedger): string {
   return parts.length === 0 ? '' : `orch: ${parts.join(' · ')}`
 }
 
-export function addUnique(list: readonly string[], item: string, cap = 50): string[] {
-  return [...list.filter(one => one !== item), item].slice(-cap)
-}
-
 export function clip(value: string, max: number): string {
   const flat = value.replace(/\s+/g, ' ').trim()
 
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
 }
 
-function list(paths: readonly string[]): string {
-  const names = paths.slice(-5).map(path => path.split('/').pop() ?? path)
+function list(entries: readonly Touched[]): string {
+  const names = entries.slice(-5).map(one => one.path.split('/').pop() ?? one.path)
 
-  return paths.length > 5 ? `${names.join(', ')} and ${paths.length - 5} more` : names.join(', ')
+  return entries.length > 5 ? `${names.join(', ')} and ${entries.length - 5} more` : names.join(', ')
 }

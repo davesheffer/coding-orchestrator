@@ -8,13 +8,23 @@
       "type": "string",
       "title": "Mode",
       "description": "enforce: refuse calls that break a rule. warn: let them run and remind the model. off: only track.",
-      "options": ["enforce", "warn", "off"],
+      "options": [
+        "enforce",
+        "warn",
+        "off"
+      ],
       "default": "enforce"
     },
     "riskyPattern": {
       "type": "string",
       "title": "Extra risky paths",
       "description": "A regular expression; edited paths it matches also need a critic SHIP before push or publish.",
+      "default": ""
+    },
+    "checkPattern": {
+      "type": "string",
+      "title": "Extra check commands",
+      "description": "A regular expression matched at the head of a command; matching commands also count as checks (for example `just test|\\./scripts/ci`).",
       "default": ""
     }
   }

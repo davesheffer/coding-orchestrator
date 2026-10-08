@@ -1,8 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
+import type { GuardLedger, Touched } from '../types'
 import {
-  addUnique,
   cardReminder,
   clip,
   EMPTY_LEDGER,
@@ -10,12 +10,15 @@ import {
   isOutward,
   isRisky,
   mainOnlyLabel,
+  mayWrite,
   needsCheck,
   outwardBlockers,
   parseCard,
   roleFor,
   routeVerdict,
+  settle,
   summary,
+  touch,
 } from './policy'
 
 const ledger = atom({ plugin: 'orch-guard', key: 'ledger' } as const, EMPTY_LEDGER)
@@ -23,24 +26,32 @@ const spawned = atom({ plugin: 'orch-guard', key: 'spawned' } as const, {})
 
 type Mode = 'enforce' | 'warn' | 'off'
 
-/** Origins that are the person's own gesture: a waiver from anywhere else is refused. */
+/** Origins that are the person's own gesture: a waiver or reset from anywhere else is refused. */
 const PERSON = new Set(['composer', 'bridge', 'sdk'])
 
-async function refresh($: EngineInterface) {
-  const text = summary(await read($, ledger))
+/** The ledger, with entries an earlier version stored as bare paths read as touched at 0. */
+async function current($: EngineInterface): Promise<GuardLedger> {
+  const raw = await read($, ledger)
+  const fix = (list: readonly (Touched | string)[]): Touched[] => list.map(one => (typeof one === 'string' ? { path: one, at: 0 } : one))
+
+  return { ...raw, uncheckedEdits: fix(raw.uncheckedEdits), riskyPending: fix(raw.riskyPending) }
+}
+
+async function change($: EngineInterface, fn: (one: GuardLedger) => GuardLedger) {
+  const next = fn(await current($))
+  await update($, ledger, () => next)
+  const text = summary(next)
   $.ui.status(text === '' ? undefined : text)
 }
 
-/** Appends the reminder the model reads after the tool's result; an error or a deny is left as it is. */
+/** Adds the reminder the model reads after the tool's answer; a deny is left as it is. */
 function remind(result: ToolCallResult, text: string): ToolCallResult {
-  return 'result' in result && result.result !== undefined && result.isError === undefined
-    ? { ...result, context: [...(result.context ?? []), text] }
-    : result
+  return result.deny !== undefined ? result : ({ ...result, context: [...(result.context ?? []), text] } as ToolCallResult)
 }
 
 /** Refuses the call (enforce), or lets it run with a reminder (warn). */
 async function refuse($: EngineInterface, mode: Mode, run: () => Promise<ToolCallResult>, reason: string): Promise<ToolCallResult> {
-  await update($, ledger, one => ({ ...one, blocked: one.blocked + 1 }))
+  await change($, one => ({ ...one, blocked: one.blocked + 1 }))
   if (mode === 'enforce') return { deny: `orch-guard: ${reason}` }
 
   $.ui.toast(`orch-guard ⚠ ${clip(reason, 110)}`, { timeoutMs: 8000 })
@@ -51,13 +62,15 @@ async function refuse($: EngineInterface, mode: Mode, run: () => Promise<ToolCal
 export const register: Register = (on, options) => {
   const mode = (options.mode as Mode | undefined) ?? 'enforce'
   const riskyPattern = typeof options.riskyPattern === 'string' ? options.riskyPattern : ''
+  const checkPattern = typeof options.checkPattern === 'string' ? options.checkPattern : ''
+  let lastToast = ''
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'orch-guard',
-      description: 'orch-guard: show what blocks push/publish (`waive <reason>` lets the next one through, `reset` clears)',
+      description: 'orch-guard: show what blocks push/publish (`waive <reason>` opens the gate until the next edit, `reset` clears)',
     })
-    await refresh($)
+    await change($, one => one)
 
     return next(e)
   })
@@ -65,23 +78,23 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'orch-guard' }, async ($, e) => {
     const [verb = '', ...rest] = e.args.trim().split(/\s+/)
 
+    if ((verb === 'waive' || verb === 'reset') && !PERSON.has(e.origin.kind)) {
+      return { text: `orch-guard: only the person can ${verb} the gate.` }
+    }
     if (verb === 'waive') {
-      if (!PERSON.has(e.origin.kind)) return { text: 'orch-guard: only the person can waive the gate.' }
       const reason = rest.join(' ').trim() || 'waived by the user'
       const at = await $.clock.now()
-      await update($, ledger, one => ({ ...one, waiver: { at, reason } }))
-      await refresh($)
+      await change($, one => ({ ...one, waiver: { at, reason } }))
 
-      return { text: `orch-guard: the push/publish gate is waived until the next edit (${reason}).` }
+      return { text: `orch-guard: the push/publish gate is open until the next edit (${reason}).` }
     }
     if (verb === 'reset') {
-      await update($, ledger, () => EMPTY_LEDGER)
-      await refresh($)
+      await change($, () => EMPTY_LEDGER)
 
       return { text: 'orch-guard: ledger cleared.' }
     }
 
-    const now = await read($, ledger)
+    const now = await current($)
     const blockers = outwardBlockers(now)
     const lines = [
       `orch-guard (${mode}) — ${summary(now) || 'nothing pending'}`,
@@ -89,14 +102,14 @@ export const register: Register = (on, options) => {
       `critic: ${now.critic === null ? 'none this session' : now.critic.verdict}`,
       `calls refused or flagged: ${now.blocked}`,
       blockers.length === 0 ? 'push/publish: clear' : `push/publish blocked:\n- ${blockers.join('\n- ')}`,
-      now.waiver === null ? '' : `waiver active: ${now.waiver.reason}`,
+      now.waiver === null ? '' : `waiver active until the next edit: ${now.waiver.reason}`,
     ]
 
     return { text: lines.filter(Boolean).join('\n') }
   })
 
   if (mode !== 'off') {
-    // Routing: named roles on their models, no inherited Opus, no recursive delegation.
+    // Routing: named roles on their models, no inherited main model, no recursive delegation.
     on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
       if (e.tool !== 'Agent') return next(e)
 
@@ -105,14 +118,14 @@ export const register: Register = (on, options) => {
 
       const result = await next(e)
       const role = roleFor(e.subagent_type, e.model)
-      // A background agent's card arrives at its turn end, not here.
-      if (role === undefined || e.run_in_background !== false || result.text === undefined) return result
+      // A background agent's card arrives at its turn end, not here; a foreground ask can still launch in the background.
+      const status = (result.result as { status?: string } | undefined)?.status
+      if (role === undefined || e.run_in_background !== false || status !== 'completed' || result.text === undefined) return result
 
       const reminder = cardReminder(role, parseCard(result.text))
 
       return reminder === undefined ? result : remind(result, reminder)
     }).catch(($, e, next) => next(e))
-
   }
 
   // One hook for every tool call: the main-session-only and ship-boundary gates, then tracking.
@@ -126,7 +139,7 @@ export const register: Register = (on, options) => {
       }
 
       if (e.agentId === undefined && isOutward(e.tool, command)) {
-        const now = await read($, ledger)
+        const now = await current($)
         const blockers = outwardBlockers(now)
         if (now.waiver !== null) {
           $.ui.toast(`orch-guard: gate waived (${clip(now.waiver.reason, 60)})`)
@@ -136,29 +149,35 @@ export const register: Register = (on, options) => {
       }
     }
 
+    const startedAt = await $.clock.now()
     const result = await next(e)
     if (result.deny !== undefined || next.signal.aborted) return result
 
     const path = e.tool === 'Edit' || e.tool === 'Write' ? e.file_path : e.tool === 'NotebookEdit' ? e.notebook_path : undefined
     if (path !== undefined && result.isError === undefined) {
-      const isCode = needsCheck(path)
-      const isRiskyEdit = isRisky(path, riskyPattern)
-      await update($, ledger, one => ({
+      const at = await $.clock.now()
+      await change($, one => ({
         ...one,
-        uncheckedEdits: isCode ? addUnique(one.uncheckedEdits, path) : one.uncheckedEdits,
-        riskyPending: isRiskyEdit ? addUnique(one.riskyPending, path) : one.riskyPending,
+        uncheckedEdits: needsCheck(path) ? touch(one.uncheckedEdits, path, at) : one.uncheckedEdits,
+        riskyPending: isRisky(path, riskyPattern) ? touch(one.riskyPending, path, at) : one.riskyPending,
         waiver: null,
       }))
-      await refresh($)
-    } else if (command !== undefined && isCheck(command)) {
-      const at = await $.clock.now()
-      const isPassing = result.isError !== true
-      await update($, ledger, one => ({
-        ...one,
-        uncheckedEdits: isPassing ? [] : one.uncheckedEdits,
-        lastCheck: { at, command, isPassing },
-      }))
-      await refresh($)
+    } else if (e.tool === 'Bash' && command !== undefined) {
+      const record = result.result as { backgroundTaskId?: string; interrupted?: boolean } | undefined
+      const isBackground = e.run_in_background === true || record?.backgroundTaskId !== undefined
+
+      if (isCheck(command, checkPattern) && !isBackground && record?.interrupted !== true) {
+        // Only changes made before this check started are covered by it.
+        const isPassing = result.isError !== true
+        await change($, one => ({
+          ...one,
+          uncheckedEdits: isPassing ? settle(one.uncheckedEdits, startedAt) : one.uncheckedEdits,
+          lastCheck: { at: startedAt, command, isPassing },
+        }))
+      } else if (result.isReadOnly !== true && mayWrite(command)) {
+        const at = await $.clock.now()
+        await change($, one => ({ ...one, uncheckedEdits: touch(one.uncheckedEdits, `bash: ${clip(command, 50)}`, at), waiver: null }))
+      }
     }
 
     return result
@@ -169,7 +188,11 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     const agentId = 'agentId' in result ? result.agentId : undefined
     if (agentId !== undefined) {
-      await update($, spawned, map => ({ ...map, [agentId]: { type: e.subagentType, model: e.model ?? ('model' in result ? result.model : undefined), isBackground: e.background } }))
+      const model = e.model ?? ('model' in result ? result.model : undefined)
+      const at = await $.clock.now()
+      // A critic's SHIP covers only what was pending when it started.
+      const reviews = roleFor(e.subagentType, model) === 'critic' ? (await current($)).riskyPending.map(one => one.path) : undefined
+      await update($, spawned, map => ({ ...map, [agentId]: { type: e.subagentType, model, isBackground: e.background, at, reviews } }))
     }
 
     return result
@@ -179,34 +202,35 @@ export const register: Register = (on, options) => {
     const agentId = e.agentId
 
     if (agentId === undefined) {
-      const now = await read($, ledger)
-      const open = outwardBlockers(now)
-      if (open.length > 0 && mode !== 'off') $.ui.toast(`orch-guard: ${summary(now)} — verify before calling it done`, { timeoutMs: 6000 })
+      const now = await current($)
+      const text = outwardBlockers(now).length > 0 && mode !== 'off' ? summary(now) : ''
+      // Once per change of what is pending, not on every chat turn.
+      if (text !== '' && text !== lastToast) $.ui.toast(`orch-guard: ${text} — verify before calling it done`, { timeoutMs: 6000 })
+      lastToast = text
 
       return next(e)
     }
 
     const agent = (await read($, spawned))[agentId]
+    await update($, spawned, map => Object.fromEntries(Object.entries(map).filter(([id]) => id !== agentId)))
     const role = roleFor(agent?.type, agent?.model)
-    if (role === undefined || e.reason !== 'answer') return next(e)
+    if (agent === undefined || role === undefined || e.reason !== 'answer') return next(e)
 
     const card = parseCard(e.answer ?? '')
     if (role === 'critic') {
       const at = await $.clock.now()
-      await update($, ledger, one => ({
+      await change($, one => ({
         ...one,
         critic: { at, verdict: card.verdict },
-        riskyPending: card.verdict === 'SHIP' ? [] : one.riskyPending,
+        riskyPending: card.verdict === 'SHIP' ? settle(one.riskyPending, agent.at, agent.reviews ?? []) : one.riskyPending,
       }))
-      await refresh($)
     }
 
     const reminder = cardReminder(role, card)
-    if (agent?.isBackground === true && reminder !== undefined && mode !== 'off') {
+    if (agent.isBackground && reminder !== undefined && mode !== 'off') {
       await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: reminder }] } }).catch(() => undefined)
     }
 
     return next(e)
   }).catch(($, e, next) => next(e))
 }
-

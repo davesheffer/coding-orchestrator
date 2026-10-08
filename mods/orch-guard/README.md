@@ -6,22 +6,26 @@ A Claude Code mod (a plugin of function hooks) that enforces the orchestrator ru
 
 | Rule in CLAUDE.md | What orch-guard does |
 |---|---|
-| Use the named roles on their models; avoid expensive model inheritance | Refuses an `Agent` call that sends `scout`/`runner`/`builder` on anything but `sonnet`, sends `critic` on anything but `fable`, or starts a built-in agent (`general-purpose`, `Explore`, `Plan`, …) with no `model` |
+| Use the named roles on their models; avoid expensive model inheritance | Refuses an `Agent` call that sends `scout`/`runner`/`builder` on anything but `sonnet`, sends `critic` on anything but `fable`, or starts a built-in agent that inherits the main model (`general-purpose`, `Explore`, `Plan`) with no `model`. Plugin and user agents are left alone, since their definitions may pin a model |
 | A subagent follows its brief without recursive delegation | Refuses `Agent` calls made inside a subagent |
-| Push, publish, deploy, delete and send stay in the main session; networked PR polling stays in the main session | Refuses these inside a subagent: `git push`, `gh pr create/merge/comment`, `gh api`, `npm publish`, `docker push`, `kubectl apply`, `terraform apply`, `rm -rf`, `git reset --hard`, `curl -X POST`, `pr-status` / `gh pr checks`, and MCP write tools |
-| Require checks after the last edit | Refuses an outward ship (`git push`, `gh pr create/merge`, publish, deploy, GitHub MCP writes) while a code file edited by the main loop or by any subagent has no passing check after it. A check is a test, build, lint or type-check command, `task verify`, or `claude plugin test`. Docs (`*.md`, `docs/`) are exempt |
-| Risky work requires critic review before completion | Refuses that same ship while risky files (auth, security, secrets, migrations, schemas, install, guards, workflows, hook and settings JSON, …) have changed since the last critic `RESULT: SHIP` |
+| Push, publish, deploy, delete and send stay in the main session; networked PR polling stays in the main session | Refuses these inside a subagent: `git push` (also `git -C <dir> push`), `gh pr create/merge/comment`, `gh api`, `npm publish`, `docker push`, `kubectl apply/delete`, `terraform apply`, `rm -rf` of `/`, `~`, `..` or `.git`, `curl -X POST` / `-d`, `pr-status` / `gh pr checks`, and MCP write tools. Local clean-ups such as `rm -rf dist` are allowed |
+| Require checks after the last edit | Refuses an outward ship (`git push`, `gh pr create/merge`, publish, deploy, GitHub MCP writes) while a code change has no passing check that started after it. Changes are Edit/Write/NotebookEdit calls from the main loop or any subagent, plus shell writes (`sed -i`, `> file`, `git apply`, …). A check is a test, build, lint or type-check command, `task verify`, or `claude plugin test`, run in the foreground with no pipe or `|| …` that could hide its exit code. Docs (`*.md`, `docs/`, `LICENSE`, `.gitignore`) are exempt |
+| Risky work requires critic review before completion | Refuses that same ship while risky code files (auth, security, secrets, migrations, schemas, install, guards, workflows, hook and settings JSON, …) have changed and no critic has reviewed them. A critic's `RESULT: SHIP` clears only the files that were pending when that critic started |
 | `RESULT / EVIDENCE / CONFIDENCE / UNVERIFIED`; weak cards mean verify or escalate, not retry | After a role agent returns, adds a reminder the model reads: a missing card, medium or low confidence, or UNVERIFIED items mean verify directly or escalate. Builders get "read the diff and confirm checks ran after the last edit". A critic `FIX FIRST` or `RETHINK` gets "resolve each finding" |
 
 A built-in agent sent on `fable` counts as the critic, since CLAUDE.md reserves fable for the critic.
+
+Commands are read one simple command at a time, with quoted text, heredoc bodies and comments removed. So `grep "git push"` or a commit message that mentions a push is never taken for one.
 
 A refused call returns its reason to the model, so the model can fix the problem and try again. The status line shows the ledger, for example `orch: 2 unchecked · critic due (1 risky)`. When a turn ends with something still pending, a toast says so.
 
 ## Commands
 
 - `/orch-guard` shows what is pending and what blocks a push or publish.
-- `/orch-guard waive <reason>` lets the next push or publish through. The waiver ends at the next edit. Only the person can run it: a waiver started by a plugin or a scheduled prompt is refused.
+- `/orch-guard waive <reason>` opens the push/publish gate until the next edit.
 - `/orch-guard reset` clears the ledger.
+
+Only the person can run `waive` or `reset`. The same command from a plugin, a scheduled prompt or another session is refused.
 
 ## Options
 
@@ -29,6 +33,11 @@ Set these in the config menu or under `pluginConfigs.orch-guard` in settings:
 
 - `mode`: `enforce` (default) refuses calls. `warn` lets the call run, shows a toast and leaves the model a reminder. `off` only tracks.
 - `riskyPattern`: an extra regular expression for paths that need critic review, for example `^relay/|jev`.
+- `checkPattern`: an extra regular expression for commands that count as checks, matched at the start of a command, for example `just test|\./scripts/ci`.
+
+## Limits
+
+orch-guard reads tool calls, not intent. A script that pushes or deploys (`./release.sh`, `npm run deploy`) is not recognised. A file changed by a program it cannot see (`python fix.py`) is not tracked. Treat the guard as a seatbelt for the rules in CLAUDE.md, not as a sandbox.
 
 ## Install
 
