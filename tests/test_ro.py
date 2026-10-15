@@ -10,6 +10,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 RO = ROOT / "bin" / "ro.py"
+# Looked up at import: on Windows, shutil.which searches cwd first, and ResolveTests
+# chdirs into a folder of planted git files.
+REAL_GIT = shutil.which("git")
 _SPEC = importlib.util.spec_from_file_location("ro_module", RO)
 ro = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(ro)
@@ -123,9 +126,9 @@ class ResolveTests(unittest.TestCase):
             found = Path(ro.resolve("git"))
         self.assertEqual(found.parent, self.dir / "sub")
 
-    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    @unittest.skipUnless(REAL_GIT, "git not installed")
     def test_real_git_wins_over_planted(self):
-        real = Path(shutil.which("git")).resolve().parent
+        real = Path(REAL_GIT).resolve().parent
         path = os.pathsep.join([str(self.dir), str(real)])
         with mock.patch.dict(os.environ, {"PATH": path}):
             found = Path(ro.resolve("git"))
@@ -133,7 +136,7 @@ class ResolveTests(unittest.TestCase):
         self.assertNotEqual(found.resolve().parent, self.dir.resolve())
 
 
-@unittest.skipUnless(shutil.which("git"), "git not installed")
+@unittest.skipUnless(REAL_GIT, "git not installed")
 class RepoTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
