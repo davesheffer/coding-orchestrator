@@ -110,7 +110,8 @@ class PrStatusTests(unittest.TestCase):
 
 
 class GhLaunchTests(unittest.TestCase):
-    def launch(self, platform, wrapper, pathext=".COM;.EXE;.BAT;.CMD", result=None, error=None):
+    def launch(self, platform, wrapper, pathext=".COM;.EXE;.BAT;.CMD", result=None, error=None,
+               gh_path="C:/tools/gh.exe"):
         calls = []
 
         def run(command, **kwargs):
@@ -123,6 +124,7 @@ class GhLaunchTests(unittest.TestCase):
              patch.object(pr_status.os.path, "expanduser", return_value=wrapper), \
              patch.object(pr_status.os, "access", return_value=True), \
              patch.dict(pr_status.os.environ, {"PATHEXT": pathext}), \
+             patch.object(pr_status, "resolve_executable", return_value=gh_path), \
              patch.object(pr_status.subprocess, "run", side_effect=run):
             output = pr_status.gh("pr", "list", "--json", "number")
         return output, calls
@@ -133,15 +135,18 @@ class GhLaunchTests(unittest.TestCase):
             wrapper_dir = Path(temp) / ".hunch"
             wrapper_dir.mkdir()
             base = str(wrapper_dir / "agent-gh")
+            gh_path = "C:/tools/gh.exe"
             with patch.object(pr_status.sys, "platform", "win32"), \
-                 patch.object(pr_status.os.path, "expanduser", return_value=base):
-                self.assertEqual(pr_status.wrapper_command(), "gh")  # nothing present yet
+                 patch.object(pr_status.os.path, "expanduser", return_value=base), \
+                 patch.object(pr_status, "resolve_executable", return_value=gh_path) as resolve:
+                self.assertEqual(pr_status.wrapper_command(), gh_path)  # nothing present yet
+                resolve.assert_called_with("gh", (".com", ".exe"))
 
                 (wrapper_dir / "agent-gh.cmd").write_bytes(b"")
-                self.assertEqual(pr_status.wrapper_command(), "gh")  # .cmd runs through cmd.exe
+                self.assertEqual(pr_status.wrapper_command(), gh_path)  # .cmd runs through cmd.exe
 
                 (wrapper_dir / "agent-gh").write_bytes(b"")
-                self.assertEqual(pr_status.wrapper_command(), "gh")  # extensionless: no PATHEXT match
+                self.assertEqual(pr_status.wrapper_command(), gh_path)  # extensionless: no PATHEXT match
 
                 exe = wrapper_dir / "agent-gh.exe"
                 exe.write_bytes(b"")
@@ -159,17 +164,78 @@ class GhLaunchTests(unittest.TestCase):
         self.assertEqual(calls[0][0], ["/home/u/.hunch/agent-gh", "pr", "list", "--json", "number"])
         self.assertEqual(calls[0][1]["errors"], "replace")
 
+    def test_posix_falls_back_to_gh_resolved_from_path(self):
+        with patch.object(pr_status.os, "access", return_value=False), \
+             patch.object(pr_status.sys, "platform", "linux"), \
+             patch.object(pr_status, "resolve_executable", return_value="/usr/bin/gh") as resolve:
+            self.assertEqual(pr_status.wrapper_command(), "/usr/bin/gh")
+        resolve.assert_called_once_with("gh", ("",))
+
     def test_launch_errors_exit_with_a_message(self):
         for error in (OSError(193, "not a valid Win32 application"), subprocess.TimeoutExpired("gh", 60)):
             with self.subTest(error=error), self.assertRaises(SystemExit) as caught:
                 self.launch("win32", "C:/home/.hunch/agent-gh", error=error)
-            self.assertTrue(str(caught.exception.code).startswith("pr-status: pr list --json could not run gh"))
+            self.assertTrue(str(caught.exception.code).startswith(
+                "pr-status: pr list --json could not run C:/tools/gh.exe"))
+
+    def test_missing_gh_exits_without_launching(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.launch("win32", "C:/home/.hunch/agent-gh", gh_path=None,
+                        error=AssertionError("must not launch"))
+        self.assertEqual(caught.exception.code, "pr-status: pr list --json could not run gh: "
+                         "not found on PATH (the current directory is never searched)")
 
     def test_failed_command_exits_with_its_stderr(self):
         failed = subprocess.CompletedProcess([], 1, "", "HTTP 401\n")
         with self.assertRaises(SystemExit) as caught:
             self.launch("linux", "/home/u/.hunch/agent-gh", result=failed)
         self.assertEqual(caught.exception.code, "pr-status: pr list --json failed: HTTP 401")
+
+
+class ChecksTests(unittest.TestCase):
+    def test_stale_is_a_finished_failure_not_a_wait(self):
+        verdict, names = pr_status.checks([{"name": "ci", "conclusion": "STALE"},
+                                           {"name": "lint", "conclusion": "SUCCESS"}])
+        self.assertEqual(verdict, "FAIL 1ok/1bad/0wait")
+        self.assertEqual(names, ["FAIL ci"])
+
+
+class ResolveExecutableTests(unittest.TestCase):
+    """Files are planted, never run: the lookup only inspects the file system."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = Path(temp.name)
+        self.cwd = self.dir / "repo"
+        self.bin = self.dir / "bin"
+        for folder in (self.cwd, self.bin, self.cwd / "sub"):
+            folder.mkdir()
+        for name in ("gh", "gh.exe", "gh.com", "gh.cmd"):
+            planted = self.cwd / name
+            planted.write_text("planted")
+            planted.chmod(0o755)
+        old = os.getcwd()
+        os.chdir(self.cwd)
+        self.addCleanup(os.chdir, old)
+
+    def test_planted_cwd_gh_is_never_chosen(self):
+        exts = (".com", ".exe") if os.name == "nt" else ("",)
+        path = os.pathsep.join(["", ".", "sub", str(self.cwd)])
+        with patch.dict(os.environ, {"PATH": path}):
+            self.assertIsNone(pr_status.resolve_executable("gh", exts))
+        real = self.bin / ("gh.exe" if os.name == "nt" else "gh")
+        real.write_text("tool")
+        real.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": os.pathsep.join([".", str(self.cwd), str(self.bin)])}):
+            self.assertEqual(pr_status.resolve_executable("gh", exts), str(real))
+
+    @unittest.skipUnless(os.name == "nt", "cmd.exe wrappers exist only on Windows")
+    def test_windows_gh_ignores_cmd_wrappers_on_path(self):
+        (self.bin / "gh.cmd").write_text("wrapper")
+        with patch.dict(os.environ, {"PATH": str(self.bin)}), \
+             patch.object(pr_status.os.path, "expanduser", return_value=str(self.dir / "none")):
+            self.assertIsNone(pr_status.wrapper_command())
 
 
 if __name__ == "__main__":

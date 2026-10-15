@@ -339,6 +339,14 @@ def create_backup(path: Path, data: bytes) -> Path:
             pass
 
 
+def dump_json(doc) -> bytes:
+    """UTF-8 JSON; a lone surrogate (valid JSON escape) falls back to ASCII escapes."""
+    try:
+        return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        return (json.dumps(doc, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--force", action="store_true")
@@ -410,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     merged_settings = merge_hooks(settings, hook_template, dest / "relay" / "relay.py")
     merged_settings = merge_jev_hook(merged_settings, dest / "bin", args.jev)
     merged_settings.setdefault("model", "claude-opus-5-5")
-    desired[settings_path] = (json.dumps(merged_settings, indent=2) + "\n").encode()
+    desired[settings_path] = dump_json(merged_settings)
     if config_existing is None:
         desired[config_path] = (root / "relay" / "config.json").read_bytes()
     if args.rollover:
@@ -419,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
         tuned = parse_json(config_path, base)
         if tuned.get("rollover") != args.rollover:
             tuned["rollover"] = args.rollover
-            desired[config_path] = (json.dumps(tuned, indent=2) + "\n").encode()
+            desired[config_path] = dump_json(tuned)
     # Jev features are opt-in: --jev turns them on; installing without it turns them off,
     # so a TYPESAFE_API_KEY in the environment alone never sends data. Turning off an
     # enabled config is reported, so a routine upgrade never disables it silently.
@@ -429,10 +437,10 @@ def main(argv: list[str] | None = None) -> int:
     jev_disabled = not args.jev and jev is not None and jev.get("enabled") is True
     if args.jev and (jev is None or jev.get("enabled") is not True):
         tuned["jev"] = {**(jev or {}), "enabled": True}
-        desired[config_path] = (json.dumps(tuned, indent=2) + "\n").encode()
+        desired[config_path] = dump_json(tuned)
     elif not args.jev and jev is not None and jev.get("enabled") is not False:
         tuned["jev"] = {**jev, "enabled": False}
-        desired[config_path] = (json.dumps(tuned, indent=2) + "\n").encode()
+        desired[config_path] = dump_json(tuned)
 
     conflicts = []
     for path, data in managed_sources.items():

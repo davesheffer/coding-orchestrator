@@ -192,3 +192,49 @@ test('a failed switch toasts the helper line', async ($, on) => {
   expect(toasts.at(-1)).toBe('✖ session process 25676 is gone (stale registry file)')
   await pane.unmount()
 })
+
+test('switch falls back to python3 when python is missing, and an empty USERPROFILE to HOME', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { USERPROFILE: '', HOME: 'C:\\Users\\h' })
+  const toasts: string[] = []
+  const runs: (readonly string[])[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: SELF }))
+  on('fs.list', (_$, e) => {
+    if (e.path.replace(/\\/g, '/') !== 'C:/Users/h/.claude/sessions') throw new Error(`ENOENT: ${e.path}`)
+
+    return { value: [{ name: '25676.json', kind: 'file' as const, size: 1, mtimeMs: NOW, isLink: false }] }
+  })
+  on('fs.read', () => ({ value: REGISTRY['25676.json'] ?? '' }))
+  on('process.run', (_$, e) => {
+    runs.push(e.argv)
+    // Windows' Store alias for a missing python: exit 9009.
+    if (e.argv[0] === 'python') {
+      return { value: { exitCode: 9009, stdout: '', stderr: 'Python was not found\n', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+
+    return { value: { exitCode: 0, stdout: 'focused soldi-12\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  await $.command.run(RUN)
+  const pane = await $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'mission-control-sessions',
+    props: { title: 'Sessions', isFocused: false, bodyColumns: 100, placement: 'dock', scroll, view: {} },
+  })
+  await pane.press({ key: `focus-${OTHER}` })
+  expect(runs).toEqual([
+    ['python', 'C:/Users/h/.claude/bin/session-focus.py', '--session', OTHER],
+    ['python3', 'C:/Users/h/.claude/bin/session-focus.py', '--session', OTHER],
+  ])
+  expect(toasts.at(-1)).toBe('🗂 focused soldi-12')
+  await pane.unmount()
+})

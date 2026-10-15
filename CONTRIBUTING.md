@@ -33,7 +33,7 @@ cd coding-orchestrator
 ## Run the checks (same as CI)
 
 ```bash
-python -m compileall -q claude codex relay tests bin/pr-status bin/agent-run.py bin/rollover-open.py
+python -m compileall -q claude codex relay tests bin bin/pr-status
 bash -n install.sh codex/install.sh
 python -m unittest discover -s tests -v
 node vscode/handoff-bridge/test.js
@@ -57,7 +57,7 @@ without touching your setup.
 | `claude/` | Claude Code installer, roles, and hooks |
 | `codex/` | Codex installer and its roles |
 | `relay/` | Hands a long chat off to a fresh session |
-| `bin/` | Small helper commands (PR status, rollover, Jev) |
+| `bin/` | Small helper commands (PR status, rollover, session switch, Jev) |
 | `mods/` | The Mission Control pane for Claude Code |
 | `vscode/` | VS Code extension that opens handoff tabs |
 | `tests/` | Python tests for all of the above |

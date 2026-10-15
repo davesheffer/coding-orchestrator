@@ -48,6 +48,7 @@ timeouts in claude/install.py (10 s for gate, 5 s for the others).
 Nothing here logs diff text, file names, commands, or report text.
 """
 import bisect
+import contextvars
 import errno
 import fnmatch
 import hashlib
@@ -59,6 +60,7 @@ import shlex
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
 try:
@@ -133,14 +135,25 @@ GIT_GLOBAL_OPTS = (r"(?:\s+(?:-C\s+" + _OPT_ARG + r"|-c\s+" + _OPT_ARG + r"|"
 _SEP = r"(?:^|[;&|()\n{`])"
 _LEAD = r"[ \t]*"
 # Env-assignment (e.g. `GIT_EDITOR=true git commit`, `A=1 B=2 git push`), shell keyword
-# (then/do/else) and wrapper (time/exec/command/env/nice/sudo, with their -flags and a
-# numeric flag value such as `nice -n 5`) prefixes before the `git` invocation itself.
+# (if/elif/then/else/while/until/do/`!`) and wrapper (time/exec/command/env/nice/nohup/
+# stdbuf/doas/sudo/xargs, and `timeout` with its duration; with their -flags, a numeric
+# flag value such as `nice -n 5`, or a word value of a one-letter flag such as `sudo -u
+# bob`) prefixes before the `git` invocation itself.
 # Only blanks separate them: a newline ends the statement (and is a _SEP itself), and
 # `\s+` here let each line of `A=b\n` * N re-consume the rest of the run (quadratic).
 # A value may hold backslash escapes (`X=a\ b git push`); an escape pair and a plain
-# char start differently, so the value still has one way to match.
-_ENV_PREFIX = (r"(?:(?:then|do|else|time|exec|command|env|nice|sudo)[ \t]+"
-               r"(?:-[\w-]+(?:[ \t]+\d+)?[ \t]+)*"
+# char start differently, so the value still has one way to match. A word flag value
+# can't be a number (the numeric branch's), start with `-`, or be a prefix keyword or
+# assignment (the next prefix's), so `-u time` has one reading and a run of them can't
+# backtrack exponentially; only a command word (`sudo -u git git push`) reads both ways,
+# and that ends the prefix.
+_PREFIX_WORDS = (r"(?:if|elif|then|do|else|while|until|!|time|exec|command|env|nice|nohup"
+                 r"|stdbuf|doas|sudo|xargs)")
+_PREFIX_FLAGS = (r"(?:-[\w-]+(?:[ \t]+\d[\w.]*)?[ \t]+"
+                 r"|-[A-Za-z][ \t]+(?!(?:" + _PREFIX_WORDS + r"|timeout)[ \t]|[A-Za-z_]\w*=)"
+                 r"""[^\s\d;&|()`'"!-][^\s;&|()`'"]*[ \t]+)*""")
+_ENV_PREFIX = (r"(?:" + _PREFIX_WORDS + r"[ \t]+" + _PREFIX_FLAGS
+               + r"|timeout[ \t]+" + _PREFIX_FLAGS + r"\d[\w.]*[ \t]+"
                r"|[A-Za-z_]\w*=(?:\\.|[^\s;&|()`\\])*[ \t]+)*")
 # `git`, `git.exe`, or a path to either (`/usr/bin/git`, `C:\Git\cmd\git.exe`, `/opt/{x}/git`),
 # in any case (`GIT.EXE`). The leading path segment excludes blanks, shell
@@ -161,8 +174,10 @@ ALL_FLAG_RE = re.compile(r"(?:^|\s)(--all|-[A-Za-z]*a[A-Za-z]*)(?=\s|$)")
 # The same flag right at a position (ALL_FLAG_RE's `^` on a slice starting there).
 _ALL_FLAG_AT_RE = re.compile(r"(?:--all|-[A-Za-z]*a[A-Za-z]*)(?=\s|$)")
 # `cd <dir>` as its own segment (split on &&, ;, ||, or a `(` subshell opener) before
-# the git segment.
-CD_RE = re.compile(r"^\s*(?:(?:then|else|do)[ \t]+)?cd\s+(.+?)\s*$")
+# the git segment; also `pushd`, `chdir` and PowerShell's `Set-Location`/`sl`.
+_CD_VERB = r"(?:cd|pushd|chdir|sl|(?i:set-location))"
+_CD_VERB_ENDS = ("cd", "pushd", "chdir", "sl", "set-location")  # for _may_keep
+CD_RE = re.compile(r"^\s*(?:(?:then|else|do)[ \t]+)?" + _CD_VERB + r"\s+(.+?)\s*$")
 # A heredoc operator (`<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`, `<<\WORD`); the
 # scanner in _strip_heredocs_and_quotes only tries it outside quotes and comments, and
 # never on a here-string (`<<<`). Group 1 captures a leading `-` (the `<<-` form, which
@@ -193,7 +208,7 @@ _GIT_DASH_C_PREFIX_RE = re.compile(
     + r"\s+(?:-[Cc]\s+|" + _LONG_VALUE_OPTS + r"(?:=|\s+))$")
 # `cd`, any options (`cd -- "dir"`, `cd -P "dir"`), then the quoted target. Each
 # option needs a leading `-` after its blanks, so a blank run has one way to split.
-_CD_WORD = r"cd(?:[ \t]+-[\w-]*)*"
+_CD_WORD = _CD_VERB + r"(?:[ \t]+-[\w-]*)*"
 _CD_PREFIX_RE = re.compile(_SEP + _LEAD + r"(?:(?:then|else|do)[ \t]+)?" + _CD_WORD + r"[ \t]+$")
 # A kept quoted `-c` value (or one after any token ending in `-c`, e.g. `--foo-c`) is
 # never read back (only -C, cd, --git-dir and --work-tree values are): it is emitted as
@@ -361,9 +376,11 @@ FAIL_CLOSED_REASON = (
 # quoted span (to the end if unbalanced) stays inside its word without its quotes, and
 # `\`-newline is dropped. A quoted span's content is also read as command text of its
 # own (to _PUSH_QUOTE_DEPTH levels), so `bash -c "git push"` still counts.
+# An ANSI-C `$'...'` span honours backslash escapes (`$'a\'b'`), so it is its own kind.
 _PUSH_LEX_RE = re.compile(
     r"(?P<sep>[\s;&|()\[\],<>]+)|'(?P<sq>[^']*)'?|\"(?P<dq>(?:[^\"\\]|\\.)*)\"?"
-    r"|\\(?P<esc>.?)|(?P<run>[^\s;&|()\[\],<>\"'\\]+)", re.DOTALL)
+    r"|\\(?P<esc>.?)|\$'(?P<ansi>(?:[^'\\]|\\.)*)'?"
+    r"|(?P<run>(?:[^\s;&|()\[\],<>\"'\\$]|\$(?!'))+)", re.DOTALL)
 # What a backslash keeps escaped inside double quotes (its content read as a command).
 _DQ_UNESCAPE_RE = re.compile(r"\\([\\\"$`])")
 # A message's quoted value is prose, not command text, so it isn't re-read: after one of
@@ -382,7 +399,43 @@ _BRACES_RE = re.compile(r"[{}]+")
 _PUSH_DYNAMIC_RE = re.compile(r"[$`@%{}]")
 _PUSH_CLEAN_RE = re.compile(r"[$`\\{}%\"']")
 _PUSH_GIT_WORD_RE = re.compile(r"git(?:\.exe)?")
-_GIT_PUSH_WORD_RE = re.compile(r"git-push(?:\.exe)?")
+# A dashed git command word (`/usr/libexec/git-core/git-push`) and its subcommand.
+_GIT_DASHED_WORD_RE = re.compile(r"git-([\w-]+?)(?:\.exe)?")
+# _commit_signals re-reads only the quoted spans these run (see _executed_span): a shell
+# or `eval` word, and a shell's script flag (`-c`, `-lc`, `-Command`, `/c`).
+_EXEC_WORDS = frozenset(("sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "csh", "tcsh",
+                         "fish", "pwsh", "powershell", "cmd", "eval", "su", "script", "flock"))
+# A shell option whose value is the next word (`bash -o pipefail -c ...`).
+_SHELL_OPT_WORDS = frozenset(("-o", "+o"))
+_EXEC_FLAG_RE = re.compile(r"-[a-z]*c[a-z]*|--?command|/c|/k")
+# Exec words that take a plain argument or two before their script flag (`su user -c`,
+# `flock lock -c`), and how many words before a quoted span _executed_span reads.
+_EXEC_ARG_WORDS = frozenset(("su", "flock", "script"))
+_EXEC_SPAN_WINDOW = 10
+# What _drop_inert_text looks at: escapes and single quotes (skipped whole), a double
+# quote, a comment, a heredoc operator, a newline.
+_INERT_SCAN_RE = re.compile(r"""\\[\s\S]|'[^']*'|"|#|<<|\n""")
+# A shell word on a heredoc's line (`bash <<EOF`, `cat <<EOF | sh`), whose body then runs.
+_SHELL_WORD_RE = re.compile(r"(?<![\w.-])(?:ba|z|da|k)?sh(?:\.exe)?(?![\w.-])|\beval\b"
+                            r"|\bpwsh\b|\bpowershell\b")
+# _commit_signals counts a git word only where a command may start (see _command_words):
+# after these shell keywords and wrappers the next word is still in command position,
+# past their -flags, a flag's value (`sudo -u bob`, `/c`), a number (`timeout 60`) or a
+# `NAME=value`; a `find -exec`-style option starts a command too.
+_WRAPPER_WORDS = frozenset((
+    "if", "elif", "then", "do", "else", "while", "until", "!", "time", "exec", "command",
+    "builtin", "env", "nice", "nohup", "stdbuf", "doas", "sudo", "xargs", "timeout", "watch",
+    "chronic", "ionice", "chrt", "taskset", "setsid", "unshare", "caffeinate", "unbuffer",
+    "strace", "ltrace", "busybox")) | _EXEC_WORDS
+# Wrappers whose first plain argument comes before the command (`flock /tmp/lock git`).
+_WRAPPER_ARG_WORDS = frozenset(("flock",))
+_EXEC_OPTS = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
+_FLAG_WORD_RE = re.compile(r"-.*|/[a-z]", re.DOTALL)
+_NUMBER_WORD_RE = re.compile(r"\d[\w.]*")
+_ASSIGN_WORD_RE = re.compile(r"[a-z_]\w*=.*", re.DOTALL)  # the words are lowercased
+# The subcommands _push_signals and _commit_signals count.
+_PUSH_SUBS = ("push", "send-pack")
+_COMMIT_SUBS = ("commit",)
 _PATH_SEP_RE = re.compile(r"[/\\]")
 # Config that environment variables pass to git (an alias among it may push).
 _GIT_CONFIG_ENV_RE = re.compile(r"git_config_(?:parameters=|count=|key_)")
@@ -397,6 +450,11 @@ UNPARSED_PUSH_REASON = (
     "wrapper (bash -c, eval, git -c alias.*), which the gate cannot review. Rerun it as a "
     "plain `git push …` so the diff is checked. If it does not push, rerun the identical "
     "command once to proceed.")
+UNPARSED_COMMIT_REASON = (
+    "[jev risk gate] This command looks like it commits through quoting, an alias or a "
+    "wrapper (bash -c, eval, git -c alias.*), which the gate cannot review. Rerun it as a "
+    "plain `git commit …` so the diff is checked. If it does not commit, rerun the "
+    "identical command once to proceed.")
 UNJUDGED_PUSH_REASON = (
     "[jev risk gate] Could not work out what this push sends (no upstream or origin default "
     "branch, or git timed out), so it was not reviewed. Set an upstream or review the "
@@ -468,9 +526,11 @@ def session_state_path(session_id, state_dir=STATE_DIR):
 
 def load_session_state(session_id, state_dir=STATE_DIR):
     try:
-        return json.loads(session_state_path(session_id, state_dir).read_text(encoding="utf-8"))
+        state = json.loads(session_state_path(session_id, state_dir).read_text(encoding="utf-8"))
     except Exception:
         return {}
+    # A state file holding other JSON (`[]`, `null`) reads as empty, not as a crash in .get().
+    return state if isinstance(state, dict) else {}
 
 
 def save_session_state(session_id, state, state_dir=STATE_DIR):
@@ -592,19 +652,51 @@ def update_state(path, mutate_fn, deadline=None):
 
 def _quote_end(text, start):
     """Index just past the quoted string opening at `start`, or None if unterminated.
-    Single quotes take no escapes; double quotes honour backslash escapes."""
-    if text[start] == "'":
+    Single quotes take no escapes, except in an ANSI-C `$'...'` string (`$'a\\'b'`);
+    double quotes honour backslash escapes."""
+    if text[start] == "'" and not _ansi_c_quote(text, start):
         end = text.find("'", start + 1)
         return None if end == -1 else end + 1
+    quote = text[start]
     i = start + 1
     while i < len(text):
         if text[i] == "\\":
             i += 2
             continue
-        if text[i] == '"':
+        if text[i] == quote:
             return i + 1
         i += 1
     return None
+
+
+def _ansi_c_quote(text, start):
+    """Whether the `'` at `start` opens an ANSI-C `$'...'` string: the `$`s right before
+    it, less one escaped by an odd backslash run (`\\$'x'`), are odd in number (`$$` is
+    the shell's PID, so `$$'x'` is a plain quote)."""
+    j = start
+    while j > 0 and text[j - 1] == "$":
+        j -= 1
+    dollars = start - j
+    k = j
+    while k > 0 and text[k - 1] == "\\":
+        k -= 1
+    if (j - k) % 2:
+        dollars -= 1
+    return dollars % 2 == 1
+
+
+# A quoted piece of a command word that _strip dequotes (no blank, expansion or glob).
+_SIMPLE_WORD_RE = re.compile(r"[\w./\\:+-]+")
+_WORD_BREAKS = frozenset(" \t\r\n;&|()<>`")
+
+
+def _word_start(text):
+    """Where the word `text` ends in starts (len(text) after a blank or separator);
+    bounded by the tail window _strip passes."""
+    k = len(text)
+    while k and text[k - 1] not in _WORD_BREAKS:
+        k -= 1
+    return k
 
 
 def _strip_heredocs_and_quotes(command, legacy_arith=False):
@@ -654,10 +746,11 @@ _FROM_INDEX = object()
 def _may_keep(tail):
     """False when none of _GIT_DASH_C_PREFIX_RE, _CD_PREFIX_RE and _LOOSE_KEEP_RE can
     match `tail`: each needs its last blank-separated word to hold a `-` (`-C`, `-c`,
-    `x--foo-C`, `--git-dir=`, a cd option) or to end in `cd`. A `$`-anchored search
-    tries every start in the tail, which made them most of a quoted argument's cost."""
+    `x--foo-C`, `--git-dir=`, a cd option) or to end in a cd verb (see _CD_VERB). A
+    `$`-anchored search tries every start in the tail, which made them most of a quoted
+    argument's cost."""
     words = tail.rsplit(None, 1)
-    return bool(words) and ("-" in words[-1] or words[-1].endswith("cd"))
+    return bool(words) and ("-" in words[-1] or words[-1].lower().endswith(_CD_VERB_ENDS))
 
 
 def _case_step(text, i, open_cases):
@@ -751,6 +844,12 @@ def _double_quote_end(text, start, depth=0):
             i = _subst_end(text, i, depth + 1)
             if i is None:
                 return None
+        elif text[i] == "`":
+            # A backtick substitution, whose own quotes don't end this one.
+            m = _BACKTICK_END_RE.match(text, i + 1)
+            if m is None:
+                return None
+            i = m.end()
         elif text[i] == '"':
             return i + 1
         else:
@@ -773,6 +872,16 @@ def _quoted_substitutions(text, depth):
                 raise TooManyTargets
             parts.append("$(" + _strip(text[i + 2:end - 1], depth=depth + 1)[0] + ")")
             i = end
+            continue
+        if text[i] == "`":
+            # `"`git push`"` runs its command just as `"$(git push)"` does.
+            m = _BACKTICK_END_RE.match(text, i + 1)
+            if m is None:
+                raise TooManyTargets
+            if depth >= MAX_SUBST_DEPTH:
+                raise TooManyTargets
+            parts.append("$(" + _strip(text[i + 1:m.end() - 1], depth=depth + 1)[0] + ")")
+            i = m.end()
             continue
         i += 1
     return " ".join(parts)
@@ -906,7 +1015,7 @@ def _strip(command, mode="default", depth=0):
                 emit(command[i:])
                 break
             nested = ""
-            if ch == '"' and "$(" in command[i:end]:
+            if ch == '"' and ("$(" in command[i:end] or "`" in command[i:end]):
                 nested = _quoted_substitutions(command[i + 1:end - 1], depth)
                 if nested:
                     out[seg_slot] += nested + "; "
@@ -921,6 +1030,11 @@ def _strip(command, mode="default", depth=0):
                 # A quoted word the command word goes on after (`'git'x push`) is
                 # dropped instead, as before, which keeps the rest of it visible.
                 emit("git")
+            elif (_SIMPLE_WORD_RE.fullmatch(command, i + 1, end - 1)
+                  and _COMMAND_POS_RE.search(tail[:_word_start(tail)])):
+                # A plain quoted piece of the command word (`'g'it`, `gi"t"`) is
+                # dequoted as the shell does, so the word still reads `git`.
+                emit(command[i + 1:end - 1])
             i = end
             continue
         if command.startswith("$(", i) and _may_keep(tail) and _GIT_DASH_C_PREFIX_RE.search(tail):
@@ -1543,6 +1657,24 @@ def _usable_path(path):
     return _native_path(path)
 
 
+# Set by _scan_targets while it scans a PowerShell command: there a backslash is a path
+# separator, not an escape, so `cd .\pkg` must not become `.pkg` (see _shell_split).
+_POWERSHELL = contextvars.ContextVar("jev_guard_powershell", default=False)
+
+
+def _shell_split(text):
+    """shlex.split, except for a PowerShell command (see _POWERSHELL): split in non-POSIX
+    mode, which keeps backslashes, and drop a word's enclosing quotes. Raises ValueError
+    on an unbalanced quote, as shlex.split does."""
+    if not _POWERSHELL.get():
+        return shlex.split(text)
+    lexer = shlex.shlex(text, posix=False)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"" else t
+            for t in lexer]
+
+
 def _global_opts(opts_segment):
     """(-C dir, --git-dir, --work-tree) from the matched global-options segment, each
     None when absent or unusable (see _usable_path). Several -C accumulate as in git
@@ -1551,7 +1683,7 @@ def _global_opts(opts_segment):
     try:
         # Without quotes or escapes shlex splits on its blanks (` \t\r\n`) too, only far
         # slower.
-        tokens = (shlex.split(opts_segment) if any(q in opts_segment for q in "'\"\\")
+        tokens = (_shell_split(opts_segment) if any(q in opts_segment for q in "'\"\\")
                   else [t for t in re.split(r"[ \t\r\n]+", opts_segment) if t])
     except ValueError:
         tokens = opts_segment.split()
@@ -1833,7 +1965,7 @@ def _cd_target(segment):
     if re.fullmatch(r"[A-Za-z0-9_./~:][A-Za-z0-9_./~:-]*", argument):
         return _usable_path(argument)
     try:
-        tokens = shlex.split(m.group(1))
+        tokens = _shell_split(m.group(1))
     except ValueError:
         tokens = m.group(1).split()
     # Drop options (-P, --) and redirections (2>/dev/null) around the directory.
@@ -1923,10 +2055,20 @@ def _all_args(command, matches):
     return flags
 
 
-def _scan_targets(raw_command, base_cwd, max_targets=None):
+def _scan_targets(raw_command, base_cwd, max_targets=None, powershell=False):
     """The distinct (op, cwd, all_flag, git_opts) targets of every git commit/push in the
     command; more than `max_targets` (if given) raise TooManyTargets. The cd index and first `git add` are computed once, so a command with
-    thousands of git invocations still resolves each one in (near) constant time."""
+    thousands of git invocations still resolves each one in (near) constant time.
+    `powershell` keeps backslashes in cd and -C paths (see _shell_split)."""
+    token = _POWERSHELL.set(bool(powershell))
+    try:
+        return _scan_command_targets(raw_command, base_cwd, max_targets)
+    finally:
+        _POWERSHELL.reset(token)
+
+
+def _scan_command_targets(raw_command, base_cwd, max_targets):
+    """_scan_targets' body, with _POWERSHELL set."""
     # The joins are right outside comments, quotes and quoted heredoc bodies only (a
     # `\`-newline ends a comment, and joining it would hide the next line), so a
     # command they change is scanned both joined and as given.
@@ -2017,10 +2159,61 @@ def _scan_targets(raw_command, base_cwd, max_targets=None):
     return targets
 
 
-def _push_words(text):
-    """The words of `text` (see _PUSH_LEX_RE) and the content of its quoted spans, except
-    a message (`git commit -m "explain git push"`) with no substitution in it."""
-    words, spans, parts = [], [], []
+def _executed_span(words, parts, cmd_start):
+    """Whether a quoted span right after `words` (and the word `parts` being built) is
+    run as a command: an `eval` argument, or a shell's `-c` (`bash -lc`, `sh -c -m`,
+    `pwsh -Command`, `cmd /c`) script, within the current command. Only the last few
+    words are looked at (constant time per span)."""
+    tail = words[max(cmd_start, len(words) - _EXEC_SPAN_WINDOW):]
+    # A long word, or one of many quoted pieces (`'x''x'...`), is a plain word: reading
+    # it whole for every span would be quadratic.
+    word = "".join(parts) if len(parts) <= 4 else "x"
+    tail = [w.lower() if len(w) <= 256 else "x"
+            for w in tail + ([word] if parts else [])]
+    flag, plain = False, 0
+    k = len(tail)
+    while k:
+        k -= 1
+        word = tail[k]
+        base = _PATH_SEP_RE.split(word)[-1]
+        base = base[:-4] if base.endswith(".exe") else base
+        if base in _EXEC_WORDS:
+            return base == "eval" or flag and (not plain or base in _EXEC_ARG_WORDS)
+        if k and tail[k - 1] in _SHELL_OPT_WORDS:
+            k -= 1  # `-o pipefail`: an option's value
+            continue
+        if not word.startswith(("-", "/")):
+            # `su user -c`, `flock -w 10 lock -c`: a plain word or two before the flag
+            plain += 1
+            if plain > 2:
+                return False
+            continue
+        flag = flag or bool(_EXEC_FLAG_RE.fullmatch(word))
+    return False
+
+
+def _ansi_decode(content):
+    """An ANSI-C `$'...'` span's text with its escapes decoded (`git pu\\x73h`), read as
+    a command; an escape Python doesn't know (`\\e`, `\\cX`) leaves it as written."""
+    if "\\" not in content:
+        return content
+    try:
+        # `\e` is bash's, not Python's: no DeprecationWarning on the hook's stderr.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return content.encode("latin-1", "backslashreplace").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return content
+
+
+def _push_words(text, executed_only=False):
+    """The words of `text` (see _PUSH_LEX_RE), the content of its quoted spans, except
+    a message (`git commit -m "explain git push"`) with no substitution in it, and the
+    indexes of the words that start a command (the first, and each after a `;`, `&`,
+    `|`, parenthesis or newline). With `executed_only`, only the spans a shell or
+    `eval` runs (see _executed_span)."""
+    words, spans, parts, starts = [], [], [], {0}
+    cmd_start = 0
     message_cmd = False  # in a `git commit`/`tag`/... command, up to its end
     for m in _PUSH_LEX_RE.finditer(text):
         kind = m.lastgroup
@@ -2031,7 +2224,9 @@ def _push_words(text):
                 if not _BRACES_RE.fullmatch(word):
                     words.append(word)
                     message_cmd = message_cmd or word.lower() in _MESSAGE_CMDS
-            if message_cmd and _COMMAND_END_RE.search(m.group(0)):
+            if _COMMAND_END_RE.search(m.group(0)):
+                starts.add(len(words))
+                cmd_start = len(words)
                 message_cmd = False
         elif kind == "esc":
             if m.group("esc") != "\n":  # `\`-newline joins lines
@@ -2043,23 +2238,27 @@ def _push_words(text):
             message = message_cmd and (
                 _MESSAGE_OPT_RE.fullmatch(parts[0].lower()) if len(parts) == 1
                 else not parts and words and _MESSAGE_OPT_RE.fullmatch(words[-1].lower())
-            ) and (kind == "sq" or not _DQ_SUBST_RE.search(content))
-            parts.append(content)
-            if not content or kind == "run" or message:
+            ) and (kind != "dq" or not _DQ_SUBST_RE.search(content))
+            skip = (message or kind == "run"
+                    or executed_only and not _executed_span(words, parts, cmd_start))
+            # `$'co\x6dmit'` spells its word with escapes: dynamic, like `$c`.
+            parts.append("$" + content if kind == "ansi" and "\\" in content else content)
+            if not content or skip:
                 continue
-            spans.append(content if kind == "sq" else _DQ_UNESCAPE_RE.sub(r"\1", content))
+            spans.append(_DQ_UNESCAPE_RE.sub(r"\1", content) if kind == "dq"
+                         else _ansi_decode(content) if kind == "ansi" else content)
     if parts:
         word = "".join(parts)
         if not _BRACES_RE.fullmatch(word):
             words.append(word)
-    return words, spans
+    return words, spans, starts
 
 
-def _git_walk(clean, dyn, i, dyn_sub=True):
-    """(push hits, last word index consumed) for the `git` word at index i: its first
-    subcommand after global options is push or send-pack, dynamic (if `dyn_sub`),
-    `subtree push`, or `config [set|add] alias.<x> <value>` with a value holding push or
-    send-pack or starting with `!`."""
+def _git_walk(clean, dyn, i, dyn_sub=True, subs=_PUSH_SUBS):
+    """(hits, last word index consumed) for the `git` word at index i: its first
+    subcommand after global options is one of `subs` (push or send-pack by default),
+    dynamic (if `dyn_sub`), `subtree push`, or `config [set|add] alias.<x> <value>` with
+    a value holding one of `subs` or starting with `!`."""
     n = len(clean)
     end = min(n, i + 1 + _GIT_SUBCOMMAND_WINDOW)
     skip, sub = False, None
@@ -2073,11 +2272,11 @@ def _git_walk(clean, dyn, i, dyn_sub=True):
         elif sub == "config":
             if word.startswith("alias.") and j + 1 < n:
                 value = clean[j + 1]
-                return int("push" in value or "send-pack" in value or value.startswith("!")
+                return int(any(s in value for s in subs) or value.startswith("!")
                            or dyn[j + 1]), j + 1
             if word not in ("set", "add"):
                 return 0, j
-        elif dyn[j] and dyn_sub or word in ("push", "send-pack"):
+        elif dyn[j] and dyn_sub or word in subs:
             return 1, j  # a dynamic word may be push at run time
         elif not word:
             continue  # e.g. `''`
@@ -2090,21 +2289,135 @@ def _git_walk(clean, dyn, i, dyn_sub=True):
     return int(end < n), end - 1  # options past the window: subcommand unknown
 
 
+def _after_xargs(clean, starts, i):
+    """Whether the word at index i is the command an `xargs` a few words before it in
+    the same command runs (`xargs git`, `xargs -n1 git`)."""
+    for k in range(i - 1, max(-1, i - 5), -1):
+        if _PATH_SEP_RE.split(clean[k])[-1] in ("xargs", "xargs.exe"):
+            return True
+        if k in starts:
+            break
+    return False
+
+
+def _command_words(tokens, clean, starts):
+    """Which of `tokens` (`clean` their cleaned forms) may be a command word: the first
+    of each command (`starts`, see _push_words), each after a prefix (see
+    _WRAPPER_WORDS) or a `find -exec`, and any word with a backtick in it (a
+    substitution may start there). Not an argument (`echo git commit`). One pass."""
+    out = []
+    lead = wrapped = after_flag = takes_arg = False
+    for i, word in enumerate(clean):
+        if i in starts:
+            lead, wrapped, after_flag, takes_arg = True, False, False, False
+        out.append(lead or "`" in tokens[i])
+        if word in _EXEC_OPTS:
+            lead, wrapped, after_flag, takes_arg = True, False, False, False
+            continue
+        if not lead:
+            continue
+        base = _PATH_SEP_RE.split(word)[-1]
+        base = base[:-4] if base.endswith(".exe") else base
+        flag = wrapped and bool(_FLAG_WORD_RE.fullmatch(word))
+        if base in _WRAPPER_WORDS:
+            wrapped = True
+            takes_arg = base in _WRAPPER_ARG_WORDS
+        elif not (flag or _ASSIGN_WORD_RE.fullmatch(word)
+                  or wrapped and (after_flag or _NUMBER_WORD_RE.fullmatch(word))):
+            if takes_arg:
+                takes_arg = False  # `flock /tmp/lock`: the lock file
+            else:
+                lead = False  # the command word itself: what follows are its arguments
+        after_flag = flag
+    return out
+
+
 def _push_signals(command, depth=0):
-    """How many pushes `command` may hold, parsed or not (see _PUSH_LEX_RE). Coarse on
-    purpose: an extra one only costs one denial an identical retry overrides. Every
-    word is looked at a bounded number of times (linear time)."""
-    tokens, spans = _push_words(command)
+    """How many pushes `command` may hold, parsed or not (see _git_signals)."""
+    return _git_signals(command, _PUSH_SUBS, depth)
+
+
+def _commit_signals(command):
+    """How many commits `command` may hold, parsed or not (see _git_signals). Narrower
+    than _push_signals, since commit text is common in prose: heredoc bodies and
+    comments (see _drop_inert_text), quoted text no shell or `eval` runs (`echo "git
+    commit"`, a commit message) and a git word that is only an argument (`echo git
+    commit`, see _command_words) are not read."""
+    return _git_signals(_drop_inert_text(command), _COMMIT_SUBS, executed_only=True,
+                        command_only=True)
+
+
+def _drop_inert_text(command):
+    """`command` without its comments and the bodies of heredocs whose line names no
+    shell (`cat <<EOF`, not `bash <<EOF`); a heredoc with no terminator line is kept
+    (it may be a shift). Quotes are skipped whole, so a `#` or `<<` in them is text.
+    Linear: each body line is read once."""
+    out, pos, scanned, pending = [], 0, 0, []
+    n = len(command)
+    for m in _INERT_SCAN_RE.finditer(command):
+        start = m.start()
+        if start < scanned:
+            continue
+        token = m.group(0)
+        if token == '"':
+            scanned = _double_quote_end(command, start) or n
+        elif token == "#":
+            if start == 0 or command[start - 1] in " \t\n;&|()":
+                end = command.find("\n", start)
+                out.append(command[pos:start])
+                pos = scanned = n if end < 0 else end
+        elif token == "<<":
+            heredoc = HEREDOC_RE.match(command, start)
+            if heredoc and command[start - 1:start] != "<" and command[start + 2:start + 3] != "<":
+                line_start = command.rfind("\n", 0, start) + 1
+                line_end = command.find("\n", start)
+                line = command[line_start:n if line_end < 0 else line_end]
+                pending.append((heredoc.group(2) or heredoc.group(3) or heredoc.group(4),
+                                bool(heredoc.group(1)), bool(_SHELL_WORD_RE.search(line))))
+                scanned = heredoc.end()
+        elif token == "\n" and pending:
+            i = m.end()
+            for word, dash, keep in pending:
+                body, end = i, None
+                while i < n:
+                    stop = command.find("\n", i)
+                    stop = n if stop < 0 else stop
+                    line = command[i:stop].rstrip("\r")
+                    if (line.lstrip("\t") if dash else line) == word:
+                        end = stop
+                        break
+                    i = stop + 1
+                if end is None:
+                    i = body  # no terminator: not a heredoc, so its text is kept
+                    continue
+                if not keep:
+                    out.append(command[pos:body])
+                    pos = end
+                i = end
+            pending = []
+            scanned = i
+    out.append(command[pos:])
+    return "".join(out)
+
+
+def _git_signals(command, subs, depth=0, executed_only=False, command_only=False):
+    """How many git invocations of one of `subs` `command` may hold, parsed or not (see
+    _PUSH_LEX_RE). Coarse on purpose: an extra one only costs one denial an identical
+    retry overrides. With `command_only`, a git word must be in command position (see
+    _command_words). Every word is looked at a bounded number of times (linear time)."""
+    tokens, spans, starts = _push_words(command, executed_only)
     dyn = [bool(_PUSH_DYNAMIC_RE.search(t)) for t in tokens]
     clean = [_PUSH_CLEAN_RE.sub("", t).lower() for t in tokens]
-    has_alias = "alias" in command.lower()
+    at_command = _command_words(tokens, clean, starts) if command_only else None
+    lowered = command.lower()
+    has_alias, has_xargs = "alias" in lowered, "xargs" in lowered
     hits, env_hit, done = 0, False, -1
     for i, token in enumerate(tokens):
         word = clean[i]
         # `git -c alias.p=push p`, a shell alias (`alias.p=!git push`) or one set at
         # run time (`alias.p=$cmd`).
         if word.startswith("alias."):
-            hits += ("push" in word or "send-pack" in word
+            hits += (any(s in word for s in subs)
                      or word.partition("=")[2].startswith("!")
                      or bool(_PUSH_DYNAMIC_RE.search(token.partition("=")[2])))
             continue
@@ -2113,31 +2426,38 @@ def _push_signals(command, depth=0):
             continue
         if i <= done:
             continue  # an option or the subcommand of the git word before
+        if at_command is not None and not at_command[i]:
+            continue
         # The segment keeps `\` as a separator (`C:\Git\cmd\git.exe`).
         seg = _PATH_SEP_RE.split(token.replace("\\", "/").lower())[-1]
         seg = _PUSH_CLEAN_RE.sub("", seg)
-        if _GIT_PUSH_WORD_RE.fullmatch(seg):
-            hits += bool(_PATH_SEP_RE.search(token))  # not `man git-push`
+        dashed = _GIT_DASHED_WORD_RE.fullmatch(seg)
+        if dashed:
+            # not `man git-push`
+            hits += dashed.group(1) in subs and bool(_PATH_SEP_RE.search(token))
         elif (_PUSH_GIT_WORD_RE.fullmatch(seg) or _PUSH_GIT_WORD_RE.fullmatch(word)
               or dyn[i] and word.endswith("git")):
             # A dynamic path (`cp -r $SRC/git $DST`) may be an argument: a dynamic word
             # after it isn't taken for a subcommand.
             found, done = _git_walk(clean, dyn, i,
-                                    not (dyn[i] and _PATH_SEP_RE.search(token)))
-            hits += found
+                                    not (dyn[i] and _PATH_SEP_RE.search(token)), subs)
+            # `echo push | xargs git`: with no subcommand in its own command, xargs
+            # supplies it from its input.
+            hits += found or (has_xargs and _after_xargs(clean, starts, i)
+                              and (done + 1 >= len(tokens) or done + 1 in starts))
         elif not dyn[i] or i + 1 == len(tokens):
             continue
-        elif clean[i + 1] == "push":
+        elif clean[i + 1] in subs:
             hits, done = hits + 1, i + 1  # `g=git; $g push`
         elif not word.startswith("-") and clean[i + 1].startswith("-"):
             # A dynamic command word with options (`$g -C . push`, `"$GIT_BIN" -c k=v
             # push`) is walked like git, but a dynamic word after it (`$EDITOR -n $f`)
             # isn't taken for a subcommand.
-            found, done = _git_walk(clean, dyn, i, False)
+            found, done = _git_walk(clean, dyn, i, False, subs)
             hits += found
     # Every quoted span's content at once, one per line (linear in their total length).
     if spans and depth < _PUSH_QUOTE_DEPTH:
-        hits += _push_signals("\n".join(spans), depth + 1)
+        hits += _git_signals("\n".join(spans), subs, depth + 1, command_only=command_only)
     return hits
 
 
@@ -2175,7 +2495,8 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         return None
     base_cwd = _native_path(payload.get("cwd") or os.getcwd())
     try:
-        targets = _scan_targets(raw_command, base_cwd, MAX_TARGETS)
+        targets = _scan_targets(raw_command, base_cwd, MAX_TARGETS,
+                                payload.get("tool_name") == "PowerShell")
     except TooManyTargets:
         # Too many to diff within the budget, and ignoring some would skip their review.
         if log_fn:
@@ -2190,7 +2511,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
                 "branching, or substitution depth). Split it into smaller commands."),
         }}
 
-    def deny_once(key, reason_code, reason):
+    def deny_once(key, reason_code, reason, op="push"):
         """Deny the command once for a check that needs no classifier; the identical
         retry (same `key`, cwd and raw command, among the session's last 20 denials) is
         logged as an override and returns None so the normal flow continues. The cwd
@@ -2198,7 +2519,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         session_id = payload.get("session_id")
         retry_hash = hashlib.sha256(
             f"{key}\0{base_cwd}\0{raw_command}".encode("utf-8", "replace")).hexdigest()
-        entry = {"ts": timestamp(), "feature": "risk_gate", "op": "push", "reason": reason_code}
+        entry = {"ts": timestamp(), "feature": "risk_gate", "op": op, "reason": reason_code}
         if retry_hash in (load_session_state(session_id, state_dir).get("denied") or []):
             if log_fn:
                 log_fn({**entry, "decision": "override"})
@@ -2238,6 +2559,20 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         denial = deny_once("unparsed-push", "unparsed_push", UNPARSED_PUSH_REASON)
         if denial is not None:
             return denial
+    else:
+        # The same backstop for a commit the scanner didn't parse. Only when the push
+        # one didn't fire: it counts the same wrappers, aliases and dynamic subcommands,
+        # so one command costs at most one such denial.
+        signals = _commit_signals(raw_command)
+        parsed = sum(t[0] == "commit" for t in targets)
+        if signals > parsed:
+            parsed = max(parsed, sum(m.group(2) == "commit"
+                                     for m in GIT_COMMAND_RE.finditer(_strip(raw_command)[0])))
+        if signals > parsed:
+            denial = deny_once("unparsed-commit", "unparsed_commit", UNPARSED_COMMIT_REASON,
+                               "commit")
+            if denial is not None:
+                return denial
     if not targets:
         return None
     op = "push" if any(t[0] == "push" for t in targets) else "commit"
@@ -2426,8 +2761,9 @@ def _extract_report_text(tool_response):
     if isinstance(tool_response, dict):
         content = tool_response.get("content")
         if isinstance(content, list):
-            return "".join(item.get("text", "") for item in content
-                            if isinstance(item, dict) and item.get("type") == "text")
+            return "".join(item["text"] for item in content
+                           if isinstance(item, dict) and item.get("type") == "text"
+                           and isinstance(item.get("text"), str))
         for key in ("result", "text"):
             value = tool_response.get(key)
             if isinstance(value, str):

@@ -37,7 +37,7 @@ git clone https://github.com/davesheffer/coding-orchestrator.git
 cd coding-orchestrator
 ```
 
-**Claude Code** (needs Python 3.10+):
+**Claude Code** (needs Python 3.11+):
 
 ```sh
 ./install.sh --dry-run   # see what would change
@@ -52,6 +52,8 @@ On Windows: `python claude/install.py`.
 ./codex/install.sh --dry-run
 ./codex/install.sh
 ```
+
+On Windows: `python codex/install.py`.
 
 Then start a new session. That's it. 🎉
 

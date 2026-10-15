@@ -211,6 +211,35 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertIn("printf private", stop_commands)
         self.assertEqual(json.loads(self.home.joinpath("relay/config.json").read_text(encoding="utf-8")), config)
 
+    def test_non_ascii_settings_and_relay_config_round_trip_as_utf8(self):
+        self.home.joinpath("relay").mkdir(parents=True)
+        value = "שלום \U0001f600"
+        self.home.joinpath("settings.json").write_text(
+            json.dumps({"theme": value}, ensure_ascii=False), encoding="utf-8")
+        self.home.joinpath("relay/config.json").write_text(
+            json.dumps({"note": value, "jev": {"enabled": True}}, ensure_ascii=False), encoding="utf-8")
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, key in (("settings.json", "theme"), ("relay/config.json", "note")):
+            with self.subTest(name=name):
+                data = self.home.joinpath(name).read_bytes()
+                self.assertIn(value.encode("utf-8"), data)
+                self.assertNotIn(b"\\u05e9", data)
+                self.assertEqual(json.loads(data.decode("utf-8"))[key], value)
+        before = self.snapshot()
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_lone_surrogate_escape_in_user_json_does_not_crash_install(self):
+        self.home.joinpath("relay").mkdir(parents=True)
+        self.home.joinpath("settings.json").write_text('{"theme": "\\ud83d"}', encoding="utf-8")
+        self.home.joinpath("relay/config.json").write_text('{"note": "\\ud83d"}', encoding="utf-8")
+        result = self.run_install("--jev", "--rollover", "copy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, key in (("settings.json", "theme"), ("relay/config.json", "note")):
+            with self.subTest(name=name):
+                self.assertEqual(json.loads(self.home.joinpath(name).read_bytes())[key], "\ud83d")
+
     def test_installed_instructions_substitute_platform_interpreter(self):
         # A placeholder token inside the install path must survive substitution literally.
         self.home = self.home / "__PR_STATUS__ __PYTHON__ __RELAY__"

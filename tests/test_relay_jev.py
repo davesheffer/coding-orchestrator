@@ -146,6 +146,26 @@ class RelayJevTests(unittest.TestCase):
         self.assertEqual(self.read_state("s1")["recent_prompts"], ["small prompt"])
         self.assertEqual(self.log_entries(), [])
 
+    def test_system_blocks_are_stripped_from_recorded_and_classified_prompts(self):
+        seen = []
+        relay_module.JEV_CLASSIFY = lambda body, key: seen.append(body) or noul_response("continues", 0.9)
+        self.seed_state("s1", recent_prompts=["do task A"])
+        self.run_prompt("<browser_instruction>\nuse the browser\n</browser_instruction>\nfix the bug",
+                        session_id="s1", transcript_tokens=40000)
+        self.assertEqual(self.read_state("s1")["recent_prompts"], ["do task A", "fix the bug"])
+        self.assertIn("fix the bug", json.dumps(seen))
+        self.assertNotIn("browser_instruction", json.dumps(seen))
+
+    def test_system_only_prompts_are_not_recorded_or_classified(self):
+        calls = []
+        relay_module.JEV_CLASSIFY = lambda body, key: calls.append(1) or noul_response("continues", 0.1)
+        self.seed_state("s1", recent_prompts=["do task A"])
+        for prompt in ("<task-notification>\nagent done\n</task-notification>",
+                       '<agent-message from="x">\nhand-back\n</agent-message>\n'):
+            self.run_prompt(prompt, session_id="s1", transcript_tokens=40000)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.read_state("s1")["recent_prompts"], ["do task A"])
+
     def test_red_zone_skips_jev_and_leaves_output_unchanged(self):
         calls = []
         relay_module.JEV_CLASSIFY = lambda body, key: calls.append(1) or noul_response("continues", 0.1)

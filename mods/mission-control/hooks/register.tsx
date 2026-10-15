@@ -27,6 +27,7 @@ import {
   hunchName,
   hunchOutcome,
   isRole,
+  isToastSeverity,
   jevStatus,
   kTokens,
   localDay,
@@ -118,7 +119,8 @@ let logSize = -1
 let alertCursor = -1
 
 async function loadRelay($: EngineInterface) {
-  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
+  // An empty variable counts as unset.
+  const home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
   homeDir = home.replace(/\\/g, '/')
   relayDir = `${homeDir}/.claude/relay`
 
@@ -152,6 +154,11 @@ async function pollJev($: EngineInterface) {
   const path = `${relayDir}/jev-log.jsonl`
   const stat = await $.fs.stat(path).catch(() => undefined)
 
+  // Rotated away or truncated: the next file's lines are all new, so alert on them from its start.
+  if (stat === undefined || stat.size < logSize) {
+    logSize = -1
+    if (alertCursor >= 0) alertCursor = 0
+  }
   if (stat === undefined) {
     await update($, jev, () => ({ isOnline: null, spendToday: 0, deniesToday: 0, weakToday: 0, recent: [], note: 'no jev-log.jsonl' }))
     return
@@ -283,7 +290,7 @@ async function finishHunchCall($: EngineInterface, id: string, result: ToolCallR
   // 5: a task id in an output only moves the current task when the main loop started it.
   const isMainStart = call.role === 'main' && call.name === 'task' && call.target.startsWith('start')
   await update($, hunch, current => {
-    fresh = outcome.constraints.filter(one => one.severity !== 'advisory' && !current.seenConstraints.includes(one.id))
+    fresh = outcome.constraints.filter(one => isToastSeverity(one.severity) && !current.seenConstraints.includes(one.id))
 
     return {
       ...current,
@@ -420,15 +427,35 @@ async function pollSessions($: EngineInterface) {
   if (checkedAt !== (await read($, sessionsCheckedAt))) await update($, sessionsCheckedAt, () => checkedAt)
 }
 
+// `python` first, then `python3` where only that is installed, then `py`, the Windows launcher.
+const PYTHONS = ['python', 'python3', 'py']
+
+/** Runs a Python script with the first interpreter that starts; 9009 is Windows' "not found" (the Store alias). */
+async function runPython($: EngineInterface, args: string[], timeoutMs: number) {
+  let failure: unknown
+  let notFound: Awaited<ReturnType<EngineInterface['process']['run']>> | undefined
+  for (const python of PYTHONS) {
+    try {
+      const run = await $.process.run([python, ...args], { timeoutMs })
+      if (run.exitCode !== 9009) return run
+      notFound ??= run
+    } catch (error) {
+      // Only a missing interpreter moves on: a timeout or abort means the script itself ran.
+      if (!/failed to start|ENOENT/i.test(error instanceof Error ? error.message : String(error))) throw error
+      failure ??= error
+    }
+  }
+  if (notFound !== undefined) return notFound
+  throw failure
+}
+
 /** Asks the handoff bridge in the session's own VS Code window to bring its tab forward. */
 async function focusSession($: EngineInterface, row: SessionRow) {
   $.ui.toast(`Switching to ${row.name}…`, { timeoutMs: 3000 })
   let message: string
   try {
     const helper = `${homeDir}/.claude/bin/session-focus.py`
-    const { exitCode, stdout, stderr } = await $.process.run(['python', helper, '--session', row.sessionId], {
-      timeoutMs: 20_000,
-    })
+    const { exitCode, stdout, stderr } = await runPython($, [helper, '--session', row.sessionId], 20_000)
     const last = (text: string) => text.trim().split(/\r?\n/).at(-1) ?? ''
     const line = last(stdout) || last(stderr) || `session-focus exited ${exitCode}`
     message = exitCode === 0 ? `🗂 ${line}` : `✖ ${line}`
@@ -643,7 +670,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('tool.call', { tool: /^mcp__hunch__/ }, async ($, e, next) => {
+  on('tool.call', { tool: /^mcp__(?:plugin_hunch_)?hunch__/ }, async ($, e, next) => {
     const name = hunchName(e.tool)
     if (name === undefined) return next(e)
 

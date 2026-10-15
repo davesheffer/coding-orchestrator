@@ -13,6 +13,7 @@ import sys
 import time
 
 CLAIMED_GRACE = 3.0  # extra seconds for an ack once the bridge has claimed the request
+OPEN_TIMEOUT = 15  # seconds before a hung `code --open-url` / open / xdg-open counts as a failed launch
 
 
 def home() -> Path:
@@ -73,12 +74,13 @@ def open_uri(uri: str) -> None:
     if sys.platform == "win32":
         code = resolve_executable("code")
         if code:
-            subprocess.run([code, "--open-url", uri], check=True, capture_output=True)
+            subprocess.run([code, "--open-url", uri], check=True, capture_output=True,
+                           timeout=OPEN_TIMEOUT)
         else:
             os.startfile(uri)
     else:
         command = ["open", uri] if sys.platform == "darwin" else ["xdg-open", uri]
-        subprocess.run(command, check=True, capture_output=True)
+        subprocess.run(command, check=True, capture_output=True, timeout=OPEN_TIMEOUT)
 
 
 def parent_map() -> dict[int, int]:
@@ -210,7 +212,7 @@ def launch(client: str, handoff: Path, resume_token: str = "", timeout: float = 
     launched = True
     try:
         open_uri(uri)
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         if withdraw(request, CLAIMED_GRACE) is not False:
             return f"Editor launch failed ({exc}). Open a new {what} and send: {prompt}"
         launched = False  # a bridge scan already claimed it despite the failed launch

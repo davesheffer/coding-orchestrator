@@ -35,6 +35,21 @@ class ArgvTests(unittest.TestCase):
                 with self.assertRaises(ro.UsageError):
                     ro.build_argv(verb, args)
 
+    def test_trailing_newline_is_rejected(self):
+        for verb, args in (("log", ["HEAD\n"]), ("log", ["-n", "5\n"]), ("issue", ["7\n"]),
+                           ("blame", ["f", "-L", "1,2\n"]), ("log", ["--", "a\n"])):
+            with self.subTest(verb=verb, args=args):
+                with self.assertRaises(ro.UsageError):
+                    ro.build_argv(verb, args)
+
+    def test_config_check_decodes_output_as_utf8(self):
+        done = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(ro, "resolve", return_value="git"), \
+                mock.patch.object(ro.subprocess, "run", return_value=done) as run:
+            self.assertIsNone(ro.local_config_violation({}))
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
+
     def test_builds_expected_argv(self):
         base = ro.GIT_BASE
         sig = ["--no-show-signature"]

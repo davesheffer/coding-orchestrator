@@ -353,6 +353,87 @@ class CodexJevTests(unittest.TestCase):
             self.assertEqual(self.run_main({"hook_event_name": "PreToolUse", "tool_name": "Agent",
                                             "tool_input": {"command": "git push"}}), (0, ""))
 
+    def test_every_codex_shell_name_and_argv_list_fails_closed(self):
+        def shell(name, command):
+            return {"hook_event_name": "PreToolUse", "tool_name": name, "tool_input": {"command": command}}
+
+        with patch.object(module, "guard_module", side_effect=RuntimeError("guard missing")):
+            for name in module.SHELL_TOOLS:
+                for push, safe in (("git push origin main", "ls -la"),
+                                   (["bash", "-lc", "git push origin main"], ["ls", "-la"])):
+                    with self.subTest(name=name, command=push):
+                        code, out = self.run_main(shell(name, push))
+                        self.assertEqual(code, 0)
+                        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+                        self.assertEqual(self.run_main(shell(name, safe)), (0, ""))
+
+    def test_exec_command_cmd_key_reaches_the_guard_as_a_bash_command(self):
+        seen = []
+        guard = type("G", (), {"gate": staticmethod(lambda payload, *a, **k: seen.append(payload))})
+        cfg = module.settings() | {"enabled": True}
+        with patch.object(module, "guard_module", return_value=guard):
+            module.risk({"tool_name": "exec_command", "tool_input": {"cmd": "git push origin main"}}, cfg)
+            module.risk({"tool_name": "exec_command", "tool_input": {"cmd": ["git", "push"]}}, cfg)
+        self.assertEqual(seen[0]["tool_name"], "Bash")
+        self.assertEqual(seen[0]["tool_input"]["command"], "git push origin main")
+        self.assertEqual(seen[1]["tool_input"]["command"], "git push")
+        with patch.object(module, "guard_module", side_effect=RuntimeError("guard missing")):
+            code, out = self.run_main({"hook_event_name": "PreToolUse", "tool_name": "exec_command",
+                                       "tool_input": {"cmd": "git push origin main"}})
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_every_codex_shell_name_is_dispatched_to_the_risk_gate(self):
+        for name in module.SHELL_TOOLS:
+            with self.subTest(name=name), patch.object(module, "risk", return_value=None) as risk, \
+                 patch.object(module, "route", return_value=None) as route:
+                self.run_main({"hook_event_name": "PreToolUse", "tool_name": name, "tool_input": {"command": "ls"}})
+                risk.assert_called_once()
+                route.assert_not_called()
+
+    def test_risk_presents_shells_to_the_guard_as_bash_or_powershell_strings(self):
+        seen = []
+        guard = type("G", (), {"gate": staticmethod(lambda payload, *a, **k: seen.append(payload))})
+        cfg = module.settings() | {"enabled": True}
+        with patch.object(module, "guard_module", return_value=guard):
+            module.risk({"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "git push"], "cwd": "x"}}, cfg)
+            module.risk({"tool_name": "PowerShell", "tool_input": {"command": "git push"}}, cfg)
+            module.risk({"tool_name": "local_shell", "tool_input": {"command": ["git", "push", "it's"]}}, cfg)
+        self.assertEqual(seen[0]["tool_name"], "Bash")
+        self.assertEqual(seen[0]["tool_input"], {"command": "bash -lc 'git push'", "cwd": "x"})
+        self.assertEqual(seen[1]["tool_name"], "PowerShell")
+        self.assertEqual(seen[1]["tool_input"]["command"], "git push")
+        self.assertEqual(seen[2]["tool_input"]["command"], "git push 'it'\"'\"'s'")
+
+    def test_installer_matcher_names_the_same_shell_tools(self):
+        spec = importlib.util.spec_from_file_location("codex_install_for_jev", ROOT / "codex" / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        self.assertEqual(installer.JEV_SHELL_MATCHER.split("|"), list(module.SHELL_TOOLS))
+        hooks = json.loads(installer.merge_jev_hooks(Path("hooks.json"), None, self.home, True))["hooks"]
+        self.assertEqual(hooks["PreToolUse"][0]["matcher"].split("|"),
+                         [*module.SHELL_TOOLS, "Agent", "Task", "spawn_agent"])
+
+    def test_missing_jev_client_still_fails_closed(self):
+        # A copy of the hook whose jev_client import raises: main() must still deny a push.
+        hook_dir = Path(self.temp.name) / "hookbin"
+        hook_dir.mkdir()
+        (hook_dir / "jev-hook.py").write_bytes(HOOK.read_bytes())
+        (hook_dir / "jev_client.py").write_text('raise ImportError("simulated missing jev_client")\n')
+        for command, denied in (("git push origin main", True), ("ls -la", False)):
+            with self.subTest(command=command):
+                payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
+                result = subprocess.run([sys.executable, str(hook_dir / "jev-hook.py")],
+                                        input=json.dumps(payload).encode("utf-8"), env=self.env,
+                                        capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if denied:
+                    decision = json.loads(result.stdout)["hookSpecificOutput"]
+                    self.assertEqual(decision["permissionDecision"], "deny")
+                    self.assertIn("fail-closed", decision["permissionDecisionReason"])
+                else:
+                    self.assertEqual(result.stdout, b"")
+
     def test_handoff_grade_is_optional_and_blocks_weak_handoff(self):
         cfg = module.settings() | {"enabled": True}
         with patch.object(module.client, "ask", return_value={"actionable": {"score": 1}}), \

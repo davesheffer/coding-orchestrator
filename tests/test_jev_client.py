@@ -348,6 +348,11 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(Path(jev_client.resolve_executable(name)), real / exe)
         with mock.patch.dict(os.environ, {"PATH": ".", "PATHEXT": ".COM;.EXE"}):
             self.assertIsNone(jev_client.resolve_executable(name))
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join([str(planted), str(real)]),
+                                          "PATHEXT": ".COM;.EXE"}):
+            self.assertEqual(Path(jev_client.resolve_executable(name)), real / exe)
+        with mock.patch.dict(os.environ, {"PATH": str(planted), "PATHEXT": ".COM;.EXE"}):
+            self.assertIsNone(jev_client.resolve_executable(name))
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ def load_router():
     return module
 
 
-def validate_benchmark(data, tiers=("sonnet", "opus", "fable")):
+def validate_benchmark(data, tiers=AGENT_MODELS):
     """Return a list of problems; empty means valid."""
     if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("tasks"), list):
         return ["benchmark must be an object with version 1 and a tasks list"]
