@@ -1720,6 +1720,16 @@ class GateTests(unittest.TestCase):
         self.assertEqual([os.path.normpath(t[1]) for t in targets],
                          [os.path.normpath(os.path.join(base, "pkg"))])
 
+    def test_powershell_split_backslash_per_os(self):
+        token = jev._POWERSHELL.set(True)
+        try:
+            with mock.patch.object(jev.os, "sep", "/"):
+                self.assertEqual(jev._shell_split("cd .\\pkg\\sub"), ["cd", "./pkg/sub"])
+            with mock.patch.object(jev.os, "sep", "\\"):
+                self.assertEqual(jev._shell_split("cd '.\\pkg'"), ["cd", ".\\pkg"])
+        finally:
+            jev._POWERSHELL.reset(token)
+
     def test_long_prefix_chain_scans_fast(self):
         command = "timeout -k " * 2000 + "git commit"
         self._assert_fast(lambda: (jev._scan_targets(command, "/repo"),

@@ -1664,15 +1664,17 @@ _POWERSHELL = contextvars.ContextVar("jev_guard_powershell", default=False)
 
 def _shell_split(text):
     """shlex.split, except for a PowerShell command (see _POWERSHELL): split in non-POSIX
-    mode, which keeps backslashes, and drop a word's enclosing quotes. Raises ValueError
-    on an unbalanced quote, as shlex.split does."""
+    mode, which keeps backslashes, and drop a word's enclosing quotes. Off Windows the
+    backslashes become `/`, as pwsh reads them there (`cd .\pkg` is `./pkg`). Raises
+    ValueError on an unbalanced quote, as shlex.split does."""
     if not _POWERSHELL.get():
         return shlex.split(text)
     lexer = shlex.shlex(text, posix=False)
     lexer.whitespace_split = True
     lexer.commenters = ""
-    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"" else t
-            for t in lexer]
+    words = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"" else t
+             for t in lexer]
+    return words if os.sep == "\\" else [w.replace("\\", "/") for w in words]
 
 
 def _global_opts(opts_segment):
