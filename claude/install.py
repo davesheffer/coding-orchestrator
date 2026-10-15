@@ -14,6 +14,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -94,6 +95,10 @@ def validate_role(path: Path, data: bytes, name: str) -> None:
     front = text.split("\n---\n", 1)[0].splitlines()[1:]
     fields = {line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip()
               for line in front if ":" in line}
+    for line in front:
+        value = line.split(":", 1)[1].strip() if ":" in line and not line[:1].isspace() else ""
+        if value[:1] not in ("", '"', "'") and (": " in value or " #" in value or value.endswith(":")):
+            fail(f"invalid role {path}: quote this YAML value: {line}")
     required = {"name", "description", "model", "tools", "permissionMode", "maxTurns"}
     if fields.get("name") != name or required - fields.keys():
         fail(f"invalid role {path}: missing fields or wrong name")
@@ -141,6 +146,14 @@ OWNED_PYTHONS = ("python3", "python")
 
 def hook_python() -> str:
     return "python" if os.name == "nt" else "python3"
+
+
+def pinned_python() -> str:
+    """Base interpreter for scout commands, so a PATH-planted `python` (e.g. a repo .venv) is never used."""
+    python = Path(getattr(sys, "_base_executable", "") or sys.executable).as_posix()
+    if not python or not os.path.isabs(python):
+        fail(f"cannot pin an absolute Python interpreter (got {python!r})")
+    return python
 
 
 def fill_placeholders(text: str, values: dict[str, str]) -> str:
@@ -354,11 +367,18 @@ def main(argv: list[str] | None = None) -> int:
         data = read_regular(source)
         assert data is not None
         validate_role(source, data, name)
-        managed_sources[dest / "agents" / f"{name}.md"] = data
+        managed_sources[dest / "agents" / f"{name}.md"] = fill_placeholders(data.decode("utf-8"), {
+            "__ROLE_GUARD__": json.dumps(
+                f"{shlex.quote(pinned_python())} "
+                f"{shlex.quote((dest / 'bin' / 'role-guard.py').as_posix())} || exit 2"),
+            "__RO__": f"{shlex.quote(pinned_python())} {shlex.quote((dest / 'bin' / 'ro.py').as_posix())}",
+        }).encode("utf-8")
     managed_sources[dest / "relay" / "relay.py"] = (root / "relay" / "relay.py").read_bytes()
     managed_sources[dest / "bin" / "pr-status"] = (root / "bin" / "pr-status").read_bytes()
     managed_sources[dest / "bin" / "rollover-open.py"] = (root / "bin" / "rollover-open.py").read_bytes()
     managed_sources[dest / "bin" / "session-focus.py"] = (root / "bin" / "session-focus.py").read_bytes()
+    managed_sources[dest / "bin" / "role-guard.py"] = (root / "bin" / "role-guard.py").read_bytes()
+    managed_sources[dest / "bin" / "ro.py"] = (root / "bin" / "ro.py").read_bytes()
     for name in JEV_SCRIPTS:
         managed_sources[dest / "bin" / name] = (root / "bin" / name).read_bytes()
 
