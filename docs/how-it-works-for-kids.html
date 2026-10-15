@@ -154,7 +154,7 @@
       <p>Finds files, reads code, and sends back a short summary. It only <b>reads</b>; it never changes anything. This saves the head chef from stuffing its memory with whole files.</p>
     </div>
     <div class="card runner">
-      <div class="model">Runner · Sonnet (fast &amp; cheap)</div>
+      <div class="model">Runner · Haiku (fast &amp; cheap)</div>
       <h3>The tester</h3>
       <p>Runs the exact command it's given (like "run all the tests") and reports what happened: did it pass or fail, and the exact error. It doesn't try to fix anything. Test output can be thousands of lines long; the runner boils it down.</p>
     </div>
@@ -183,7 +183,7 @@
     <tr><th style="width:15%">Role</th><th style="width:16%">Claude Code</th><th style="width:22%">Codex</th><th>Why that one</th></tr>
     <tr><td><b>Head chef</b></td><td>Opus 5.5</td><td>GPT-6.1 Sol · medium</td><td>Hard decisions and final checking need the strongest brain.</td></tr>
     <tr><td><b>Scout</b></td><td>Sonnet</td><td>GPT-6 Luna · low</td><td>Reading and summarizing: fast and cheap is enough.</td></tr>
-    <tr><td><b>Runner</b></td><td>Sonnet</td><td>GPT-6 Luna · low</td><td>Just runs a command and reports what came out.</td></tr>
+    <tr><td><b>Runner</b></td><td>Haiku</td><td>GPT-6 Luna · low</td><td>Just runs a command and reports what came out.</td></tr>
     <tr><td><b>Builder</b></td><td>Sonnet</td><td>GPT-6.1 Sol · medium</td><td>Writes code from a plan that's already decided.</td></tr>
     <tr><td><b>Critic</b></td><td>Fable</td><td>GPT-6 Astra · high</td><td>A different, sharp brain that's good at spotting mistakes.</td></tr>
     <tr><td><b>Jev</b></td><td colspan="2">jev-latest (TypeSafe)</td><td>A small, fast judge for quick questions and scores. It can move a helper to a bigger brain (Sonnet → Opus/Fable) when a job is hard.</td></tr>
