@@ -26,7 +26,23 @@ class RolloverOpenTests(unittest.TestCase):
         resolve.assert_called_once_with("code")
         run.assert_called_once_with(
             ["code.cmd", "--open-url", "vscode://coding-orchestrator.handoff-bridge/open?id=test"],
-            check=True, capture_output=True)
+            check=True, capture_output=True, timeout=rollover.OPEN_TIMEOUT)
+
+    def test_hung_opener_times_out_and_falls_back_to_the_prompt(self):
+        for platform in ("win32", "linux"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp, \
+                    patch.dict(os.environ, {"ORCHESTRATOR_HANDOFF_HOME": temp}), \
+                    patch.object(rollover, "CLAIMED_GRACE", 0.1), \
+                    patch.object(rollover.sys, "platform", platform), \
+                    patch.object(rollover, "resolve_executable", return_value="code.cmd"), \
+                    patch.object(rollover.subprocess, "run",
+                                 side_effect=subprocess.TimeoutExpired("code", 15)) as run:
+                handoff = Path(temp) / "handoff.md"
+                handoff.write_text("GOAL: continue\nSTATE: saved\n", encoding="utf-8")
+                result = rollover.launch("claude", handoff, "relay:1234abcd", timeout=0)
+            self.assertEqual(run.call_args.kwargs["timeout"], rollover.OPEN_TIMEOUT)
+            self.assertIn("Editor launch failed", result)
+            self.assertIn("relay:1234abcd", result)
 
     def test_resolve_executable_ignores_cwd_and_relative_path_entries(self):
         with tempfile.TemporaryDirectory() as temp:

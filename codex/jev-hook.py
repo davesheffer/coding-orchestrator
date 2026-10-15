@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -14,7 +15,12 @@ from pathlib import Path
 HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
-import jev_client as client  # noqa: E402
+try:
+    import jev_client as client  # noqa: E402
+except Exception as exc:  # re-raised inside main()'s guard so fail_closed() still runs
+    client, CLIENT_IMPORT_ERROR = None, exc
+else:
+    CLIENT_IMPORT_ERROR = None
 
 CONFIG = HOME / "jev" / "config.json"
 STATE = HOME / "jev" / "state"
@@ -24,6 +30,8 @@ RANK = {"luna": 0, "sol": 1, "astra": 2}
 INSTRUCTIONS = ("Choose the least expensive Codex model that will reliably complete this task well; "
                 "when torn between two models, choose the stronger one.")
 PINNED = {"scout", "runner", "builder", "critic"}
+# Codex shell tool names; codex/install.py's PreToolUse matcher must list the same names.
+SHELL_TOOLS = ("Bash", "PowerShell", "shell", "local_shell", "exec_command")
 LABELS = {
     "luna": "Bounded searches, summaries and exact offline checks.",
     "sol": "Implementation and routine design or debugging.",
@@ -143,8 +151,28 @@ def route(payload, cfg, classify_fn=None):
                                     "updatedInput": updated}}
 
 
+def shell_command(tool_input):
+    """The command text of a shell tool call; argv lists are joined with POSIX quoting,
+    which is what the guard's scanner parses."""
+    if not isinstance(tool_input, dict):
+        return None
+    # The unified exec_command tool names its command `cmd`.
+    command = tool_input.get("command")
+    if command is None:
+        command = tool_input.get("cmd")
+    if isinstance(command, list) and all(isinstance(part, str) for part in command):
+        return shlex.join(command)
+    return command if isinstance(command, str) else None
+
+
 def risk(payload, cfg, classify_fn=None):
     guard = guard_module()
+    # The guard gates only Bash/PowerShell with a string command; present every Codex shell that way.
+    tool_input = payload.get("tool_input")
+    command = shell_command(tool_input)
+    if command is not None:
+        name = "PowerShell" if payload.get("tool_name") == "PowerShell" else "Bash"
+        payload = {**payload, "tool_name": name, "tool_input": {**tool_input, "command": command}}
     result = guard.gate(payload, cfg, classify_fn, lambda entry: log(cfg, entry), state_dir=STATE)
     if result:
         reason = result["hookSpecificOutput"]["permissionDecisionReason"]
@@ -260,11 +288,10 @@ def fail_closed(raw, payload):
     Defined locally: the guard module may be what failed."""
     try:
         if isinstance(payload, dict):
-            if payload.get("hook_event_name") != "PreToolUse" or payload.get("tool_name") != "Bash":
+            if payload.get("hook_event_name") != "PreToolUse" or payload.get("tool_name") not in SHELL_TOOLS:
                 return
-            tool_input = payload.get("tool_input")
-            command = tool_input.get("command") if isinstance(tool_input, dict) else None
-            text = command if isinstance(command, str) else raw
+            command = shell_command(payload.get("tool_input"))
+            text = command if command is not None else raw
         else:
             text = raw
         if OUTWARD_COMMAND_RE.search(text or ""):
@@ -281,6 +308,8 @@ def main():
         # Hook payloads are UTF-8 whatever the locale (e.g. cp1255 on Windows).
         raw = sys.stdin.buffer.read().decode("utf-8", "replace")
         payload = json.loads(raw or "{}")
+        if CLIENT_IMPORT_ERROR is not None:
+            raise CLIENT_IMPORT_ERROR
         cfg = settings()
         if len(sys.argv) > 1 and sys.argv[1] == "grade":
             result = grade_handoff(str(payload.get("handoff") or ""), cfg)
@@ -290,7 +319,7 @@ def main():
         event = payload.get("hook_event_name")
         result = None
         if event == "PreToolUse":
-            result = risk(payload, cfg) if payload.get("tool_name") == "Bash" else route(payload, cfg)
+            result = risk(payload, cfg) if payload.get("tool_name") in SHELL_TOOLS else route(payload, cfg)
         elif event == "SubagentStart":
             result = subagent_start(payload, cfg)
         elif event == "SubagentStop":

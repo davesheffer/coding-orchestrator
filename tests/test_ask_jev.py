@@ -245,6 +245,43 @@ class AskJevTests(unittest.TestCase):
         self.assertIn("no Jev API key", output["error"])
         self.assertEqual(self.calls, [])
 
+    def test_malformed_questions_are_usage_errors_even_when_jev_is_off(self):
+        self.file("a.py")
+        for cfg in (self.cfg(enabled=False), self.cfg(features={"ask": False})):
+            with self.subTest(cfg=cfg.get("features")), self.assertRaises(ask_jev.UsageError):
+                self.run_args(["-q", "{not json", "a.py"], cfg=cfg)
+        out = io.StringIO()
+        with mock.patch.object(jev_client, "load_config", return_value=self.cfg(enabled=False)), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(ask_jev.main(["-q", "[]", "a.py"]), 2)
+        self.assertIn("error", json.loads(out.getvalue()))
+        self.assertEqual(self.calls, [])
+
+    def test_repo_root_never_runs_a_git_planted_in_the_cwd(self):
+        """Planted files are only inspected, never run."""
+        for name in ("git", "git.exe", "git.cmd"):
+            (self.outside / name).write_text("planted")
+            (self.outside / name).chmod(0o755)
+        path = os.pathsep.join(["", ".", "sub"])
+        with contextlib.chdir(self.outside), mock.patch.dict(os.environ, {"PATH": path}), \
+                mock.patch.object(ask_jev.subprocess, "run") as run:
+            with self.assertRaisesRegex(ask_jev.UsageError, "git not found on PATH"):
+                ask_jev.repo_root(str(self.outside))
+        run.assert_not_called()
+        real = self.dir / "tools"
+        real.mkdir()
+        (real / "git.exe").write_text("tool")
+        (real / "git").write_text("tool")
+        (real / "git").chmod(0o755)
+        done = subprocess.CompletedProcess([], 0, str(self.repo) + "\n", "")
+        with contextlib.chdir(self.outside), \
+                mock.patch.dict(os.environ, {"PATH": os.pathsep.join([".", str(real)]), "PATHEXT": ".EXE"}), \
+                mock.patch.object(ask_jev.subprocess, "run", return_value=done) as run:
+            self.assertEqual(ask_jev.repo_root(str(self.outside)), self.repo.resolve())
+        git = run.call_args.args[0][0]
+        self.assertTrue(os.path.isabs(git))
+        self.assertEqual(Path(git).parent, real)
+
     def test_outside_root_bases_are_not_walked(self):
         self.file("a.py")
         (self.outside / "far.py").write_text("x = 1\n", encoding="utf-8")

@@ -49,7 +49,7 @@ the mapping applies if that tier is used for a future role.
 
 The Claude installer sets `claude-opus-5-5` as the main-session default when no
 model is already selected in user settings; existing explicit choices remain
-untouched. Its named scout, runner, and builder roles use Sonnet, and its critic
+untouched. Its named scout and builder roles use Sonnet, its runner uses Haiku, and its critic
 uses Fable. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
 follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
 Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
@@ -73,7 +73,7 @@ assistant homes; neither installer implicitly configures a project's local files
 ./install.sh
 ```
 
-Requires Claude Code and Python **3.10+**. The installer places the marked
+Requires Claude Code and Python **3.11+**. The installer places the marked
 orchestrator block, four Markdown roles, relay, and `pr-status` under
 `${CLAUDE_HOME:-$HOME/.claude}`. It validates roles, JSON, markers, and destination
 conflicts before writing, refuses symlinks, preserves instructions
@@ -660,12 +660,13 @@ runner. No credentials are included.
 | `codex/PROMPT.md`, `codex/CONTEXT-GAUGE.md` | Validation brief and optional gauge proposal |
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
 | `bin/pr-status` | Shared PR/CI helper |
+| `bin/session-focus.py` | Switch VS Code to a running Claude Code session's tab (used by `/sessions`) |
 | `bin/rollover-open.py`, `vscode/handoff-bridge/` | Shared handoff protocol and VS Code tab bridge |
 | `mods/mission-control/` | Optional Claude Code mod: live `/orch` dashboard, activity timeline, and `/sessions` switcher |
 | `bin/jev_client.py`, `bin/jev-route.py`, `bin/jev-guard.py`, `bin/jev-report.py`, `bin/ask-jev.py`, `bin/eval-jev-routing.py` | Opt-in TypeSafe Jev hooks (routing, risk gate, report check), ask-about-files command, log and spend report, routing eval |
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
-| `tests/` | Bundle contracts, both installers, and relay behavior |
+| `tests/` | Bundle, marker, and relay contracts; both installers; agent-run/report, ro, role-guard, Jev (client, route, guard, report, ask), PR status, rollover-open, session-focus, and read-only comparison tests |
 | `.github/workflows/ci.yml` | Python 3.11–3.13 Linux and Windows CI plus macOS 3.12, compilation, shell syntax, and tests |
 
 ## Update and verify

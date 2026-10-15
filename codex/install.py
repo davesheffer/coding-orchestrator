@@ -6,6 +6,7 @@ Usage: install.py [--force] [--dry-run] [--configure-routing] [--jev]
 from __future__ import annotations
 
 import argparse
+import codecs
 import copy
 import json
 import os
@@ -35,6 +36,8 @@ REQUIRED_ROLE_FIELDS = {
     "name", "description", "model", "model_reasoning_effort", "sandbox_mode",
     "approval_policy", "developer_instructions",
 }
+# Must name the same tools as SHELL_TOOLS in codex/jev-hook.py (a test checks they agree).
+JEV_SHELL_MATCHER = "Bash|PowerShell|shell|local_shell|exec_command"
 ROUTING_POLICY = b'{"network_fallback_roles": []}\n'
 ROUTING_FIELDS = {
     "default_subagent_model": "gpt-6-luna",
@@ -58,7 +61,8 @@ def read_regular(path: Path) -> bytes | None:
 
 def parse_toml(path: Path, data: bytes) -> dict:
     try:
-        value = tomllib.loads(data.decode("utf-8"))
+        # utf-8-sig: editors such as Notepad save a leading BOM, which tomllib rejects.
+        value = tomllib.loads(data.decode("utf-8-sig"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         fail(f"invalid TOML in {path}: {exc}")
     if not isinstance(value, dict):
@@ -68,7 +72,7 @@ def parse_toml(path: Path, data: bytes) -> dict:
 
 def validate_routing_policy(path: Path, data: bytes) -> None:
     try:
-        value = json.loads(data.decode("utf-8"))
+        value = json.loads(data.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         fail(f"invalid routing policy in {path}: {exc}")
     roles = value.get("network_fallback_roles") if isinstance(value, dict) else None
@@ -91,7 +95,8 @@ def configure_routing_defaults(path: Path, data: bytes) -> bytes:
     if not missing:
         return data
 
-    text = data.decode("utf-8")
+    bom = codecs.BOM_UTF8 if data.startswith(codecs.BOM_UTF8) else b""
+    text = data[len(bom):].decode("utf-8")
     lines = text.splitlines(keepends=True)
     table = re.compile(r"^\s*\[agents\]\s*(?:#.*)?(?:\r?\n)?$")
     custom = re.compile(r"^\s*\[agents\.")
@@ -111,7 +116,7 @@ def configure_routing_defaults(path: Path, data: bytes) -> bytes:
         lines.extend(["[agents]" + newline, *additions])
     else:
         fail(f"cannot safely configure routing defaults in {path}: unsupported agents table syntax")
-    updated = "".join(lines).encode("utf-8")
+    updated = bom + "".join(lines).encode("utf-8")
     expected = copy.deepcopy(config)
     expected.setdefault("agents", {}).update(missing)
     if parse_toml(path, updated) != expected:
@@ -132,8 +137,12 @@ def validate_role(path: Path, data: bytes, name: str) -> None:
         fail(f"unsupported or enabled role features in {path}")
     if role.get("agents") != {"enabled": False}:
         fail(f"nested agents must be disabled in {path}")
-    if role.get("sandbox_workspace_write", {}).get("network_access") is not False:
+    workspace = role.get("sandbox_workspace_write", {})
+    if workspace.get("network_access") is not False:
         fail(f"network must be disabled in {path}")
+    if ROLE_SANDBOX[name] == "workspace-write" and (
+            workspace.get("exclude_slash_tmp") is not True or workspace.get("exclude_tmpdir_env_var") is not True):
+        fail(f"writable roles must exclude /tmp and $TMPDIR in {path}")
 
 
 def platform_python() -> str:
@@ -182,7 +191,7 @@ def parse_json(path: Path, data: bytes | None) -> dict:
     if data is None:
         return {}
     try:
-        value = json.loads(data.decode("utf-8"))
+        value = json.loads(data.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         fail(f"invalid JSON in {path}: {exc}")
     if not isinstance(value, dict):
@@ -199,38 +208,56 @@ def hook_command(dest: Path) -> str:
     return f'{python} "{path}"' if os.name == "nt" else f"{python} {shlex.quote(path)}"
 
 
+def dump_json(doc) -> bytes:
+    """UTF-8 JSON; a lone surrogate (valid JSON escape) falls back to ASCII escapes."""
+    try:
+        return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        return (json.dumps(doc, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+
+
 def merge_jev_hooks(path: Path, prior: bytes | None, dest: Path, enabled: bool) -> bytes | None:
     doc = parse_json(path, prior)
     hooks = doc.get("hooks", {})
     if not isinstance(hooks, dict):
         fail(f"hooks must be an object in {path}")
     command = hook_command(dest)
-    events = {"PreToolUse": ("Bash|Agent|Task|spawn_agent", 10),
+    events = {"PreToolUse": (JEV_SHELL_MATCHER + "|Agent|Task|spawn_agent", 10),
               "SubagentStart": ("critic", 5), "SubagentStop": ("scout|runner|builder|critic", 5),
               "UserPromptSubmit": (None, 5)}
     result = {name: list(groups) if isinstance(groups, list) else fail(f"invalid hook groups in {path}")
               for name, groups in hooks.items()}
-    for event, groups in result.items():
+    removed = False
+    for event, groups in list(result.items()):
         remaining = []
         for group in groups:
             if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
                 fail(f"invalid hook group in {path}")
             handlers = [h for h in group["hooks"] if not (isinstance(h, dict) and h.get("command") == command)]
+            if len(handlers) == len(group["hooks"]):
+                remaining.append(group)
+                continue
+            removed = True
             if handlers:
                 remaining.append({**group, "hooks": handlers})
-        result[event] = remaining
+        # Drop only an event our handlers emptied; the user's own empty entries stay as they are.
+        if remaining or not groups:
+            result[event] = remaining
+        else:
+            del result[event]
     if enabled:
         for event, (matcher, timeout) in events.items():
             group = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
             if matcher:
                 group["matcher"] = matcher
             result.setdefault(event, []).append(group)
-    doc["hooks"] = {event: groups for event, groups in result.items() if groups}
+    if enabled or removed:
+        doc["hooks"] = result
     if prior is None and not enabled:
         return None
     if prior is not None and doc == parse_json(path, prior):
         return prior
-    return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    return dump_json(doc)
 
 
 JEV_DISABLED = "jev: disabled (was enabled). Re-run with --jev to keep it."
@@ -249,7 +276,7 @@ def merge_jev_config(path: Path, prior: bytes | None, enabled: bool) -> bytes | 
     jev["enabled"] = enabled
     if prior is not None and doc == parse_json(path, prior):
         return prior
-    return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    return dump_json(doc)
 
 
 def backup_path(path: Path) -> Path:

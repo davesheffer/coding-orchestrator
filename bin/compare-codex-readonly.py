@@ -5,17 +5,45 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
 
+def kill_tree(process):
+    """Kill the launcher and the codex it started; killing only the launcher leaves codex running."""
+    try:
+        if sys.platform == 'win32':
+            # Absolute path: a bare name could resolve to a taskkill planted in the cwd.
+            taskkill = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
+            subprocess.run([taskkill, '/T', '/F', '/PID', str(process.pid)],
+                           capture_output=True, timeout=30)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    process.kill()
+
+
 def run_one(repo, task, model):
     launcher = Path(__file__).with_name('agent-run.py')
-    result = subprocess.run([sys.executable, str(launcher), 'scout', '--cd', str(repo),
-                             '--trial-model', model], input=task['prompt'],
-                            cwd=repo, capture_output=True, text=True, encoding='utf-8',
-                            errors='replace', timeout=180)
+    process = subprocess.Popen([sys.executable, str(launcher), 'scout', '--cd', str(repo),
+                                '--trial-model', model], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, text=True,
+                               encoding='utf-8', errors='replace',
+                               start_new_session=sys.platform != 'win32')
+    try:
+        stdout, stderr = process.communicate(task['prompt'], timeout=180)
+    except subprocess.TimeoutExpired:
+        kill_tree(process)
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return {'task': task['id'], 'model': model, 'exit': 124, 'error': 'timeout'}
+    result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     record = {'task': task['id'], 'model': model, 'exit': result.returncode}
     log_line = next((line for line in result.stdout.splitlines()
                      if line.startswith('Agent run: ')), None)

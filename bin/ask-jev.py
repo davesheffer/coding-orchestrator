@@ -193,8 +193,12 @@ def scrub_questions(questions, guard):
 
 def repo_root(cwd):
     """The git work tree's resolved root, or None outside a git repository."""
+    # Resolved to an absolute path: a bare "git" could run a git.exe planted in the cwd.
+    git = jev_client.resolve_executable("git")
+    if git is None:
+        raise UsageError("git not found on PATH (the current directory is never searched)")
     try:
-        out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True,
+        out = subprocess.run([git, "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True,
                              text=True, timeout=5)
         if out.returncode == 0 and out.stdout.strip():
             return Path(out.stdout.strip()).resolve()
@@ -514,6 +518,10 @@ def add_usage(total, spent):
 def run(args, cfg, classify_fn=None, cwd=None):
     """(exit code, output dict, log entry) for parsed args."""
     cwd = cwd or os.getcwd()
+    # Malformed inline questions are a usage error (exit 2) whether or not Jev is on;
+    # an @file is only read once Jev is known to be on.
+    if not args.questions.startswith("@"):
+        parse_questions(args.questions)
     if not jev_client.feature_enabled(cfg, "ask"):
         return 3, {"error": "Jev is off (relay/config.json jev.enabled and jev.features.ask); "
                             "read the files instead"}, None

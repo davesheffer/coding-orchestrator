@@ -36,6 +36,8 @@ UNVERIFIED: <anything not run or not checked, or "none">
 [sandbox_workspace_write]
 network_access = false
 writable_roots = []
+exclude_slash_tmp = true
+exclude_tmpdir_env_var = true
 
 [features]
 apps = false

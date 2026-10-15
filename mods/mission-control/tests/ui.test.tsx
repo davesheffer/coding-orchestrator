@@ -53,3 +53,17 @@ test('the pane draws its sections with nothing yet recorded', async $ => {
     await ui.unmount()
   }
 })
+
+test('a narrow pane draws its details without throwing', async $ => {
+  const ui = await $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'mission-control',
+    props: { title: 'Mission Control', isFocused: false, bodyColumns: 20, placement: 'dock', scroll, view: {} },
+  })
+  await ui.press({ key: 'details' })
+  expect(await ui.find({ text: /^UNKNOWN/ })).toBeDefined()
+  await ui.press({ key: 'details' })
+  await ui.unmount()
+})

@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { hunchCli, hunchInvocation, hunchName, hunchOutcome, reapStale } from '../hooks/parse'
+import { hunchCli, hunchInvocation, hunchName, hunchOutcome, isToastSeverity, reapStale } from '../hooks/parse'
 
 const TASK = 'htask_a0a4770f5592438f23dad47a'
 
@@ -19,6 +19,9 @@ describe('hunch parsing', () => {
     expect(hunchName('mcp__hunch__hunch_context')).toBe('context')
     expect(hunchName('mcp__hunch__hunch_check_constraints')).toBe('check_constraints')
     expect(hunchName('mcp__github__get_issue')).toBeUndefined()
+    // The Hunch plugin's own MCP server.
+    expect(hunchName('mcp__plugin_hunch_hunch__hunch_context')).toBe('context')
+    expect(hunchName('mcp__plugin_other_hunch__hunch_context')).toBeUndefined()
 
     expect(hunchInvocation('context', { target: 'lib/a.dart', task_id: TASK })).toEqual({
       name: 'context',
@@ -90,6 +93,11 @@ describe('hunch parsing', () => {
     expect(outcome.summary).toBe('2 constraints (1 warning)')
     expect(hunchOutcome('check_constraints', 'No constraints match.', false).summary).toBe('no constraints in scope')
     expect(hunchOutcome('check_constraints', '• con_x1 [blocking/hard] Never X.', false).level).toBe('alert')
+  })
+
+  test('only warning severity or above is worth a toast', async () => {
+    expect(['warning', 'warn', 'blocking', 'error', 'critical'].every(isToastSeverity)).toBe(true)
+    expect(['advisory', 'info', 'note', ''].some(isToastSeverity)).toBe(false)
   })
 
   test('merge verdict, escalations, verify exit codes, errors', async () => {
@@ -280,4 +288,47 @@ test('an interrupted call is marked interrupted, without a failure toast', async
   expect(await band.find({ text: /hunch 2/ })).toBeDefined()
   expect(await band.find({ text: /hunch 2 ⚠/ })).toBeUndefined()
   await band.unmount()
+})
+
+test('a plugin-provided Hunch tool is tracked like the bare one', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-06T14:00:00') })
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'mcp__plugin_hunch_hunch__hunch_merge_verdict' }, () => ({
+    result: 'VERDICT: ⛔ BLOCK — breaks con_x\n(scope: staged, 2 file(s))',
+  }))
+
+  await $.tool.call({ tool: 'mcp__plugin_hunch_hunch__hunch_merge_verdict', task_id: TASK })
+  expect(toasts.filter(text => /merge verdict BLOCK/.test(text)).length).toBe(1)
+
+  const band = await $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 120, scroll, view: {} },
+  })
+  expect(await band.find({ text: /hunch 1 ⚠1/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('an info or advisory invariant stays in the pane without a toast', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-06T14:00:00') })
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'mcp__hunch__hunch_check_constraints' }, () => ({
+    result: ['• con_1111111111 [info/advisory_v1] Prefer small diffs.', '• con_2222222222 [advisory] Keep it tidy.'].join('\n'),
+  }))
+
+  await $.tool.call({ tool: 'mcp__hunch__hunch_check_constraints', scope: 'lib/a.dart' })
+  expect(toasts.filter(text => /Hunch invariant/.test(text))).toEqual([])
 })

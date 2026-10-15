@@ -244,9 +244,10 @@ def resolve_executable(name):
         names = [name] if Path(name).suffix.lower() in exts else [name + ext for ext in exts]
     else:
         names = [name]
+    cwd = os.path.normcase(os.path.realpath(os.getcwd()))
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         entry = entry.strip().strip('"')
-        if not entry or not os.path.isabs(entry):
+        if not entry or not os.path.isabs(entry) or os.path.normcase(os.path.realpath(entry)) == cwd:
             continue
         for candidate in names:
             path = os.path.join(entry, candidate)

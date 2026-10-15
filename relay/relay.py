@@ -50,7 +50,26 @@ DEFAULTS = {
 }
 ROLLOVER_MODES = ("open", "copy")
 # Only a prompt that starts with the resume token continues a handoff; a mere mention does not.
-RELAY_RE = re.compile(r"^\s*relay:([a-f0-9]{8})\b")
+RELAY_RE = re.compile(r"^\s*relay:([a-f0-9]{8})\b", re.I)
+# Clients (VS Code, subagent hand-backs) prepend <tag ...>...</tag> blocks to the user's text.
+SYSTEM_BLOCK_RE = re.compile(r"\s*<([A-Za-z][\w:.-]*)(?:\s[^>]*)?>.*?</\1\s*>", re.S)
+
+
+def user_text(prompt):
+    """The prompt with any leading system blocks and surrounding whitespace removed."""
+    pos = 0
+    names = set()
+    while True:
+        m = SYSTEM_BLOCK_RE.match(prompt, pos)
+        if not m:
+            rest = prompt[pos:].strip()
+            # A leftover closing tag means a forged close ended a block early: fail safe.
+            for name in names:
+                if re.search(r"</\s*" + re.escape(name) + r"\b", rest, re.I):
+                    return ""
+            return rest
+        names.add(m.group(1))
+        pos = m.end()
 HANDOFF_CLOSE_RE = re.compile(r"<(\s*/\s*handoff)", re.IGNORECASE)
 MAX_TRANSCRIPT_BYTES = 8 << 20
 SWEEP_INTERVAL = 3600  # prompt-hook sweeps run at most hourly
@@ -100,10 +119,10 @@ def open_editor_prompt(next_prompt):
                   "it cannot be confirmed, so the prompt is copied as well.")
             return False
         else:
-            result = subprocess.run(["open", uri], check=False)
+            result = subprocess.run(["open", uri], check=False, timeout=15)
             if result.returncode != 0:
                 raise OSError(f"open exited {result.returncode}")
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"could not request editor session ({exc}); falling back to relay prompt.")
         return False
     print("editor session launch requested with the relay prompt pre-filled; press Enter there to continue.")
@@ -208,14 +227,14 @@ def _restrict_windows_state(path):
         raise OSError("could not locate the Windows system directory")
     system_dir = Path(system_dir.value)
     identity = subprocess.run([str(system_dir / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
-                              capture_output=True, text=True, check=True)
+                              capture_output=True, text=True, check=True, timeout=10)
     rows = list(csv.reader(identity.stdout.splitlines()))
     sid = rows[0][-1].strip() if rows and rows[0] else ""
     if not re.fullmatch(r"S-\d+(?:-\d+)+", sid):
         raise OSError("could not determine the current Windows user SID")
     subprocess.run([str(system_dir / "icacls.exe"), str(path), "/inheritance:r",
                     "/grant:r", f"*{sid}:F"],
-                   capture_output=True, text=True, check=True)
+                   capture_output=True, text=True, check=True, timeout=10)
 
 
 def save_state(session_id, state):
@@ -351,7 +370,7 @@ def classify_shift(jcfg, session_id, prompt, z):
     state = load_state(session_id)
     prev = state.get("recent_prompts") if isinstance(state.get("recent_prompts"), list) else []
     goal = state.get("handoff_goal") or ""
-    if not prev and not goal:
+    if not prompt.strip() or (not prev and not goal):
         return None, None
     start = time.monotonic()
     answers = jev_client.ask(jcfg, "shift", {
@@ -455,12 +474,18 @@ def gauge_context(data, cfg, session_id, prompt, continuing):
 def cmd_prompt():
     data = json.load(sys.stdin)
     cfg = config()
-    prompt = data.get("prompt") or ""
+    raw_prompt = data.get("prompt") or ""
+    prompt = user_text(raw_prompt)
     session_id = data.get("session_id") or "unknown"
     shift_on = _shift_enabled()
 
     m = RELAY_RE.match(prompt)
-    parts = [handoff_context(m.group(1), session_id, shift_on)] if m else []
+    parts = []
+    if m:
+        try:
+            parts.append(handoff_context(m.group(1).lower(), session_id, shift_on))
+        except OSError:
+            parts.append(f"[relay] Handoff {m.group(1).lower()} unreadable (I/O error). Tell the user.")
     try:
         sweep_if_due(cfg)
     except Exception:
@@ -475,7 +500,7 @@ def cmd_prompt():
         parts.append(gauge)
     if parts:
         emit_context("\n\n".join(parts))
-    if not m:
+    if not m and prompt:
         record_prompt(session_id, prompt)
 
 
@@ -697,7 +722,10 @@ def cmd_handoff(argv):
     HANDOFFS.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name == "nt":
         if new_dir:  # restricting an existing folder could strip inherited access from old handoffs
-            _restrict_windows_state(HANDOFFS)
+            try:
+                _restrict_windows_state(HANDOFFS)
+            except (subprocess.SubprocessError, OSError) as exc:
+                print(f"relay: warning: could not restrict the handoffs folder ({exc}).")
     else:
         os.chmod(HANDOFFS, 0o700)
     for _ in range(HANDOFF_ID_ATTEMPTS):
@@ -710,7 +738,10 @@ def cmd_handoff(argv):
     if session_id != "unknown":
         state = load_state(session_id)
         state["handoff_done"] = hid
-        save_state(session_id, state)
+        try:
+            save_state(session_id, state)
+        except (subprocess.SubprocessError, OSError) as exc:
+            print(f"relay: warning: could not record handoff state ({exc}).")
 
     next_prompt = f"relay:{hid} continue \"{title}\" from the handoff."
     print(f"handoff saved: {path}")
@@ -718,14 +749,20 @@ def cmd_handoff(argv):
     helper = CLAUDE_HOME / "bin" / "rollover-open.py"
     client = open_client() if do_open else "claude"
     if do_open and helper.is_file():
-        result = subprocess.run([sys.executable, str(helper), "open", "--client", client,
-                                 "--handoff", str(path), "--resume-token", f"relay:{hid}"],
-                                capture_output=True, text=True, encoding="utf-8")
-        if result.returncode == 0:
+        try:
+            # The helper waits up to ~15s for the bridge ack plus its own launch timeouts.
+            result = subprocess.run([sys.executable, str(helper), "open", "--client", client,
+                                     "--handoff", str(path), "--resume-token", f"relay:{hid}"],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=60)
+        except subprocess.TimeoutExpired:
+            result = None
+            print("handoff bridge timed out.")
+        if result is not None and result.returncode == 0:
             print(result.stdout.strip())
             return
-        print(f"handoff bridge failed (exit {result.returncode}): "
-              f"{result.stdout.strip()} {result.stderr.strip()}".strip())
+        if result is not None:
+            print(f"handoff bridge failed (exit {result.returncode}): "
+                  f"{result.stdout.strip()} {result.stderr.strip()}".strip())
     # A terminal session must not fall back to the extension panel; it gets the prompt instead.
     if do_open and client == "claude" and open_editor_prompt(next_prompt):
         return

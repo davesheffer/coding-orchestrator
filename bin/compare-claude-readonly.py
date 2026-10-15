@@ -4,18 +4,42 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import functools
 import json
+import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
 
 
+def resolve_executable(name):
+    """Absolute path of `name` from PATH, never from the current directory; None if absent.
+
+    A bare name given to CreateProcess (and shutil.which) is looked up in the current
+    directory first on Windows, so a repository could plant `claude.exe`. Empty, relative
+    and current-directory PATH entries are skipped for the same reason."""
+    exts = [e for e in os.environ.get('PATHEXT', '.COM;.EXE;.BAT;.CMD').split(';') if e]
+    if os.name != 'nt':
+        exts = ['']
+    cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+    for entry in os.environ.get('PATH', '').split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry) or os.path.normcase(os.path.realpath(entry)) == cwd:
+            continue
+        for ext in exts:
+            candidate = os.path.join(entry, name + ext)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+@functools.cache
 def executable():
-    wrapper = shutil.which('claude')
+    """Resolved once per process; a failed lookup is not cached."""
+    wrapper = resolve_executable('claude')
     if not wrapper:
-        raise RuntimeError('Claude Code is not installed on PATH')
+        raise RuntimeError('Claude Code is not installed on PATH (the current directory is never searched)')
     if sys.platform == 'win32':
         native = Path(wrapper).parent / 'node_modules/@anthropic-ai/claude-code/bin/claude.exe'
         if native.is_file():

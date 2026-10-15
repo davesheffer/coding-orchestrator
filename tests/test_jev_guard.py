@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -537,9 +538,13 @@ class GateTests(unittest.TestCase):
                                ('git commit -m "x" && bash -c "git push"', 1)):
             self.assertEqual(jev._push_signals(command), count, command)
         # The hardened scanner misses these, which is what the backstop is for.
-        for command in ('git "push" origin main', 'gi"t" push', 'bash -c "git push"',
+        for command in ('git "push" origin main', 'bash -c "git push"',
                         "git -c alias.p=push p"):
             self.assertEqual(jev._scan_targets(command, "/repo"), [], command)
+
+    def test_dequoted_command_word_is_parsed(self):
+        for command in ('gi"t" push', "'g'it push"):
+            self.assertEqual([t[0] for t in jev._scan_targets(command, "/repo")], ["push"], command)
 
     def test_unparsed_push_denied_once(self):
         command = 'bash -c "git push"'
@@ -1636,6 +1641,117 @@ class GateTests(unittest.TestCase):
             self.assertIsNone(out, command)
         self.assertEqual(self.calls, [])
 
+    def test_prefixed_and_quoted_commits_are_seen(self):
+        # Each shape is either parsed as a target or counted by the backstop.
+        for command, op in (("if git commit -m x; then echo ok; fi", "commit"),
+                            ("timeout 60 git commit -am x", "commit"),
+                            ('echo "`git commit -m x`"', "commit"),
+                            ("echo $'a\\'b' ; git commit -m 'x'", "commit"),
+                            ("'g'it commit -m x", "commit"),
+                            ("while ! git commit -m x; do :; done", "commit"),
+                            ("sudo -u bob git commit -m x", "commit"),
+                            ("nohup stdbuf -oL git commit -m x", "commit"),
+                            ("flock -w 5 /tmp/l git commit -m x", "commit"),
+                            ("watch git commit -m x", "commit"),
+                            ("ionice -c2 chrt -f 1 git commit -m x", "commit"),
+                            ("setsid unshare -r git commit -m x", "commit"),
+                            ("su -c 'git commit -m x'", "commit"),
+                            ("script -c 'git commit -m x' /dev/null", "commit"),
+                            ('bash -o pipefail -c "git commit -m x"', "commit"),
+                            ("fish -c 'git commit -m x'", "commit"),
+                            ('su - deploy -c "git commit -m x"', "commit"),
+                            ('su --command "git commit -m x"', "commit"),
+                            ('flock -w 10 ./lock -c "git commit -m x"', "commit"),
+                            ('bash -o pipefail -o errexit -o nounset -c "git commit -m x"',
+                             "commit"),
+                            ("bash -c $'git co\\x6dmit -m x'", "commit"),
+                            ("eval $'git pu\\x73h'", "push"),
+                            ("git $'co\\x6dmit' -m x", "commit"),
+                            ("git $'\\x70ush'", "push"),
+                            ("echo push | xargs git", "push")):
+            ops = [t[0] for t in jev._scan_targets(command, "/repo")]
+            signals = jev._push_signals(command) if op == "push" else jev._commit_signals(command)
+            self.assertTrue(op in ops or signals, command)
+
+    def test_unparsed_commit_denied_once(self):
+        self.stage_change()
+        command = "git 'commit' -m x"
+        self.assertEqual(jev._scan_targets(command, str(self.repo)), [])
+        out = self.gate(self.payload(command), classify_fn=self.classify())
+        hook = out["hookSpecificOutput"]
+        self.assertEqual(hook["permissionDecision"], "deny")
+        self.assertEqual(hook["permissionDecisionReason"], jev.UNPARSED_COMMIT_REASON)
+        self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
+                         ("deny", "unparsed_commit"))
+        # The identical retry is an override with no targets left: None.
+        self.assertIsNone(self.gate(self.payload(command), classify_fn=self.classify()))
+        self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
+                         ("override", "unparsed_commit"))
+        self.assertEqual(self.calls, [])
+
+    def test_commit_text_outside_command_position_is_not_a_hidden_commit(self):
+        for i, command in enumerate(("echo commit", "echo git.exe commit", "git status",
+                                     "grep -n commit file", "ls | xargs git add",
+                                     "git log --grep commit", "echo git commit",
+                                     'bash -c "echo git commit"',
+                                     'bash -o pipefail -c "echo git commit"',
+                                     "bash run.sh -c 'git commit -m x'",
+                                     "watch -n 1 git status", "flock /tmp/l git status",
+                                     "flock /tmp/l echo git commit",
+                                     "git log --format=$'%h\\t%s'",
+                                     "printf $'git\\tcommit\\n'")):
+            self.assertFalse([t for t in jev._scan_targets(command, "/repo") if t[0] == "commit"],
+                             command)
+            self.assertEqual(jev._commit_signals(command), 0, command)
+            out = self.gate(self.payload(command, session_id=f"cp{i}"), classify_fn=self.classify())
+            self.assertIsNone(out, command)
+        self.assertEqual(self.calls, [])
+
+    def test_cd_verbs_set_cwd(self):
+        j = os.path.join
+        for command in ("pushd sub && git commit -m x", "chdir sub; git commit -m x",
+                        "Set-Location sub; git commit -m x", "sl sub; git commit -m x"):
+            self.assertEqual([t[1] for t in jev._scan_targets(command, "/repo")],
+                             [j("/repo", "sub")], command)
+
+    def test_powershell_cd_keeps_backslash(self):
+        base = str(self.repo)
+        targets = jev._scan_targets("cd .\\pkg; git commit -m x", base, powershell=True)
+        self.assertEqual([os.path.normpath(t[1]) for t in targets],
+                         [os.path.normpath(os.path.join(base, "pkg"))])
+
+    def test_powershell_split_backslash_per_os(self):
+        token = jev._POWERSHELL.set(True)
+        try:
+            with mock.patch.object(jev.os, "sep", "/"):
+                self.assertEqual(jev._shell_split("cd .\\pkg\\sub"), ["cd", "./pkg/sub"])
+            with mock.patch.object(jev.os, "sep", "\\"):
+                self.assertEqual(jev._shell_split("cd '.\\pkg'"), ["cd", ".\\pkg"])
+        finally:
+            jev._POWERSHELL.reset(token)
+
+    def test_long_prefix_chain_scans_fast(self):
+        command = "timeout -k " * 2000 + "git commit"
+        self._assert_fast(lambda: (jev._scan_targets(command, "/repo"),
+                                   jev._commit_signals(command), jev._push_signals(command)),
+                          "timeout -k chain")
+
+    def test_many_quoted_words_count_fast(self):
+        command = "echo " + "'x' " * 80000 + "; git commit"
+        self._assert_fast(lambda: jev._commit_signals(command), "quoted words")
+        command = "echo " + "'x'" * 80000 + "; git commit"
+        self._assert_fast(lambda: jev._commit_signals(command), "quoted pieces of one word")
+        command = "echo " + "y" * 1_000_000 + " 'x'" * 40000 + "; git commit"
+        self._assert_fast(lambda: jev._commit_signals(command), "long word, quoted words")
+
+    def test_ansi_decode_is_silent(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            for command in ("echo $'\\e[1m'", "echo $'\\cA'", "echo $'\\777'",
+                            "bash -c $'echo \\e[1m'"):
+                jev._push_signals(command)
+                jev._commit_signals(command)
+
     def test_native_path_translates_msys_drive_on_windows(self):
         with mock.patch.object(jev.os, "name", "nt"):
             self.assertEqual(jev._native_path("/c/Users/me/repo"), "C:/Users/me/repo")
@@ -2302,6 +2418,25 @@ class GateTests(unittest.TestCase):
             started = time.monotonic()
             jev._scrub(text)
             self.assertLess(time.monotonic() - started, 3.0, text[:40])
+
+
+class StateAndReportInputTests(unittest.TestCase):
+    def test_non_dict_state_reads_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = jev.session_state_path("sess1", tmp)
+            for text in ("[]", '"x"'):
+                path.write_text(text, encoding="utf-8")
+                self.assertEqual(jev.load_session_state("sess1", tmp), {}, text)
+            state = {"note": "café שלום ✓"}
+            jev.save_session_state("sess1", state, tmp)
+            self.assertEqual(jev.load_session_state("sess1", tmp), state)
+
+    def test_report_text_skips_non_str_items(self):
+        content = [{"type": "text", "text": None}, {"type": "text", "text": 5},
+                   {"type": "text", "text": "ok"}, {"type": "text", "text": ["x"]}]
+        self.assertEqual(jev._extract_report_text({"content": content}), "ok")
+        self.assertEqual(jev._extract_report_text([{"text": 1}, "a", {"text": "b"}]), "ab")
+        self.assertEqual(jev._extract_report_text({"result": 3}), "")
 
 
 class AgentDoneTests(unittest.TestCase):

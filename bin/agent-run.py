@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -46,12 +45,34 @@ def overrides(settings):
     return [part for key, value in settings.items() for part in ('-c', key + '=' + toml(value))]
 
 
+def resolve_executable(name):
+    """Absolute path of `name` from PATH, never from the current directory; None if absent.
+
+    A bare name given to CreateProcess (and shutil.which) is looked up in the current
+    directory first on Windows, so a repository could plant `codex.exe`. Empty, relative
+    and current-directory PATH entries are skipped for the same reason."""
+    exts = [e for e in os.environ.get('PATHEXT', '.COM;.EXE;.BAT;.CMD').split(';') if e]
+    if os.name != 'nt':
+        exts = ['']
+    cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+    for entry in os.environ.get('PATH', '').split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry) or os.path.normcase(os.path.realpath(entry)) == cwd:
+            continue
+        for ext in exts:
+            candidate = os.path.join(entry, name + ext)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
 def executable():
     if sys.platform != 'win32':
         raise RuntimeError('This restricted launcher currently supports Windows only; use verified native roles or keep the task in the main session')
-    command = shutil.which('codex')
+    command = resolve_executable('codex')
     if not command:
-        raise RuntimeError('codex is not installed on PATH')
+        raise RuntimeError('codex is not installed on PATH (the current directory is never searched)')
+    # Absolute, so the vendor binary below is never looked up relative to the cwd.
     path = Path(command)
     if path.suffix.lower() == '.exe':
         return str(path)

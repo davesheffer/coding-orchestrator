@@ -13,6 +13,12 @@ record below distinguishes offline configuration checks from live agent behavior
 ## Experimental release validation — 2026-09-22
 
 Local environment: Windows, Python 3.12, Codex CLI 0.155.1, Claude Code 2.1.278.
+
+> Historical snapshot: the test and job counts below describe the commit tested at
+> the time and are not current. Role models named in this record (Haiku scout,
+> Sonnet runner) reflect the routing then in effect; the current routing is
+> scout and builder on Sonnet, runner on Haiku, critic on Fable.
+
 Each installer was run against a disposable assistant home; no credentials were
 copied into that home or into this repository.
 
@@ -41,6 +47,8 @@ compaction run, or editor-session-opening test has been completed. These remain
 release limitations and are why the public bundle is labeled experimental.
 
 ### Routing optimization follow-up — 2026-09-23
+
+_Historical snapshot: test counts and role models below are as observed on that date._
 
 The same Windows clients were checked after the routing update. A fresh disposable
 Codex install completed and `codex debug prompt-input` loaded its configuration

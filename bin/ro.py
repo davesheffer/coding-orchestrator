@@ -17,10 +17,11 @@ GIT_BASE = ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.pager
 CONFIG_RX = (r"^(filter\..*\.(clean|smudge|process)|core\.fsmonitor|core\.hookspath|"
              r"diff\..*\.(command|textconv)|core\.(pager|editor|sshcommand|askpass|gitproxy)|"
              r"include\.path|includeif\..*|gpg\..*|log\.showsignature)$")
-REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./^~@:-]*$")
-PATH_RE = re.compile(r"^[^\x00-\x1f]+$")
-NUM_RE = re.compile(r"^\d{1,7}$")
-RANGE_RE = re.compile(r"^\d+,\d+$")
+# Always used with fullmatch: `$` with match would also accept a trailing newline.
+REF_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./^~@:-]*")
+PATH_RE = re.compile(r"[^\x00-\x1f]+")
+NUM_RE = re.compile(r"\d{1,7}")
+RANGE_RE = re.compile(r"\d+,\d+")
 TIMEOUT = 60
 
 
@@ -29,7 +30,7 @@ class UsageError(Exception):
 
 
 def check_ref(ref: str) -> str:
-    if not REF_RE.match(ref) or ref.startswith("-") or ".." in ref:
+    if not REF_RE.fullmatch(ref) or ref.startswith("-") or ".." in ref:
         raise UsageError(f"bad ref: {ref!r}")
     return ref
 
@@ -45,7 +46,7 @@ def check_range(spec: str) -> str:
 
 
 def check_path(path: str) -> str:
-    if path.startswith("-") or "\x00" in path or not PATH_RE.match(path):
+    if path.startswith("-") or "\x00" in path or not PATH_RE.fullmatch(path):
         raise UsageError(f"bad path: {path!r}")
     return path
 
@@ -57,7 +58,7 @@ def build_argv(verb: str, args: list[str]) -> list[str]:
             raise UsageError(f"{verb} takes no arguments")
         return ["gh", "issue" if verb == "issues" else "pr", "list", "--limit", "30"]
     if verb in ("issue", "pr"):
-        if len(args) != 1 or not NUM_RE.match(args[0]):
+        if len(args) != 1 or not NUM_RE.fullmatch(args[0]):
             raise UsageError(f"{verb} takes one number")
         return ["gh", verb, "view", args[0]]
     if verb == "status":
@@ -68,7 +69,7 @@ def build_argv(verb: str, args: list[str]) -> list[str]:
         rest = list(args)
         span: list[str] = []
         if len(rest) >= 3 and rest[-2] == "-L":
-            if not RANGE_RE.match(rest[-1]):
+            if not RANGE_RE.fullmatch(rest[-1]):
                 raise UsageError("bad -L range")
             span = ["-L", rest[-1]]
             rest = rest[:-2]
@@ -90,7 +91,7 @@ def build_argv(verb: str, args: list[str]) -> list[str]:
     while i < len(head):
         token = head[i]
         if verb == "log" and token == "-n":
-            if i + 1 >= len(head) or not NUM_RE.match(head[i + 1]) or not 1 <= int(head[i + 1]) <= 500:
+            if i + 1 >= len(head) or not NUM_RE.fullmatch(head[i + 1]) or not 1 <= int(head[i + 1]) <= 500:
                 raise UsageError("-n takes an integer 1..500")
             count = int(head[i + 1])
             i += 2
@@ -147,7 +148,7 @@ def local_config_violation(env: dict[str, str]) -> str | None:
     argv = [resolve("git"), "--no-pager", "config", "--show-scope", "--includes", "--get-regexp",
             CONFIG_RX]
     done = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True,
-                          text=True, timeout=TIMEOUT)
+                          text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT)
     if done.returncode == 1:
         return None
     if done.returncode != 0:

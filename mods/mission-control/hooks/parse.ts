@@ -6,7 +6,10 @@ export const ROLES = ['scout', 'runner', 'builder', 'critic'] as const
 
 const FIELDS = ['RESULT', 'EVIDENCE', 'CONFIDENCE', 'UNVERIFIED'] as const
 
-const HEADER = /^[ \t>#*_\-]*(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)\b[ \t*_]*[:\-–—]?[ \t]*(.*)$/i
+// Uppercase and a colon, so prose like "Result was fine" is not taken for a header.
+const HEADER = /^[ \t>#*_\-]*(RESULT|EVIDENCE|CONFIDENCE|UNVERIFIED)[ \t*_]*:[ \t]*(.*)$/
+
+const LEVELS = ['high', 'medium', 'med', 'low']
 
 const NOTHING = /^(none|n\/?a|nothing|-+|—|\(none\)|no(ne)? unverified.*)\.?$/i
 
@@ -48,7 +51,7 @@ export function parseCard(answer: string): ParsedCard {
 
     if (header !== null) {
       const [, name = '', rest = ''] = header
-      current = name.toUpperCase()
+      current = name
       sections.set(current, rest.trim() === '' ? [] : [rest.trim()])
     } else if (current !== undefined) {
       sections.get(current)?.push(line)
@@ -57,7 +60,9 @@ export function parseCard(answer: string): ParsedCard {
 
   const missing = FIELDS.filter(field => !sections.has(field))
   const confidenceText = (sections.get('CONFIDENCE') ?? []).join(' ').toLowerCase()
-  const level = /\b(high|medium|med|low)\b/.exec(confidenceText)?.[1]
+  // The first word only: "not high" is no claim of high.
+  const word = /^[^a-z]*([a-z]+)/.exec(confidenceText)?.[1] ?? ''
+  const level = LEVELS.includes(word) ? word : undefined
   const confidence: Confidence =
     level === undefined ? 'missing' : level === 'med' ? 'medium' : (level as Confidence)
 
@@ -68,7 +73,8 @@ export function parseCard(answer: string): ParsedCard {
   const bullets = realItems.filter(line => BULLET.test(line)).length
   const unverified = realItems.length === 0 ? 0 : Math.max(1, bullets)
 
-  const exitCodes = [...answer.matchAll(/\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)\b/gi)].map(match =>
+  // `exit 0`, `exit code: 1`, and JSON's `"exit_code": 2`.
+  const exitCodes = [...answer.matchAll(/\bexit(?:[\s_]+code)?"?\s*[:=]?\s*(-?\d+)\b/gi)].map(match =>
     Number(match[1]),
   )
 
@@ -189,7 +195,10 @@ export function jevStatus(lines: JevLine[], today: string, isEnabled: boolean): 
   let weakToday = 0
 
   for (const line of newestFirst) {
-    if (!text(line.ts).startsWith(today)) break
+    const ts = text(line.ts)
+    // A line without a stamp says nothing about the day: skip it, stop at the first older one.
+    if (ts === '') continue
+    if (!ts.startsWith(today)) break
     if (line.kind === 'usage' && typeof line.usd === 'number') spendToday += line.usd
     if (line.feature === 'risk_gate' && line.decision === 'deny') deniesToday += 1
     if (line.feature === 'report_check' && (line.decision === 'deny' || line.decision === 'weak')) weakToday += 1
@@ -227,9 +236,11 @@ export function kTokens(n: number | undefined): string {
 }
 
 export function bar(fraction: number, cells: number): string {
-  const filled = Math.max(0, Math.min(cells, Math.round(fraction * cells)))
+  // A narrow pane can ask for no cells or fewer: draw nothing rather than throw.
+  const width = Math.max(0, cells)
+  const filled = Math.max(0, Math.min(width, Math.round(fraction * width)))
 
-  return '█'.repeat(filled) + '░'.repeat(cells - filled)
+  return '█'.repeat(filled) + '░'.repeat(width - filled)
 }
 
 export function seconds(ms: number): string {
@@ -246,9 +257,10 @@ export function clockTime(ms: number): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-// Hunch: calls through its MCP server (`mcp__hunch__hunch_context`) or its CLI through Bash.
+// Hunch: calls through its MCP server (`mcp__hunch__hunch_context`, or `mcp__plugin_hunch_hunch__hunch_context`
+// when the Hunch plugin provides it) or its CLI through Bash.
 
-const HUNCH_MCP = /^mcp__hunch__(?:hunch_)?(.+)$/
+const HUNCH_MCP = /^mcp__(?:plugin_hunch_)?hunch__(?:hunch_)?(.+)$/
 
 const TASK_ID = /\bhtask_[a-f0-9]{24}\b/
 
@@ -282,6 +294,11 @@ export type HunchOutcome = {
   verdict?: 'BLOCK' | 'WARN' | 'PASS'
   exitCode?: number
   taskId?: string
+}
+
+/** An invariant severity worth a toast: `warning` or a blocking one; advisory and info stay in the pane. */
+export function isToastSeverity(severity: string): boolean {
+  return /^warn(ing)?$/i.test(severity) || BLOCKING.test(severity)
 }
 
 export function maxLevel(a: HunchLevel, b: HunchLevel): HunchLevel {

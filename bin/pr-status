@@ -21,11 +21,33 @@ import subprocess
 import sys
 
 FIELDS = "number,title,headRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,author"
-BAD = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+# STALE is a final conclusion (GitHub gave up on an incomplete check), so it is a
+# finished check that did not pass, never one to keep waiting for.
+BAD = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}
 OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 
+def resolve_executable(name, exts):
+    """Absolute path of `name` + one of `exts` from PATH, never from the current directory.
+
+    On Windows a bare name given to CreateProcess (and shutil.which) is looked up in
+    the current directory first, so a repository could plant `gh.exe`. Empty, relative
+    and current-directory PATH entries are skipped for the same reason. Returns None
+    when nothing is found."""
+    cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry) or os.path.normcase(os.path.realpath(entry)) == cwd:
+            continue
+        for ext in exts:
+            path = os.path.join(entry, name + ext)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
 def wrapper_command():
+    """The agent-gh wrapper, else gh from PATH as an absolute path; None when neither exists."""
     base = os.path.expanduser("~/.hunch/agent-gh")
     if sys.platform == "win32":
         # Only .com/.exe are safe to launch directly (.bat/.cmd would pass arguments
@@ -34,12 +56,15 @@ def wrapper_command():
         for ext in (".com", ".exe"):
             if os.path.isfile(base + ext):
                 return base + ext
-        return "gh"
-    return base if os.access(base, os.X_OK) else "gh"
+        return resolve_executable("gh", (".com", ".exe"))
+    return base if os.access(base, os.X_OK) else resolve_executable("gh", ("",))
 
 
 def gh(*args):
     exe = wrapper_command()
+    if exe is None:
+        sys.exit(f"pr-status: {' '.join(args[:3])} could not run gh: not found on PATH "
+                 "(the current directory is never searched)")
     try:
         r = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=60)

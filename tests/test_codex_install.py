@@ -503,6 +503,73 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertNotIn(message, again.stdout)
 
+    def test_bom_prefixed_hooks_and_config_are_accepted(self):
+        self.home.mkdir()
+        bom = b"\xef\xbb\xbf"
+        config = bom + b'[agents]\nenabled = false\n'
+        user_group = {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-hook"}]}
+        self.home.joinpath("config.toml").write_bytes(config)
+        self.home.joinpath("hooks.json").write_bytes(bom + json.dumps({"hooks": {"PreToolUse": [user_group]}}).encode())
+        result = self.run_install("--jev", "--configure-routing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = self.home.joinpath("config.toml").read_bytes()
+        self.assertTrue(updated.startswith(bom + b'[agents]\ndefault_subagent_model = "gpt-6-luna"\n'), updated)
+        hooks = json.loads(self.home.joinpath("hooks.json").read_text(encoding="utf-8"))["hooks"]
+        self.assertEqual(hooks["PreToolUse"][0], user_group)
+        self.assertEqual(len(hooks["PreToolUse"]), 2)
+        before = self.snapshot()
+        self.assertEqual(self.run_install("--jev", "--configure-routing").returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_lone_surrogate_escape_in_user_json_does_not_crash_merge(self):
+        prior = b'{"note": "\\ud83d"}'
+        out = install_module.merge_jev_config(Path("config.json"), prior, True)
+        self.assertEqual(json.loads(out)["note"], "\ud83d")
+        self.assertIs(json.loads(out)["jev"]["enabled"], True)
+        hooks = install_module.merge_jev_hooks(Path("hooks.json"), b'{"note": "\\ud83d"}', self.home, True)
+        self.assertEqual(json.loads(hooks)["note"], "\ud83d")
+
+    def test_hooks_json_without_owned_hooks_is_never_rewritten(self):
+        for original in (b'{"foo": 1}\n', b'{"hooks": {"Stop": []}}\n', b'{"hooks": {}}'):
+            with self.subTest(original=original):
+                path = Path("hooks.json")
+                self.assertEqual(install_module.merge_jev_hooks(path, original, self.home, False), original)
+                shutil.rmtree(self.home, ignore_errors=True)
+                self.home.mkdir()
+                self.home.joinpath("hooks.json").write_bytes(original)
+                result = self.run_install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("hooks.json", result.stdout)
+                self.assertEqual(self.home.joinpath("hooks.json").read_bytes(), original)
+                on = self.run_install("--jev")
+                self.assertEqual(on.returncode, 0, on.stderr)
+                before = self.snapshot()
+                again = self.run_install("--jev")
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertNotIn("write", again.stdout)
+                self.assertEqual(self.snapshot(), before)
+                off = self.run_install()
+                self.assertEqual(off.returncode, 0, off.stderr)
+                restored, expected = json.loads(self.home.joinpath("hooks.json").read_bytes()), json.loads(original)
+                self.assertEqual(restored.pop("hooks"), expected.pop("hooks", {}))
+                self.assertEqual(restored, expected)
+
+    def test_writable_roles_must_exclude_tmp(self):
+        for name in ("runner", "builder"):
+            source = ROOT / "codex" / "agents" / f"{name}.toml"
+            data = source.read_bytes()
+            install_module.validate_role(source, data, name)
+            for line in (b"exclude_slash_tmp = true", b"exclude_tmpdir_env_var = true"):
+                with self.subTest(name=name, line=line):
+                    self.assertIn(line, data)
+                    for replacement in (b"", line.replace(b"true", b"false")):
+                        with self.assertRaisesRegex(ValueError, "exclude /tmp"):
+                            install_module.validate_role(source, data.replace(line, replacement), name)
+        # Read-only roles are not held to the writable-sandbox keys.
+        for name in ("scout", "critic"):
+            source = ROOT / "codex" / "agents" / f"{name}.toml"
+            install_module.validate_role(source, source.read_bytes(), name)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -245,10 +245,47 @@ class RoutingTests(unittest.TestCase):
                 agent.approved_roles()
 
     def test_non_windows_launcher_refuses_before_launch(self):
-        with patch.object(agent.sys, 'platform', 'linux'), patch.object(agent.shutil, 'which') as lookup:
+        with patch.object(agent.sys, 'platform', 'linux'), patch.object(agent, 'resolve_executable') as lookup:
             with self.assertRaisesRegex(RuntimeError, 'Windows only'):
                 agent.executable()
             lookup.assert_not_called()
+
+    def test_codex_planted_in_cwd_is_never_resolved(self):
+        """Planted files are only inspected, never run."""
+        with tempfile.TemporaryDirectory() as temp:
+            cwd, tools = Path(temp) / 'repo', Path(temp) / 'tools'
+            for folder in (cwd, tools, cwd / 'sub'):
+                folder.mkdir()
+            for name in ('codex', 'codex.exe', 'codex.cmd'):
+                (cwd / name).write_text('planted')
+                (cwd / name).chmod(0o755)
+            path = os.pathsep.join(['', '.', 'sub', str(cwd)])
+            with contextlib.chdir(cwd), patch.dict(os.environ, {'PATH': path, 'PATHEXT': '.EXE;.CMD'}), \
+                 patch.object(agent.sys, 'platform', 'win32'):
+                self.assertIsNone(agent.resolve_executable('codex'))
+                with self.assertRaisesRegex(RuntimeError, 'not installed on PATH'):
+                    agent.executable()
+            real = tools / ('codex.exe' if os.name == 'nt' else 'codex')
+            real.write_text('tool')
+            real.chmod(0o755)
+            path = os.pathsep.join(['.', str(cwd), str(tools)])
+            with contextlib.chdir(cwd), patch.dict(os.environ, {'PATH': path, 'PATHEXT': '.EXE;.CMD'}):
+                self.assertEqual(agent.resolve_executable('codex').lower(), str(real).lower())
+
+    @unittest.skipUnless(os.name == 'nt', 'npm shim layout is Windows-specific')
+    def test_npm_shim_resolves_vendor_binary_beside_the_shim_not_the_cwd(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cwd, tools = Path(temp) / 'repo', Path(temp) / 'tools'
+            vendor_rel = ('node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/'
+                          'vendor/x86_64-pc-windows-msvc/bin/codex.exe')
+            for base in (cwd, tools):
+                (base / vendor_rel).parent.mkdir(parents=True)
+                (base / vendor_rel).write_text('binary')
+            (tools / 'codex.cmd').write_text('shim')
+            with contextlib.chdir(cwd), patch.dict(os.environ, {'PATH': str(tools), 'PATHEXT': '.EXE;.CMD'}):
+                found = agent.executable()
+            self.assertTrue(os.path.isabs(found))
+            self.assertEqual(Path(found), tools / vendor_rel)
 
     def test_workspace_cannot_contain_user_consent_home(self):
         with patch.object(agent, 'ROOT', Path.cwd() / '.codex'):
