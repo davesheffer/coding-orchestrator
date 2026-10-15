@@ -1,7 +1,7 @@
 ---
 name: runner
 description: Run an exact command and report its exit code and relevant failures. Use for noisy offline tests and builds; do not diagnose or repair failures.
-model: sonnet
+model: haiku
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: dontAsk

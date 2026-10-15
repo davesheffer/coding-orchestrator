@@ -31,7 +31,7 @@ sending messages stay with the orchestrator and the user's authorization.
 |---|---|---|---|
 | Orchestrator | Design, ambiguity, root causes, final verification | Opus 5.5 | GPT-6.1 Sol / medium |
 | `scout` | Read-only lookup and reconnaissance | Sonnet | GPT-6 Luna / low |
-| `runner` | Exact commands; exit codes and verbatim failures | Sonnet | GPT-6 Luna / low |
+| `runner` | Exact commands; exit codes and verbatim failures | Haiku | GPT-6 Luna / low |
 | `builder` | A specified change, then its acceptance check | Sonnet | GPT-6.1 Sol / medium |
 | `critic` | Fresh-context adversarial review | Fable | GPT-6 Astra / high |
 

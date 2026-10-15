@@ -26,7 +26,7 @@ building. Works with **Claude Code** and **Codex**.
 |---|---|---|---|
 | **Boss** (orchestrator) | Plans, decides, checks the final result | Opus 5.5 | GPT-6.1 Sol |
 | `scout` | Finds and reads code | Sonnet | GPT-6 Luna |
-| `runner` | Runs tests and builds, reports exact results | Sonnet | GPT-6 Luna |
+| `runner` | Runs tests and builds, reports exact results | Haiku | GPT-6 Luna |
 | `builder` | Makes a change that's already been decided | Sonnet | GPT-6.1 Sol |
 | `critic` | Fresh eyes: tries to prove the work is wrong | Fable | GPT-6 Astra |
 
