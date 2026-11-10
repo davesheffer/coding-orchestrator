@@ -14,7 +14,7 @@ The main session owns the request, design, root cause, judgment, verification, a
 | Adversarial review of risky changes or claims | critic | Fable 5.2 |
 | Design, ambiguity, security/concurrency decisions | main session | Opus 5.5 |
 
-Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and `sonnet` for bounded reading and specified implementation; reserve `fable` (Fable 5.2, `claude-fable-5-2`) for the critic and builder escalation. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work.
+Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and `sonnet` for bounded reading and specified implementation; reserve `fable` (currently Fable 5.2) for the critic and builder escalation. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work.
 
 - Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
 - Launch independent, delegation-sized units together; respect concurrency limits and avoid overlapping edits. Large Workflow orchestration with dozens of agents requires an explicit user request.
@@ -29,7 +29,7 @@ Provide goal, exact paths/ranges, applicable project rules, constraints, accepta
 
 Require `RESULT / EVIDENCE / CONFIDENCE / UNVERIFIED`, with actual check exit codes. Read builder diffs and require checks after the last edit. Missing evidence, low/medium confidence, or material unverified claims require direct verification or escalation (scout/runner to builder/main; builder to main), not the same retry.
 
-Builder escalation: count critic verdicts on builder-made revisions of one change; critic rounds on fixes the main session makes itself do not count. After 4 verdicts other than SHIP, run later rounds as `builder` with `model: "fable"` (Fable 5.2), briefed with the spec, the unresolved findings and the current diff. A RETHINK means the spec is wrong: revise the spec in the main session before the next builder round; the count carries on. If the Fable builder has no SHIP after 2 more rounds, stop and report to the user. The weak-report escalation above still applies within each round. With Jev installed, set `respect_explicit_model: true` (or add `builder` to `pinned_agents`) in `relay/config.json`, or the route hook may move the call back to Sonnet.
+Builder escalation: count every critic verdict on the builder's work for one change, starting with the first; RETHINK counts and nothing resets the count, while critic runs on fixes the main session made alone, or runs that end without a verdict, do not count. After 4 verdicts without SHIP, run later rounds as `builder` with `model: "fable"`, briefed with the spec, the unresolved findings and the current diff; after a RETHINK, revise the spec in the main session first. If 2 Fable builder rounds (6 verdicts in total) still have no SHIP, stop and report to the user. The weak-report escalation above still applies within each round. Record the count in a handoff's STATE. If Jev routing is on, its route hook may downgrade the Fable call; the orchestrator's `docs/reference.md` lists the user settings that prevent it.
 
 Risky or irreversible work requires critic review before completion. Resolve findings and report the actual verdict. Role tool lists and permission modes must be checked against effective client permissions; wording alone does not enforce a sandbox. Do not broaden permissions to make a check pass.
 

@@ -51,13 +51,13 @@ The Claude installer sets `claude-opus-5-5` as the main-session default when no
 model is already selected in user settings; existing explicit choices remain
 untouched. Its named scout and builder roles use Sonnet, its runner uses Haiku, and its critic
 uses Fable. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
-follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
+follow the client's current model (`fable` currently resolves to Fable 5.2, `claude-fable-5-2`): Claude Code 2.1.284 resolves `sonnet` to
 Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
 [Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
 is required for Opus 5.5. These are routing defaults, not a promise of access on every plan.
 Check your model picker and adjust the role definitions for your account.
 
-When the critic has returned 4 verdicts other than SHIP on builder-made revisions of one change, the Claude instructions move later rounds to `builder` with `model: "fable"`, and stop to report to the user if 2 more rounds still have no SHIP. With Jev routing on, set `respect_explicit_model: true` or add `builder` to `pinned_agents`; otherwise the route hook may move that call back to Sonnet.
+When the critic has returned 4 verdicts without SHIP on the builder's work for one change, the Claude instructions move later rounds to `builder` with `model: "fable"`, and stop to report to the user if 2 Fable builder rounds still have no SHIP. With Jev routing on, the route hook may downgrade that call. To keep it, set one of these under the `jev` key of the installed `relay/config.json`: `"respect_explicit_model": true` (no call that sets `model` is rerouted, including built-in agents given `haiku` or `sonnet`), or `"pinned_agents": ["critic", "fork", "builder"]` (the list replaces the default, so keep `critic` and `fork`; builder calls then lose Jev's Sonnet-to-Opus upgrade).
 
 ## Install
 
