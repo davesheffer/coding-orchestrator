@@ -10,7 +10,7 @@ The main session owns the request, design, root cause, judgment, verification, a
 | Locate, read, summarize | scout | Sonnet |
 | Run exact test/build commands and distill output | runner | Haiku |
 | Implement an already specified change | builder | Sonnet |
-| Same change after 4 critic rounds without SHIP | builder | Fable 5.2 |
+| Builder change after 4 critic verdicts without SHIP | builder | Fable 5.2 |
 | Adversarial review of risky changes or claims | critic | Fable 5.2 |
 | Design, ambiguity, security/concurrency decisions | main session | Opus 5.5 |
 
@@ -29,7 +29,7 @@ Provide goal, exact paths/ranges, applicable project rules, constraints, accepta
 
 Require `RESULT / EVIDENCE / CONFIDENCE / UNVERIFIED`, with actual check exit codes. Read builder diffs and require checks after the last edit. Missing evidence, low/medium confidence, or material unverified claims require direct verification or escalation (scout/runner to builder/main; builder to main), not the same retry.
 
-Builder escalation: count critic rounds on each builder change. After 4 rounds where the critic returned FIX FIRST or RETHINK instead of SHIP, run every later round as `builder` with `model: "fable"` (Fable 5.2), briefed with all earlier findings and the current diff. Fixes the main session makes itself are not builder rounds.
+Builder escalation: count critic verdicts on builder-made revisions of one change; critic rounds on fixes the main session makes itself do not count. After 4 verdicts other than SHIP, run later rounds as `builder` with `model: "fable"` (Fable 5.2), briefed with the spec, the unresolved findings and the current diff. A RETHINK means the spec is wrong: revise the spec in the main session before the next builder round; the count carries on. If the Fable builder has no SHIP after 2 more rounds, stop and report to the user. The weak-report escalation above still applies within each round. With Jev installed, set `respect_explicit_model: true` (or add `builder` to `pinned_agents`) in `relay/config.json`, or the route hook may move the call back to Sonnet.
 
 Risky or irreversible work requires critic review before completion. Resolve findings and report the actual verdict. Role tool lists and permission modes must be checked against effective client permissions; wording alone does not enforce a sandbox. Do not broaden permissions to make a check pass.
 
