@@ -352,6 +352,7 @@ class ClaudeInstallTests(unittest.TestCase):
         env = dict(os.environ)
         env.pop("CLAUDE_HOME", None)
         env["HOME"] = str(Path(self.temp.name) / "unrelated-home")
+        env["CLAUDE_RELAY_NO_CLIPBOARD"] = "1"  # never write the real clipboard
         relay = self.home / "relay/relay.py"
         body = "GOAL: preserve Unicode \u05e9\u05dc\u05d5\u05dd \U0001f680\nNEXT STEP: verify installed handoff"
         handoff = subprocess.run([sys.executable, str(relay), "handoff", "--no-open"],
@@ -633,6 +634,7 @@ class ClaudeInstallTests(unittest.TestCase):
         env = dict(os.environ)
         env.pop("CLAUDE_HOME", None)
         env["HOME"] = str(Path(self.temp.name) / "unrelated-home")
+        env["CLAUDE_RELAY_NO_CLIPBOARD"] = "1"  # never write the real clipboard
         relay = self.home / "relay/relay.py"
         instructions = self.home.joinpath("CLAUDE.md").read_text(encoding="utf-8")
         self.assertIn(f"{install_module.hook_python()} {shlex.quote(str(relay))} handoff", instructions)

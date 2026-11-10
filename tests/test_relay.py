@@ -24,7 +24,8 @@ class RelayTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR"))
         self.home = Path(self.temp.name) / "claude"
-        self.env = os.environ | {"CLAUDE_HOME": str(self.home)}
+        # Child relays must never write the developer's real clipboard.
+        self.env = os.environ | {"CLAUDE_HOME": str(self.home), "CLAUDE_RELAY_NO_CLIPBOARD": "1"}
         self.env.pop("CLAUDE_RELAY_ROLLOVER", None)
 
     def tearDown(self):
@@ -79,6 +80,16 @@ class RelayTests(unittest.TestCase):
         files = list((self.home / "relay/handoffs").glob("*.md"))
         self.assertEqual(len(files), 1)
         self.assertIn("GOAL: continue", files[0].read_text(encoding="utf-8"))
+        self.assertIn("clipboard unavailable", result.stdout)
+
+    def test_no_clipboard_switch_skips_the_clipboard_tools(self):
+        self.assertEqual(self.env["CLAUDE_RELAY_NO_CLIPBOARD"], "1")
+        with patch.dict(os.environ, {"CLAUDE_RELAY_NO_CLIPBOARD": "1"}), \
+                patch.object(relay_module, "resolve_executable", side_effect=lambda n: f"/abs/{n}"), \
+                patch.object(relay_module.subprocess, "run") as run:
+            self.assertEqual(relay_module.clipboard_commands(), [])
+            self.assertFalse(relay_module.copy_to_clipboard("relay:1234abcd"))
+        run.assert_not_called()
 
     def test_windows_editor_handoff_requests_new_claude_tab_but_is_unconfirmed(self):
         with patch.object(relay_module.sys, "platform", "win32"), \
@@ -201,6 +212,7 @@ class RelayTests(unittest.TestCase):
         self.env.update({"PATH": str(fake_bin), "CLIP_OUT": str(clip_out),
                          "CLAUDE_CODE_ENTRYPOINT": "claude-vscode",
                          "__CFBundleIdentifier": "com.microsoft.VSCode"})
+        self.env.pop("CLAUDE_RELAY_NO_CLIPBOARD", None)  # PATH holds only the fake tools
         return marker, clip_out
 
     def handoff(self, *args):
@@ -591,15 +603,21 @@ class RelayTests(unittest.TestCase):
 
     def test_resume_turn_injects_handoff_even_if_gauge_path_throws(self):
         self.seed_handoff("GOAL: old task\nSTATE: ready")
-        (self.home / "relay").mkdir(parents=True, exist_ok=True)
-        # A misconfigured (string) task_shift_min_tokens makes the `tokens <
-        # cfg["task_shift_min_tokens"]` comparison in gauge_context raise; the
-        # handoff must still be injected.
-        (self.home / "relay/config.json").write_text(
-            json.dumps({"task_shift_min_tokens": "30000"}), encoding="utf-8")
-        context = self.prompt_context("relay:1234abcd continue", tokens=50000)
+        payload = json.dumps({"session_id": "s1", "prompt": "relay:1234abcd continue",
+                              "transcript_path": str(self.transcript(50000))})
+        out = io.StringIO()
+        # Whatever makes the gauge path raise, the handoff must still be injected.
+        with patch.object(relay_module, "HANDOFFS", self.home / "relay/handoffs"), \
+                patch.object(relay_module, "STATE", self.home / "relay/state"), \
+                patch.object(relay_module, "ROOT", self.home / "relay"), \
+                patch.object(relay_module, "gauge_context", side_effect=TypeError("bad gauge")), \
+                patch.object(relay_module.sys, "stdin", io.StringIO(payload)), \
+                contextlib.redirect_stdout(out):
+            relay_module.cmd_prompt()
+        context = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
         self.assertIn('<handoff id="1234abcd">', context)
         self.assertIn("CONTINUES", context)
+        self.assertNotIn("context ~", context)
 
     def test_empty_session_id_env_is_treated_as_unknown(self):
         body = "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks"
@@ -639,12 +657,247 @@ class RelayTests(unittest.TestCase):
             self.assertEqual(relay_module.git("c", "status"), "out")
         self.assertEqual(run.call_args.args[0][:3], ["/abs/git", "-C", "c"])
         with patch.object(relay_module, "resolve_executable", side_effect=lambda n: f"/abs/{n}"), \
-                patch.object(relay_module.sys, "platform", "win32"):
+                patch.object(relay_module.sys, "platform", "win32"),                 patch.dict(os.environ):
+            os.environ.pop("CLAUDE_RELAY_NO_CLIPBOARD", None)
             self.assertEqual(relay_module.clipboard_commands(), [["/abs/clip"]])
 
     def test_resolve_executable_ignores_relative_path_entries(self):
         with patch.dict(os.environ, {"PATH": os.pathsep.join(["", ".", "rel"])}):
             self.assertIsNone(relay_module.resolve_executable("git"))
+
+    def test_synthetic_zero_usage_entry_does_not_hide_the_real_usage(self):
+        zero = {"input_tokens": 0, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0, "output_tokens": 0}
+        real = {"type": "assistant", "isSidechain": False, "message": {"model": "claude-test", "usage": {
+            "input_tokens": 10, "cache_read_input_tokens": 259000,
+            "cache_creation_input_tokens": 990, "output_tokens": 5}}}
+        synthetic = {
+            "api error": {"type": "assistant", "isSidechain": False, "isApiErrorMessage": True,
+                          "message": {"model": "<synthetic>", "usage": zero}},
+            "synthetic model": {"type": "assistant", "message": {
+                "model": "<synthetic>", "usage": dict(zero, input_tokens=7)}},
+            "error flag": {"type": "assistant", "isApiErrorMessage": True,
+                           "message": {"usage": dict(zero, input_tokens=7)}},
+            "all zero": {"type": "assistant", "message": {"model": "claude-test", "usage": zero}},
+        }
+        transcript = Path(self.temp.name) / "synthetic.jsonl"
+        for name, entry in synthetic.items():
+            with self.subTest(entry=name):
+                transcript.write_text(json.dumps(real) + "\n" + json.dumps(entry) + "\n", encoding="utf-8")
+                self.assertEqual(relay_module.context_usage(transcript), (260000, False))
+        transcript.write_text(json.dumps(synthetic["api error"]) + "\n", encoding="utf-8")
+        self.assertEqual(relay_module.context_usage(transcript), (None, False))
+        transcript.write_text(json.dumps(real) + "\n" + json.dumps(synthetic["api error"]) + "\n",
+                              encoding="utf-8")
+        payload = json.dumps({"session_id": "synth", "prompt": "continue", "transcript_path": str(transcript)})
+        prompted = self.run_relay("prompt", input_text=payload)
+        self.assertIn("RED", json.loads(prompted.stdout)["hookSpecificOutput"]["additionalContext"])
+        stopped = self.run_relay("stop", input_text=payload)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(json.loads(stopped.stdout)["decision"], "block")
+
+    def test_malformed_usage_entry_after_real_one_is_unknown(self):
+        real = {"type": "assistant", "isSidechain": False, "message": {"model": "claude-test", "usage": {
+            "input_tokens": 10, "cache_read_input_tokens": 199000,
+            "cache_creation_input_tokens": 990, "output_tokens": 5}}}
+        bad = {"type": "assistant", "message": {"model": "claude-test", "usage": {
+            "input_tokens": None, "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0, "output_tokens": 0}}}
+        transcript = Path(self.temp.name) / "malformed.jsonl"
+        for usage in (bad["message"]["usage"], dict(bad["message"]["usage"], input_tokens=0.0)):
+            with self.subTest(usage=usage):
+                entry = {"type": "assistant", "message": {"model": "claude-test", "usage": usage}}
+                transcript.write_text(json.dumps(real) + "\n" + json.dumps(entry) + "\n", encoding="utf-8")
+                self.assertEqual(relay_module.context_usage(transcript), (None, False))
+
+    def windows_acl_calls(self, whoami_stdout):
+        """Run _restrict_windows_state with whoami/icacls faked; returns their (argv, kwargs)."""
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=whoami_stdout if "whoami" in argv[0] else None)
+
+        with patch.object(relay_module, "ctypes") as ctypes_mock, \
+                patch.object(relay_module.subprocess, "run", side_effect=fake_run):
+            ctypes_mock.windll.kernel32.GetSystemDirectoryW.return_value = 3
+            ctypes_mock.create_unicode_buffer.return_value = MagicMock(value="C:\\W", __len__=lambda s: 100)
+            try:
+                relay_module._restrict_windows_state(Path("x"))
+            finally:
+                self.acl_calls = calls
+        return calls
+
+    def test_windows_acl_reads_the_sid_from_undecodable_output(self):
+        # 0x81/0x8d/0x90 are undefined in cp1252: decoding OEM output as ANSI text raised.
+        whoami, icacls = self.windows_acl_calls(b'"dom\\us\x81\x8d\x90er","S-1-5-21-1-2-3-1001"\r\n')
+        for _, kwargs in (whoami, icacls):
+            self.assertFalse(kwargs.get("text") or kwargs.get("encoding") or kwargs.get("universal_newlines"))
+            self.assertEqual(kwargs["timeout"], 10)
+        self.assertIn("*S-1-5-21-1-2-3-1001:F", icacls[0])
+        self.assertEqual(icacls[1]["stdout"], subprocess.DEVNULL)
+        self.assertEqual(icacls[1]["stderr"], subprocess.DEVNULL)
+
+    def test_windows_acl_without_a_sid_is_an_oserror(self):
+        for stdout in (None, b"", b"\x81\x8d\x90 no sid here\r\n"):
+            with self.subTest(stdout=stdout):
+                with self.assertRaises(OSError):
+                    self.windows_acl_calls(stdout)
+                self.assertEqual(len(self.acl_calls), 1)  # icacls never ran
+
+    def test_handoff_is_saved_when_the_windows_acl_step_crashes(self):
+        handoffs = self.home / "relay/handoffs"
+        body = "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks"
+        with patch.object(relay_module.os, "name", "nt"), \
+                patch.object(relay_module, "_restrict_windows_state",
+                             side_effect=AttributeError("'NoneType' object has no attribute 'splitlines'")), \
+                patch.object(relay_module, "copy_to_clipboard", return_value=False), \
+                patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sess1"}), \
+                patch.object(relay_module, "HANDOFFS", handoffs), \
+                patch.object(relay_module, "STATE", self.home / "relay/state"), \
+                patch.object(relay_module, "ROOT", self.home / "relay"), \
+                patch.object(relay_module, "jev_client", None), \
+                patch.object(relay_module.sys, "stdin", io.StringIO(body)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            relay_module.cmd_handoff(["--no-open"])
+        files = list(handoffs.glob("*.md"))
+        self.assertEqual(len(files), 1)
+        self.assertIn(body, files[0].read_text(encoding="utf-8"))
+        self.assertIn("could not restrict the handoff file", output.getvalue())
+        self.assertIn("could not record handoff state", output.getvalue())
+        self.assertIn(f"relay:{files[0].stem}", output.getvalue())
+
+    def test_active_session_state_is_not_swept(self):
+        state = self.home / "relay/state"
+        state.mkdir(parents=True)
+        old = time.time() - 100 * 3600
+        live, idle = state / "s1.json", state / "idle.json"
+        live.write_text(json.dumps({"handoff_done": "1234abcd"}), encoding="utf-8")
+        idle.write_text("{}", encoding="utf-8")
+        for path in (live, idle):
+            os.utime(path, (old, old))
+        context = self.prompt_context("still here", tokens=300000)  # session s1; the sweep is due
+        self.assertTrue(live.exists())
+        self.assertFalse(idle.exists())
+        self.assertIn("already handed off", context)
+        self.assertNotIn("ROLL OVER NOW", context)
+        os.utime(live, (old, old))
+        payload = json.dumps({"session_id": "s1", "transcript_path": str(self.transcript(300000))})
+        stopped = self.run_relay("stop", input_text=payload)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(stopped.stdout, "")  # still handed off: no second nudge
+        self.assertGreater(live.stat().st_mtime, old + 3600)
+        os.utime(live, (old, old))
+        self.run_relay("stop", input_text=json.dumps({"session_id": "s1", "stop_hook_active": True}))
+        self.assertGreater(live.stat().st_mtime, old + 3600)
+
+    def test_sweep_removes_leaked_stage_directories(self):
+        state = self.home / "relay/state"
+        leaked = state / ".private-0123456789abcdef"
+        fresh = state / ".private-fedcba9876543210"
+        other = state / "not-a-stage"
+        for folder in (leaked, fresh, other):
+            folder.mkdir(parents=True)
+        (leaked / "state.tmp").write_text("{}", encoding="utf-8")
+        old = time.time() - 100 * 3600
+        for folder in (leaked, other):
+            os.utime(folder, (old, old))
+        with patch.object(relay_module, "STATE", state), \
+                patch.object(relay_module, "HANDOFFS", self.home / "relay/handoffs"):
+            relay_module.sweep(dict(relay_module.DEFAULTS))
+        self.assertFalse(leaked.exists())
+        self.assertTrue(fresh.is_dir())
+        self.assertTrue(other.is_dir())  # only stage folders are removed recursively
+
+    def test_wrong_typed_config_numbers_fall_back_to_defaults(self):
+        relay_dir = self.home / "relay"
+        relay_dir.mkdir(parents=True)
+        (relay_dir / "config.json").write_text(json.dumps({
+            "handoff_ttl_hours": None, "hard_tokens": "200000", "soft_tokens": [1],
+            "task_shift_min_tokens": True, "auto_open": False, "rollover": "copy"}), encoding="utf-8")
+        with patch.object(relay_module, "ROOT", relay_dir):
+            cfg = relay_module.config()
+        self.assertEqual(cfg["handoff_ttl_hours"], 72)
+        self.assertEqual(cfg["hard_tokens"], 200000)
+        self.assertEqual(cfg["soft_tokens"], 150000)
+        self.assertEqual(cfg["task_shift_min_tokens"], 30000)
+        self.assertIs(cfg["auto_open"], False)
+        self.assertEqual(cfg["rollover"], "copy")
+        self.assertEqual(relay_module._number(" 1.5 ", 72), 1.5)
+        self.assertEqual(relay_module._number("9" * 400, 150000), 150000)
+        self.assertEqual(relay_module._number(10 ** 400, 150000), 150000)
+        self.assertEqual(relay_module._number(2e12, 5), 5)
+        for bad in ("soon", "nan", "inf", "", float("nan"), float("inf"), {}, False):
+            with self.subTest(value=bad):
+                self.assertEqual(relay_module._number(bad, 72), 72)
+        body = "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks"
+        for count, value in enumerate(("72", None, "soon", [72]), start=1):
+            with self.subTest(handoff_ttl_hours=value):
+                (relay_dir / "config.json").write_text(json.dumps({"handoff_ttl_hours": value}), encoding="utf-8")
+                result = self.run_relay("handoff", "--no-open", input_text=body, cwd=ROOT)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(list((relay_dir / "handoffs").glob("*.md"))), count)
+
+    def test_sweep_failure_does_not_prevent_saving_the_handoff(self):
+        handoffs = self.home / "relay/handoffs"
+        with patch.object(relay_module, "sweep", side_effect=TypeError("bad ttl")), \
+                patch.object(relay_module, "copy_to_clipboard", return_value=False), \
+                patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), \
+                patch.object(relay_module, "HANDOFFS", handoffs), \
+                patch.object(relay_module, "STATE", self.home / "relay/state"), \
+                patch.object(relay_module, "ROOT", self.home / "relay"), \
+                patch.object(relay_module, "jev_client", None), \
+                patch.object(relay_module.sys, "stdin", io.StringIO(
+                    "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks")), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            relay_module.cmd_handoff(["--no-open"])
+        self.assertEqual(len(list(handoffs.glob("*.md"))), 1)
+        self.assertIn("handoff saved", output.getvalue())
+
+    def test_handoff_stdin_strips_leading_bom(self):
+        handoffs = self.home / "relay/handoffs"
+        body = "GOAL: continue the exact task\nSTATE: ready\nNEXT STEP: run the checks"
+        with patch.object(relay_module, "copy_to_clipboard", return_value=False), \
+                patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "", "CLAUDE_RELAY_NO_CLIPBOARD": "1"}), \
+                patch.object(relay_module, "HANDOFFS", handoffs), \
+                patch.object(relay_module, "STATE", self.home / "relay/state"), \
+                patch.object(relay_module, "ROOT", self.home / "relay"), \
+                patch.object(relay_module, "jev_client", None), \
+                patch.object(relay_module.sys, "stdin", io.StringIO("\ufeff" + body)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            relay_module.cmd_handoff(["--no-open"])
+        saved = [p.read_text(encoding="utf-8") for p in handoffs.glob("*.md")]
+        self.assertEqual(len(saved), 1)
+        self.assertIn(body, saved[0])
+        self.assertNotIn("\ufeff", saved[0])
+
+    def test_handoff_body_file_option(self):
+        body = "GOAL: preserve \u05e9\u05dc\u05d5\u05dd \u4e2d\u6587 \U0001f680\nSTATE: ready\nNEXT STEP: continue"
+        source = Path(self.temp.name) / "handoff body.md"
+        source.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))  # a BOM is tolerated
+        self.env.update({"PYTHONUTF8": "0", "PYTHONIOENCODING": "ascii"})
+        result = self.run_relay("handoff", "--no-open", "--title", "from file", "--body-file", str(source),
+                                input_text="", cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = list((self.home / "relay/handoffs").glob("*.md"))
+        self.assertEqual(len(files), 1)
+        saved = files[0].read_text(encoding="utf-8")
+        self.assertIn(body, saved)
+        self.assertNotIn("\ufeff", saved)
+        self.assertIn('continue "from file" from the handoff.', result.stdout)
+        for args in (["--body-file", str(source) + ".missing"], ["--body-file"]):
+            with self.subTest(args=args):
+                failed = self.run_relay("handoff", "--no-open", *args, input_text=body, cwd=ROOT)
+                self.assertEqual(failed.returncode, 1)
+                self.assertIn("--body-file", failed.stderr)
+                self.assertNotIn("Traceback", failed.stderr)
+        self.assertEqual(len(list((self.home / "relay/handoffs").glob("*.md"))), 1)
+        self.assertIn("--body-file <file>", relay_module.HOW)
+        self.assertNotIn("< file", relay_module.HOW)
+        instructions = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn('handoff --title "<short title>" --body-file <file>', instructions)
+        self.assertNotIn("< <file>", instructions)
 
 
 if __name__ == "__main__":
