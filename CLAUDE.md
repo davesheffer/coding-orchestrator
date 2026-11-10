@@ -10,10 +10,11 @@ The main session owns the request, design, root cause, judgment, verification, a
 | Locate, read, summarize | scout | Sonnet |
 | Run exact test/build commands and distill output | runner | Haiku |
 | Implement an already specified change | builder | Sonnet |
-| Adversarial review of risky changes or claims | critic | Fable |
+| Same change after 4 critic rounds without SHIP | builder | Fable 5.2 |
+| Adversarial review of risky changes or claims | critic | Fable 5.2 |
 | Design, ambiguity, security/concurrency decisions | main session | Opus 5.5 |
 
-Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and `sonnet` for bounded reading and specified implementation; reserve `fable` for the critic. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work.
+Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and `sonnet` for bounded reading and specified implementation; reserve `fable` (Fable 5.2, `claude-fable-5-2`) for the critic and builder escalation. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work.
 
 - Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
 - Launch independent, delegation-sized units together; respect concurrency limits and avoid overlapping edits. Large Workflow orchestration with dozens of agents requires an explicit user request.
@@ -27,6 +28,8 @@ Use the installed named roles. For built-in agents, explicitly select `haiku` fo
 Provide goal, exact paths/ranges, applicable project rules, constraints, acceptance check, and expected output. Give critics the exact diff/base and claim to attack in fresh context, without the author's conclusions.
 
 Require `RESULT / EVIDENCE / CONFIDENCE / UNVERIFIED`, with actual check exit codes. Read builder diffs and require checks after the last edit. Missing evidence, low/medium confidence, or material unverified claims require direct verification or escalation (scout/runner to builder/main; builder to main), not the same retry.
+
+Builder escalation: count critic rounds on each builder change. After 4 rounds where the critic returned FIX FIRST or RETHINK instead of SHIP, run every later round as `builder` with `model: "fable"` (Fable 5.2), briefed with all earlier findings and the current diff. Fixes the main session makes itself are not builder rounds.
 
 Risky or irreversible work requires critic review before completion. Resolve findings and report the actual verdict. Role tool lists and permission modes must be checked against effective client permissions; wording alone does not enforce a sandbox. Do not broaden permissions to make a check pass.
 
