@@ -118,9 +118,49 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
 
     def test_downgrade_needs_high_confidence(self):
-        self.payload["tool_input"]["model"] = "opus"
+        # Only a model the call did not set itself (here the agent's frontmatter) can go down.
+        del self.payload["tool_input"]["model"]
+        self.agent(self.home, "builder", "opus")
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.7)))
         out = self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.85))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "sonnet")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         "jev: opus \u2192 sonnet (conf 0.85)")
+
+    def test_explicit_model_is_never_downgraded(self):
+        self.agent(self.home, "builder", "sonnet")
+        for model in ("fable", "claude-fable-5-2", "opusplan"):
+            with self.subTest(model=model):
+                self.calls.clear()
+                self.payload["tool_input"]["model"] = model
+                logs = []
+                self.assertIsNone(self.decide(self.payload, self.cfg,
+                                              self.classify(choice="sonnet", confidence=0.99), logs.append))
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(len(logs), 1)
+                self.assertFalse(logs[0]["applied"])
+                self.assertEqual(logs[0]["reason"],
+                                 f"jev: {model} \u2192 sonnet (conf 0.99); skipped: explicit model kept")
+        self.assertEqual(jev.verdict("sonnet", 0.99, "fable", self.cfg, explicit=True),
+                         ("explicit model kept", None, None))
+        self.assertEqual(jev.verdict("sonnet", 0.99, "fable", self.cfg), ("applied", "sonnet", None))
+
+    def test_explicit_model_still_upgrades_and_escalates(self):
+        logs = []
+        out = self.decide(self.payload, self.cfg, self.classify(choice="opus", confidence=0.9), logs.append)
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+        self.assertTrue(logs[0]["applied"])
+        probabilities = {"sonnet": 0.55, "opus": 0.3, "fable": 0.15}
+        out = self.decide(self.payload, self.cfg, self.probs("sonnet", 0.55, probabilities))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+        why, model, _ = jev.verdict("sonnet", 0.55, "sonnet", self.cfg, probabilities, explicit=True)
+        self.assertEqual((why, model), ("applied", "opus"))
+
+    def test_unranked_explicit_model_keeps_threshold_rule(self):
+        # The hook cannot tell which way a move from an unknown model goes.
+        self.payload["tool_input"]["model"] = "gpt-5"
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.4)))
+        out = self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.6))
         self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "sonnet")
 
     def test_unknown_current_uses_min_confidence(self):
@@ -531,11 +571,11 @@ class DecideTests(unittest.TestCase):
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="opus"), logs.append))
         self.assertEqual(logs[-1]["current"], "opusplan")
         self.assertTrue(logs[-1]["reason"].endswith("skipped: same model"))
-        # A downgrade from opusplan needs downgrade confidence, as from opus.
-        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.7)))
         del self.payload["tool_input"]["model"]
         self.agent(self.home, "builder", "opusplan")
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="opus")))
+        # A downgrade from opusplan needs downgrade confidence, as from opus.
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.7)))
 
     def test_invalid_label_choice_is_truncated_and_ascii_safe_in_log(self):
         long_choice = "x" * 200

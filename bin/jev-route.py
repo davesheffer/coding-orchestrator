@@ -6,7 +6,9 @@ TypeSafe's hosted Jev classifier which tier (sonnet/opus/fable) should run the
 task and, when the answer is confident enough and different, rewrites the tool
 input's `model`. Moving to a stronger tier needs less confidence than moving to
 a weaker one, and a task escalates when the stronger tiers together are likely
-enough, because under-routing costs more than over-routing. Configuration lives under the "jev" key of
+enough, because under-routing costs more than over-routing. A call that sets `model`
+itself is never moved to a weaker tier when the hook can rank
+that model. Configuration lives under the "jev" key of
 `<install>/relay/config.json`; the API key comes from TYPESAFE_API_KEY or
 `jev.api_key_file`.
 
@@ -72,6 +74,12 @@ def current_model(payload, tool_input, home=ROOT):
     return None
 
 
+def explicit_model(tool_input):
+    """True when the call sets `model` itself: a non-blank string, as in current_model."""
+    model = tool_input.get("model")
+    return isinstance(model, str) and bool(model.strip())
+
+
 def model_tier(model, tiers):
     """The tier alias for a model: the alias itself (or its MODEL_ALIASES tier), or the tier
     from `tiers` named inside a full Claude id (claude-opus-4-1 is opus when "opus" is in
@@ -116,10 +124,11 @@ def sanitize_probabilities(probabilities, labels):
     return {k: coerce_confidence(v) for k, v in probabilities.items() if k in labels}
 
 
-def verdict(choice, confidence, current, cfg, probabilities=None):
+def verdict(choice, confidence, current, cfg, probabilities=None, explicit=False):
     """(why, model, escalated_mass): why an answer is skipped, or "applied" with the
     model to run (shared with bin/eval-jev-routing.py). escalated_mass is set when
-    the classifier kept the current tier but stronger tiers together are likely enough."""
+    the classifier kept the current tier but stronger tiers together are likely enough.
+    explicit: the call set `current` itself, so it is never moved to a weaker tier."""
     if not isinstance(current, str):
         current = None  # e.g. a dict/list tool_input.model: treat as unknown
     if not isinstance(choice, str) or choice not in cfg["labels"]:
@@ -133,6 +142,9 @@ def verdict(choice, confidence, current, cfg, probabilities=None):
         return "applied", escalated[0], escalated[1]
     if choice == tier:
         return "same model", None, None
+    if explicit and tier in TIER_RANK and choice in TIER_RANK and TIER_RANK[choice] < TIER_RANK[tier]:
+        # An explicit model the hook cannot rank keeps the threshold rule below.
+        return "explicit model kept", None, None
     if confidence < threshold(tier, choice, cfg):
         return "below confidence threshold", None, None
     return "applied", choice, None
@@ -142,10 +154,9 @@ def pinned(tool_input, cfg):
     """True when the call is never classified (pinned agent or respected explicit model)."""
     if tool_input.get("subagent_type") in (cfg.get("pinned_agents") or []):
         return True
-    model = tool_input.get("model")
     # Same predicate as current_model: only a non-blank string pins; a non-string is invalid
     # (logged by decide), not a silent pin.
-    return bool(cfg.get("respect_explicit_model") and isinstance(model, str) and model.strip())
+    return bool(cfg.get("respect_explicit_model") and explicit_model(tool_input))
 
 
 def desc_hash(description):
@@ -237,7 +248,8 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
             log_fn({**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
         return None
     confidence = coerce_confidence(answer.get("confidence"))
-    why, applied_model, escalated_mass = verdict(choice, confidence, current, cfg, probabilities)
+    why, applied_model, escalated_mass = verdict(choice, confidence, current, cfg, probabilities,
+                                                 explicit_model(tool_input))
     applied = why == "applied"
     conf_text = f"{confidence:.2f}" if valid_confidence(confidence) else "invalid"
     # Never write a raw non-string/oversized choice; repr() is UTF-8-safe (handles lone surrogates too).
