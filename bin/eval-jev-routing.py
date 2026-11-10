@@ -5,11 +5,12 @@ Loads benchmarks/jev-routing.json (tasks with an expected tier), asks the Jev
 classifier the same question bin/jev-route.py asks, sequentially, and reports
 accuracy, a confusion matrix, per-tier recall, confidence by outcome and the
 list of misses. "Applied accuracy" scores what the router would actually run:
-jev-route's own rule (pinned_agents, min_confidence, same-model skip) decides
-whether the choice is applied, otherwise the agent keeps its frontmatter model
-(or "inherit"). The route feature is forced on so the result does not depend
-on the user's feature toggles. `--labels-file` swaps in candidate rubrics
-({tier: rubric}) for tuning. `--dry-run` only validates the benchmark.
+jev-route's own rule (pinned_agents, min_confidence, same-model skip, no
+downgrade of a task's explicit `model`) decides whether the choice is applied,
+otherwise the agent keeps its own or frontmatter model (or "inherit"). The
+route feature is forced on so the result does not depend on the user's feature
+toggles. `--labels-file` swaps in candidate rubrics ({tier: rubric}) for tuning.
+`--dry-run` only validates the benchmark.
 
 Usage: eval-jev-routing.py [--benchmark PATH] [--labels-file PATH] [--config PATH]
                            [--dry-run] [--json]
@@ -119,7 +120,8 @@ def evaluate(tasks, cfg, classify_fn=None, router=None, home=None):
         # Pinned agents are still classified for raw accuracy, but production never
         # routes them, so they keep their own model.
         why, model, _ = (("pinned", None, None) if router.pinned(task, cfg)
-                         else router.verdict(choice, confidence, current, cfg, probabilities))
+                         else router.verdict(choice, confidence, current, cfg, probabilities,
+                                             router.explicit_model(task)))
         effective = model if why == "applied" else choice if why == "same model" else (
             router.model_tier(current, router.TIER_RANK) or "inherit")
         result = {"id": task["id"], "expected": task["expected"], "got": predicted,

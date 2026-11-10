@@ -306,6 +306,18 @@ class EvalTests(unittest.TestCase):
         self.assertIsNone(result["results"][1]["probabilities"])
         json.dumps(result, sort_keys=True, allow_nan=False)
 
+    def test_explicit_task_model_is_never_downgraded_like_the_hook(self):
+        tasks = [
+            {"id": "x1", "subagent_type": "builder", "description": "d1", "prompt": "p", "expected": "fable",
+             "model": "fable"},
+            {"id": "x2", "subagent_type": "builder", "description": "d2", "prompt": "p", "expected": "opus",
+             "model": "sonnet"},
+        ]
+        replies = {"d1": answers("sonnet", 0.99), "d2": answers("opus", 0.9)}
+        result = evaluator.evaluate(tasks, self.cfg, lambda state, q: replies[state["description"]])
+        self.assertEqual([r["effective"] for r in result["results"]], ["fable", "opus"])
+        self.assertEqual([r["applied"] for r in result["results"]], [False, True])
+
     def test_nan_confidence_is_dropped_and_json_output_is_strict(self):
         tasks = [{"id": "n1", "subagent_type": "general-purpose", "description": "d1", "prompt": "p",
                   "expected": "opus"}]

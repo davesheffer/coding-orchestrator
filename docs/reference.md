@@ -316,7 +316,7 @@ installed `relay/config.json`:
 | `upgrade_min_confidence`, `downgrade_min_confidence` | `0.35`, `0.8` | route: confidence needed to move to a stronger or weaker tier than the current one. Moving up is easy because under-routing is the costly error |
 | `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
 | `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
-| `respect_explicit_model` | `false` | route: never override a call that already sets `model` |
+| `respect_explicit_model` | `false` | route: never override a call that already sets `model`. When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id) |
 | `pinned_agents` | `["critic", "fork"]` | route: subagent types that are never rerouted |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
 | `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted. A removed tier's full model id (e.g. `claude-opus-4-1` with `opus` removed) can still be rewritten to a kept tier, as its alias would be. `opusplan` counts as the opus tier, so it is never rewritten to `opus` |
