@@ -40,8 +40,11 @@ On Claude Code, scout is enforced: a frontmatter PreToolUse hook (`bin/role-guar
 interpreter is missing. Scout commands run the Python interpreter pinned at install time; rerun the
 installer after moving or upgrading Python (until then scout Bash fails closed). Remaining fail-open cases are a hook timeout and agent files loaded from an
 untrusted project folder (Claude Code skips their frontmatter hooks). `ro.py` refuses repos whose local
-config defines filters, fsmonitor, diff commands, gpg programs, or includes; filter drivers from your
-own global config (for example git-lfs) still run. Critic, builder, and runner remain instruction-only.
+config defines filters, fsmonitor, diff commands, gpg programs, includes, a partial clone or promisor
+remote, remote upload/receive-pack or `vcs` helpers, or protocol allow rules. It never
+fetches a missing object on demand (`GIT_NO_LAZY_FETCH=1`), and `ro.py diff` does not refresh the index.
+Filter drivers from your own global config (for example git-lfs) still run. Critic, builder, and runner
+remain instruction-only.
 
 The cross-client tier mapping is **Sol → Opus 5.5**, **Astra → Fable**,
 **Tera → Sonnet**, and **Luna → Sonnet**. Tera has no separate bundled role;
@@ -107,8 +110,9 @@ Role permissions are weaker than their names suggest:
   mode, the subagent runs in that same mode and Claude Code ignores the
   `permissionMode` you set." In those modes only each role's `tools:` list
   constrains it.
-- Scout and critic are read-only by instruction. They keep `Bash`, which is not
+- Critic is read-only by instruction. It keeps `Bash`, which is not
   sandboxed; `permissionMode: plan` blocks edit tools but not every shell command.
+  Scout is the exception: its Bash is enforced by the role guard described above.
   Builder's ban on commit and push is likewise instruction-only.
 - Runner uses `permissionMode: dontAsk`, which auto-denies any Bash command that
   would otherwise prompt, except read-only commands and those matching your
