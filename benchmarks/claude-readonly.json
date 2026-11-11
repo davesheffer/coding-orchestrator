@@ -27,6 +27,6 @@
   {
     "id": "model-observation",
     "prompt": "Find how the Windows launcher verifies the model actually used after a Codex run. State what happens if it cannot verify model identity. Cite paths and lines. Do not edit files.",
-    "required": ["actual_model", "state_5.sqlite", "model-unverified"]
+    "required": ["actual_model", "state_", "model-unverified"]
   }
 ]

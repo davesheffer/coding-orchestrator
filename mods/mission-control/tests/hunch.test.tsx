@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { hunchCli, hunchInvocation, hunchName, hunchOutcome, isToastSeverity, reapStale } from '../hooks/parse'
+import { hadBrief, hunchCli, hunchInvocation, hunchName, hunchOutcome, isToastSeverity, reapStale } from '../hooks/parse'
 
 const TASK = 'htask_a0a4770f5592438f23dad47a'
 
@@ -46,6 +46,14 @@ describe('hunch parsing', () => {
     expect(hunchCli('git commit -m "feat: band; hunch update now runs"')).toBeUndefined()
     expect(hunchCli("echo '(hunch status)'")).toBeUndefined()
     expect(hunchCli('git add . && hunch update')?.name).toBe('cli update')
+    // Windows shims are the same call, in any case.
+    expect(hunchCli(`hunch.cmd task verify ${TASK} -- npm test`)).toEqual({ name: 'verify', target: 'npm test', taskId: TASK })
+    expect(hunchCli('npx.cmd hunch context foo')).toEqual({ name: 'cli context', target: 'foo', taskId: undefined })
+    expect(hunchCli('HUNCH.EXE update')?.name).toBe('cli update')
+    expect(hunchCli('cd repo; hunch.ps1 now')?.name).toBe('cli now')
+    expect(hunchCli('NPX.EXE -y @davesheffer/hunch now')?.name).toBe('cli now')
+    expect(hunchCli('cat hunch.cmd')).toBeUndefined()
+    expect(hunchCli('hunch.command update')).toBeUndefined()
     // Heredoc bodies are data, not commands; a newline or `$(` starts a command.
     expect(hunchCli("git commit -F- <<'EOF'\nfeat: band\nhunch update\nEOF")).toBeUndefined()
     expect(hunchCli('cat <<EOF > notes.md\n(hunch status)\nEOF')).toBeUndefined()
@@ -81,6 +89,23 @@ describe('hunch parsing', () => {
     ])
     expect(reaped[0]?.summary).toBe('no result recorded')
     expect(reaped[0]?.level).toBe('warn')
+  })
+
+  test('a brief: older state without contextTasks scans calls; an id-less brief only covers id-less tasks', async () => {
+    const brief = { id: 'old', name: 'context', target: 'lib/a.dart', role: 'main', startedAt: 0, status: 'ok', summary: '', level: 'info' } as const
+    const other = 'htask_b0b4770f5592438f23dad47b'
+
+    // Saved by the older version: no contextTasks field, the brief is still in `calls`.
+    expect(hadBrief({ calls: [{ ...brief, taskId: TASK }] }, TASK)).toBe(true)
+    expect(hadBrief({ calls: [{ ...brief, taskId: TASK }] }, other)).toBe(false)
+    expect(hadBrief({ calls: [{ ...brief, name: 'cli context', taskId: TASK }] }, TASK)).toBe(true)
+    expect(hadBrief({ calls: [] }, TASK)).toBe(false)
+
+    // Per-task record: '' is an id-less brief.
+    expect(hadBrief({ calls: [], contextTasks: [''] }, TASK)).toBe(false)
+    expect(hadBrief({ calls: [], contextTasks: [''] }, undefined)).toBe(true)
+    expect(hadBrief({ calls: [], contextTasks: ['', TASK] }, TASK)).toBe(true)
+    expect(hadBrief({ calls: [{ ...brief, taskId: TASK }], contextTasks: [] }, TASK)).toBe(false)
   })
 
   test('constraints: warning is warn, advisory is listed but quiet', async () => {
@@ -331,4 +356,112 @@ test('an info or advisory invariant stays in the pane without a toast', async ($
 
   await $.tool.call({ tool: 'mcp__hunch__hunch_check_constraints', scope: 'lib/a.dart' })
   expect(toasts.filter(text => /Hunch invariant/.test(text))).toEqual([])
+})
+
+test('the hunch CLI through PowerShell is tracked like through Bash', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-06T14:00:00') })
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'PowerShell' }, () => {
+    const out = '{ "exit_code": 1, "timed_out": false }'
+
+    return { result: { stdout: out, stderr: '', interrupted: false }, text: out }
+  })
+
+  const cli = `node C:/x/@davesheffer/hunch/dist/cli/index.js task verify ${TASK} --`
+  await $.tool.call({ tool: 'PowerShell', command: `${cli} flutter test failing`, description: 'verify' })
+
+  expect(toasts.filter(text => /Hunch verify/.test(text))).toEqual(['✖ Hunch verify exit 1 (flutter test failing)'])
+})
+
+test('a finished task remembers its brief past clear done; one without a brief toasts', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-06T14:00:00') })
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'mcp__hunch__hunch_context' }, () => ({ result: '## Brief for lib/a.dart' }))
+  on('tool.call', { tool: 'mcp__hunch__hunch_task' }, () => ({ result: 'Task finished.' }))
+  on('tool.call', { tool: 'PowerShell' }, () => ({ result: { stdout: 'brief', stderr: '', interrupted: false }, text: 'brief' }))
+  const unbriefed = () => toasts.filter(text => /without a hunch_context brief/.test(text))
+
+  await $.tool.call({ tool: 'mcp__hunch__hunch_context', target: 'lib/a.dart', task_id: TASK })
+  const pane = await $.ui.mount({
+    plugin: 'mission-control',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'mission-control',
+    props: { title: 'Mission Control', isFocused: false, bodyColumns: 100, placement: 'dock', scroll, view: {} },
+  })
+  await pane.press({ key: 'clear' })
+  await pane.unmount()
+  await $.tool.call({ tool: 'mcp__hunch__hunch_task', action: 'finish', task_id: TASK })
+  expect(unbriefed()).toEqual([])
+
+  // Another task, never briefed.
+  const other = 'htask_b0b4770f5592438f23dad47b'
+  await $.tool.call({ tool: 'mcp__hunch__hunch_task', action: 'finish', task_id: other })
+  expect(unbriefed().length).toBe(1)
+
+  // A brief through the CLI counts too.
+  const third = 'htask_c0c4770f5592438f23dad47c'
+  await $.tool.call({ tool: 'PowerShell', command: `hunch context lib/b.dart --task ${third}`, description: 'brief' })
+  await $.tool.call({ tool: 'mcp__hunch__hunch_task', action: 'finish', task_id: third })
+  expect(unbriefed().length).toBe(1)
+})
+
+test('a brief without a task id covers only the current id-less task', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-06T14:00:00') })
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'mcp__hunch__hunch_context' }, () => ({ result: '## Brief for lib/a.dart' }))
+  on('tool.call', { tool: 'mcp__hunch__hunch_task' }, () => ({ result: 'Task finished.' }))
+  const unbriefed = () => toasts.filter(text => /without a hunch_context brief/.test(text))
+
+  await $.tool.call({ tool: 'mcp__hunch__hunch_context', target: 'lib/a.dart' })
+  // An id-less brief says nothing about a task with a real id.
+  await $.tool.call({ tool: 'mcp__hunch__hunch_task', action: 'finish', task_id: TASK })
+  expect(unbriefed().length).toBe(1)
+  // It does cover an id-less finish in the same task.
+  await $.tool.call({ tool: 'mcp__hunch__hunch_task', action: 'finish' })
+  expect(unbriefed().length).toBe(1)
+
+  // A new task drops it.
+  await $.tool.call({ tool: 'mcp__hunch__hunch_task', action: 'start', title: 'next' })
+  await $.tool.call({ tool: 'mcp__hunch__hunch_task', action: 'finish' })
+  expect(unbriefed().length).toBe(2)
+})
+
+test('a toast quoting a Hunch error masks the secret in it', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-06T14:00:00') })
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.call', { tool: 'mcp__hunch__hunch_why' }, () => ({
+    isError: true as const,
+    result: undefined,
+    text: 'hunch: login failed for --password hunter2',
+  }))
+
+  await $.tool.call({ tool: 'mcp__hunch__hunch_why', target: 'lib/a.dart' })
+  const failed = toasts.filter(text => /Hunch why failed/.test(text))
+  expect(failed.length).toBe(1)
+  expect(failed[0]).not.toMatch(/hunter2/)
 })
