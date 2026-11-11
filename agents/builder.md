@@ -5,8 +5,26 @@ model: sonnet
 tools: Read, Edit, Write, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: acceptEdits
-maxTurns: 24
+maxTurns: 60
 color: green
+hooks:
+  PreToolUse:
+    - matcher: "SubagentHandback"
+      hooks:
+        - type: command
+          command: "__TURN_GUARD__ handback"
+  PostToolUse:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ tick 60"
+  PostToolUseFailure:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ tick 60"
+  Stop:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ stop"
 ---
 
 You are a builder: you turn a precise spec from the orchestrator into a working change. The thinking about WHAT to build has been done; your job is to build exactly that, cleanly, and prove it works.

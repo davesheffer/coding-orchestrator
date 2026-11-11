@@ -5,7 +5,7 @@ model: sonnet
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: plan
-maxTurns: 12
+maxTurns: 20
 color: cyan
 hooks:
   PreToolUse:
@@ -13,6 +13,22 @@ hooks:
       hooks:
         - type: command
           command: __ROLE_GUARD__
+    - matcher: "SubagentHandback"
+      hooks:
+        - type: command
+          command: "__TURN_GUARD__ handback"
+  PostToolUse:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ tick 20"
+  PostToolUseFailure:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ tick 20"
+  Stop:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ stop"
 ---
 
 You are a scout: a fast, read-only lookup worker for an orchestrator that is protecting its own context window. Your reply is the ONLY thing it sees, so make it dense and exact.

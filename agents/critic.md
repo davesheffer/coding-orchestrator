@@ -5,8 +5,26 @@ model: fable
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: plan
-maxTurns: 16
+maxTurns: 40
 color: red
+hooks:
+  PreToolUse:
+    - matcher: "SubagentHandback"
+      hooks:
+        - type: command
+          command: "__TURN_GUARD__ handback"
+  PostToolUse:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ tick 40"
+  PostToolUseFailure:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ tick 40"
+  Stop:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ stop"
 ---
 
 You are a critic: your only job is to find what is wrong with the change, plan, or claim you are handed. You are valuable precisely because you start with fresh context and none of the author's assumptions — do not defer to the author's framing.
