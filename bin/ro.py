@@ -13,10 +13,14 @@ USAGE = ("usage: ro.py log [-n N] [--oneline] [--stat] [REF] [-- PATH...] | "
          "show [--stat] REF [-- PATH...] | status | blame PATH [-L START,END] | "
          "issues | issue N | prs | pr N")
 GIT_BASE = ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.pager=cat",
-            "-c", "diff.external=", "-c", "core.untrackedCache=false"]
+            "-c", "diff.external=", "-c", "core.untrackedCache=false",
+            "-c", "diff.autoRefreshIndex=false", "-c", "format.pretty=medium"]
 CONFIG_RX = (r"^(filter\..*\.(clean|smudge|process)|core\.fsmonitor|core\.hookspath|"
              r"diff\..*\.(command|textconv)|core\.(pager|editor|sshcommand|askpass|gitproxy)|"
-             r"include\.path|includeif\..*|gpg\..*|log\.showsignature)$")
+             r"include\.path|includeif\..*|gpg\..*|log\.showsignature|"
+             r"extensions\.partialclone|"
+             r"remote\..*\.(promisor|uploadpack|receivepack|partialclonefilter|vcs)|"
+             r"protocol\.(.*\.)?allow)$")
 # Always used with fullmatch: `$` with match would also accept a trailing newline.
 REF_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./^~@:-]*")
 PATH_RE = re.compile(r"[^\x00-\x1f]+")
@@ -122,6 +126,8 @@ def scrubbed_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"
+    # A promisor remote's uploadpack is a command: never fetch a missing object on demand.
+    env["GIT_NO_LAZY_FETCH"] = "1"
     return env
 
 

@@ -103,6 +103,16 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
 
+    def test_env_disables_lazy_fetch(self):
+        with mock.patch.dict(os.environ, {"GIT_NO_LAZY_FETCH": "0"}):
+            self.assertEqual(ro.scrubbed_env()["GIT_NO_LAZY_FETCH"], "1")
+
+    def test_diff_argv_disables_index_refresh(self):
+        argv = ro.build_argv("diff", [])
+        at = argv.index("diff.autoRefreshIndex=false")
+        self.assertEqual(argv[at - 1], "-c")
+        self.assertLess(at, argv.index("diff"))
+
     def test_cli_usage_errors_exit_2(self):
         for args in ((), ("evil",), ("log", "--output=x"), ("log", "-c"), ("diff", "--ext-diff"),
                      ("show", "-bad")):
@@ -178,6 +188,46 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("ro: refused: repo-local config defines core.fsmonitor", result.stderr)
         self.assertFalse(marker.exists())
+
+    def test_local_partial_clone_and_remote_commands_are_refused(self):
+        marker = self.repo / "PWNED"
+        for key, value in (("extensions.partialClone", "origin"), ("remote.origin.promisor", "true"),
+                           ("remote.origin.uploadpack", f"touch {marker.as_posix()}"),
+                           ("remote.origin.receivepack", f"touch {marker.as_posix()}"),
+                           ("remote.origin.partialCloneFilter", "blob:none"),
+                           ("protocol.allow", "always"), ("remote.origin.vcs", "x"),
+                           ("protocol.ext.allow", "always"), ("core.sshCommand", "x"),
+                           ("core.gitProxy", "x")):
+            with self.subTest(key=key):
+                self.git("config", key, value)
+                result = run_ro("show", "HEAD", cwd=self.repo)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"ro: refused: repo-local config defines {key.lower()}", result.stderr)
+                self.git("config", "--unset", key)
+        self.assertFalse(marker.exists())
+
+    def test_local_credential_config_is_allowed(self):
+        for key, value in (("credential.helper", "x"), ("credential.useHttpPath", "true")):
+            self.git("config", key, value)
+        result = run_ro("log", "--oneline", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("first", result.stdout)
+
+    def test_local_format_pretty_cannot_change_log_format(self):
+        self.git("config", "format.pretty", "format:%G? %s")
+        result = run_ro("log", "-n", "1", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("commit "), result.stdout)
+
+    def test_diff_leaves_the_index_file_untouched(self):
+        index = self.repo / ".git" / "index"
+        tracked = self.repo / "f.txt"
+        stamp = tracked.stat().st_mtime - 3600
+        os.utime(tracked, (stamp, stamp))  # same content, new mtime: stat-dirty
+        before = index.read_bytes()
+        result = run_ro("diff", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(index.read_bytes(), before)
 
     def test_local_gpg_and_show_signature_are_refused(self):
         for key, value in (("gpg.program", "x"), ("log.showSignature", "true")):

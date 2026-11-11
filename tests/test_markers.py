@@ -37,7 +37,8 @@ class MarkerTests(unittest.TestCase):
                 source = start + b"\nnew\n" + end
                 original = prefix + start + b"old" + end + suffix
                 merged = module.merge_instructions(original, source, Path("test"))
-                self.assertEqual(merged, prefix + source + suffix)
+                # The surrounding file is CRLF, so the block is written with CRLF too.
+                self.assertEqual(merged, prefix + source.replace(b"\n", b"\r\n") + suffix)
                 self.assertEqual(module.merge_instructions(merged, source, Path("test")), merged)
 
 
