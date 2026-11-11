@@ -42,6 +42,9 @@ class ClaudeInstallTests(unittest.TestCase):
             "__ROLE_GUARD__": json.dumps(
                 f"{shlex.quote(install_module.pinned_python())} "
                 f"{shlex.quote((self.home / 'bin/role-guard.py').as_posix())} || exit 2"),
+            "__TURN_GUARD__": json.dumps(
+                f"{shlex.quote(install_module.pinned_python())} "
+                f"{shlex.quote((self.home / 'bin/turn-guard.py').as_posix())}")[1:-1],
             "__RO__": f"{shlex.quote(install_module.pinned_python())} "
                       f"{shlex.quote((self.home / 'bin/ro.py').as_posix())}",
         }).encode("utf-8")
@@ -103,6 +106,27 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(tokens[0], install_module.pinned_python())
         self.assertEqual(tokens[-4], (self.home / "bin/role-guard.py").as_posix())
         self.assertEqual((self.home / "agents/scout.md").read_bytes(), self.rendered_agent("scout"))
+
+    def test_roles_are_rendered_with_turn_guard_hooks(self):
+        self.home = Path(self.temp.name) / "o'brien"
+        self.assertEqual(self.run_install().returncode, 0)
+        guard = (self.home / "bin/turn-guard.py").as_posix()
+        self.assertEqual((self.home / "bin/turn-guard.py").read_bytes(), (ROOT / "bin/turn-guard.py").read_bytes())
+        for name, cap in (("scout", 20), ("runner", 15), ("builder", 60), ("critic", 40)):
+            text = (self.home / "agents" / f"{name}.md").read_text(encoding="utf-8")
+            self.assertNotIn("__TURN_GUARD__", text)
+            self.assertIn(f"maxTurns: {cap}\n", text.replace("\r\n", "\n"))
+            commands = [json.loads(l.split("command:", 1)[1].strip()) for l in text.splitlines()
+                        if l.strip().startswith("command:") and "role-guard" not in l]
+            self.assertEqual([shlex.split(c) for c in commands], [
+                [install_module.pinned_python(), guard, "handback"],
+                [install_module.pinned_python(), guard, "tick", str(cap)],
+                [install_module.pinned_python(), guard, "tick", str(cap)],
+                [install_module.pinned_python(), guard, "stop"]])
+            self.assertIn("PostToolUseFailure:", text)
+            self.assertIn('matcher: "SubagentHandback"', text)
+            self.assertFalse(any("exit 2" in c for c in commands))
+            self.assertEqual((self.home / "agents" / f"{name}.md").read_bytes(), self.rendered_agent(name))
 
     def test_scout_commands_use_pinned_python(self):
         python = install_module.pinned_python()

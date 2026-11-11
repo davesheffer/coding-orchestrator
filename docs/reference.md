@@ -46,6 +46,17 @@ fetches a missing object on demand (`GIT_NO_LAZY_FETCH=1`), and `ro.py diff` doe
 Filter drivers from your own global config (for example git-lfs) still run. Critic, builder, and runner
 remain instruction-only.
 
+Turn caps (`maxTurns`) are builder 60, critic 40, scout 20, runner 15. Every Claude Code role also has
+frontmatter hooks running `bin/turn-guard.py`: a `tick` on PostToolUse and PostToolUseFailure counts tool
+calls (approximately turns; it warns early in most runs) and nudges once per cap cycle at half the budget
+(save progress; skipped when the cap is under 12) and at cap minus 5 (write the final RESULT report now),
+so a resumed agent is nudged again. A PreToolUse `handback` check on SubagentHandback denies, once, a
+report with no RESULT/VERDICT line, and a SubagentStop `stop` check blocks, once per run (a resumed agent is
+checked again), an agent whose final message has no such line. State lives in `state/turn-guard/` under the install root (numbered tick
+files and flag files, all claimed with exclusive create, so safe under parallel calls) and is pruned after 24 hours. The guard fails open: any error exits 0, so it never blocks a tool
+call or traps an agent. A capped agent is resumed with SendMessage, not relaunched. Codex agents are
+unchanged.
+
 The cross-client tier mapping is **Sol → Opus 5.5**, **Astra → Fable**,
 **Tera → Sonnet**, and **Luna → Sonnet**. Tera has no separate bundled role;
 the mapping applies if that tier is used for a future role.

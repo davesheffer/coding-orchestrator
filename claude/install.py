@@ -410,6 +410,10 @@ def main(argv: list[str] | None = None) -> int:
             "__ROLE_GUARD__": json.dumps(
                 f"{shlex.quote(pinned_python())} "
                 f"{shlex.quote((dest / 'bin' / 'role-guard.py').as_posix())} || exit 2"),
+            # Inserted inside the md's double quotes, with `tick <n>` / `stop` appended there.
+            "__TURN_GUARD__": json.dumps(
+                f"{shlex.quote(pinned_python())} "
+                f"{shlex.quote((dest / 'bin' / 'turn-guard.py').as_posix())}")[1:-1],
             "__RO__": f"{shlex.quote(pinned_python())} {shlex.quote((dest / 'bin' / 'ro.py').as_posix())}",
         }).encode("utf-8")
     managed_sources[dest / "relay" / "relay.py"] = (root / "relay" / "relay.py").read_bytes()
@@ -417,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
     managed_sources[dest / "bin" / "rollover-open.py"] = (root / "bin" / "rollover-open.py").read_bytes()
     managed_sources[dest / "bin" / "session-focus.py"] = (root / "bin" / "session-focus.py").read_bytes()
     managed_sources[dest / "bin" / "role-guard.py"] = (root / "bin" / "role-guard.py").read_bytes()
+    managed_sources[dest / "bin" / "turn-guard.py"] = (root / "bin" / "turn-guard.py").read_bytes()
     managed_sources[dest / "bin" / "ro.py"] = (root / "bin" / "ro.py").read_bytes()
     for name in JEV_SCRIPTS:
         managed_sources[dest / "bin" / name] = (root / "bin" / name).read_bytes()

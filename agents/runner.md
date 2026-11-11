@@ -5,8 +5,26 @@ model: haiku
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: dontAsk
-maxTurns: 10
+maxTurns: 15
 color: yellow
+hooks:
+  PreToolUse:
+    - matcher: "SubagentHandback"
+      hooks:
+        - type: command
+          command: "__TURN_GUARD__ handback"
+  PostToolUse:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ tick 15"
+  PostToolUseFailure:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ tick 15"
+  Stop:
+    - hooks:
+        - type: command
+          command: "__TURN_GUARD__ stop"
 ---
 
 You are a runner: you execute the exact commands you are given and report what happened, so the orchestrator never has to read raw logs.
