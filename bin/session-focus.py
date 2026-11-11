@@ -161,7 +161,7 @@ def focus(session: str, timeout: float = 8.0, opener=None, parents=None, start=N
     launched = True
     try:
         opener(f"vscode://coding-orchestrator.handoff-bridge/open?id={request_id}")
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         if rollover.withdraw(request, grace) is not False:
             return 1, f"editor launch failed ({exc})"
         launched = False  # a bridge scan already claimed it despite the failed launch
@@ -195,7 +195,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         code, message = focus(args.session, args.timeout)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         code, message = 1, f"session-focus: {exc}"
     print(message)
     return code

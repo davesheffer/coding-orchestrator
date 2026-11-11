@@ -7,15 +7,14 @@ Subcommands:
             injects that handoff so a fresh session continues the work.
   stop      Stop hook. In the red zone, blocks the stop ONCE per session so the
             model writes a handoff and rolls over instead of idling on a full context.
-  handoff   Called by the model: stores the handoff (stdin), then either asks the
-            shared VS Code bridge for a new Claude tab (rollover "open") or only
-            copies the relay prompt to the clipboard (rollover "copy"). Printing
-            the prompt is the fallback whenever a launch cannot be confirmed.
+  handoff   Called by the model: stores the handoff (stdin, or --body-file <path>),
+            then either asks the shared VS Code bridge for a new Claude tab (rollover
+            "open") or only copies the relay prompt to the clipboard (rollover "copy").
+            Printing the prompt is the fallback whenever a launch cannot be confirmed.
   status    Print the gauge for a transcript (debugging).
 
 Hooks must never break a prompt: every hook path swallows errors and exits 0.
 """
-import csv
 import ctypes
 import json
 import locale
@@ -23,6 +22,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -130,12 +130,36 @@ def open_editor_prompt(next_prompt):
     return True
 
 
+def _number(value, default):
+    """A numeric config value (numeric strings accepted), or the default for any other type."""
+    if isinstance(value, str):
+        for cast in (int, float):
+            try:
+                value = cast(value.strip())
+                break
+            except ValueError:
+                continue
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    try:
+        as_float = float(value)
+    except OverflowError:
+        return default
+    if as_float != as_float or abs(as_float) > 1e12:
+        return default
+    return value
+
+
 def config():
     cfg = dict(DEFAULTS)
     try:
         cfg.update(json.loads((ROOT / "config.json").read_text(encoding="utf-8")))
     except Exception:
         pass
+    # A wrong-typed number ("72", null) must not raise later, e.g. before a handoff is saved.
+    for key, default in DEFAULTS.items():
+        if not isinstance(default, bool):
+            cfg[key] = _number(cfg.get(key), default)
     return cfg
 
 
@@ -178,6 +202,13 @@ def context_usage(transcript_path):
                     message = entry.get("message")
                     usage = message.get("usage") if isinstance(message, dict) else None
                     if not isinstance(usage, dict) or "input_tokens" not in usage:
+                        continue
+                    # A synthetic entry (API error, interrupted turn) reports zero usage and
+                    # says nothing about the context size: keep scanning for the real one.
+                    if (message.get("model") == "<synthetic>" or entry.get("isApiErrorMessage")
+                            or all(type(usage.get(key, 0)) is int and usage.get(key, 0) == 0 for key in (
+                                "input_tokens", "cache_read_input_tokens",
+                                "cache_creation_input_tokens", "output_tokens"))):
                         continue
                     counts = [usage.get(key, 0) for key in (
                         "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
@@ -226,15 +257,18 @@ def _restrict_windows_state(path):
     if not 0 < length < len(system_dir):
         raise OSError("could not locate the Windows system directory")
     system_dir = Path(system_dir.value)
+    # These tools write in the OEM code page, so their output is never decoded as text:
+    # the SID is ASCII and is the last column, whatever the account name's encoding.
     identity = subprocess.run([str(system_dir / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
-                              capture_output=True, text=True, check=True, timeout=10)
-    rows = list(csv.reader(identity.stdout.splitlines()))
-    sid = rows[0][-1].strip() if rows and rows[0] else ""
-    if not re.fullmatch(r"S-\d+(?:-\d+)+", sid):
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              check=True, timeout=10)
+    output = identity.stdout if isinstance(identity.stdout, bytes) else b""
+    sids = re.findall(rb"(?<![\w-])S-\d+(?:-\d+)+(?![\w-])", output)
+    if not sids:
         raise OSError("could not determine the current Windows user SID")
     subprocess.run([str(system_dir / "icacls.exe"), str(path), "/inheritance:r",
-                    "/grant:r", f"*{sid}:F"],
-                   capture_output=True, text=True, check=True, timeout=10)
+                    "/grant:r", f"*{sids[-1].decode('ascii')}:F"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=10)
 
 
 def save_state(session_id, state):
@@ -274,13 +308,27 @@ def save_state(session_id, state):
             stage.rmdir()
 
 
+def touch_state(session_id):
+    """Refresh a live session's state file so sweep() never expires it (handoff_done,
+    stop_nudged) while that session is still being used."""
+    if not valid_session_id(session_id):
+        return
+    try:
+        os.utime(STATE / f"{session_id}.json")
+    except OSError:
+        pass
+
+
 def sweep(cfg):
     cutoff = time.time() - cfg["handoff_ttl_hours"] * 3600
     for folder in (HANDOFFS, STATE):
         for p in folder.glob("*"):
             try:
                 if p.stat().st_mtime < cutoff:
-                    p.unlink()
+                    if p.is_dir() and p.name.startswith(".private-"):
+                        shutil.rmtree(p, ignore_errors=True)  # stage folder a killed save left behind
+                    else:
+                        p.unlink()
             except OSError:
                 pass
 
@@ -304,7 +352,7 @@ def build_how(script: Path) -> str:
             "NEXT STEP and NEXT PROMPT; pipe the handoff to "
             f"`{python} {shlex.quote(str(script))} handoff --title \"<short title>\"` "
             "(body on stdin via quoted heredoc; if the shell rejects it, e.g. `unexpected EOF`, write the body "
-            "to a file with your file tool and redirect it with `< file` instead of retrying). Report the script's actual result; if it only saves/copies "
+            "to a file with your file tool and pass `--body-file <file>` instead of retrying). Report the script's actual result; if it only saves/copies "
             "a relay prompt, tell the user how to start the new session. Then stop here.")
 
 
@@ -486,6 +534,7 @@ def cmd_prompt():
             parts.append(handoff_context(m.group(1).lower(), session_id, shift_on))
         except OSError:
             parts.append(f"[relay] Handoff {m.group(1).lower()} unreadable (I/O error). Tell the user.")
+    touch_state(session_id)
     try:
         sweep_if_due(cfg)
     except Exception:
@@ -506,10 +555,11 @@ def cmd_prompt():
 
 def cmd_stop():
     data = json.load(sys.stdin)
+    session_id = data.get("session_id") or "unknown"
+    touch_state(session_id)
     if data.get("stop_hook_active"):
         return
     cfg = config()
-    session_id = data.get("session_id") or "unknown"
     tokens = context_tokens(data.get("transcript_path") or "")
     if zone(tokens, cfg) != "red":
         return
@@ -567,6 +617,8 @@ def rollover_mode(cfg):
 
 
 def clipboard_commands():
+    if os.environ.get("CLAUDE_RELAY_NO_CLIPBOARD"):
+        return []  # tests and headless runs: print the prompt, never touch the clipboard
     if sys.platform == "darwin":
         candidates = [["pbcopy"]]
     elif sys.platform == "win32":
@@ -657,7 +709,10 @@ def write_handoff(path, text):
         return False
     try:
         if os.name == "nt":
-            _restrict_windows_state(path)
+            try:
+                _restrict_windows_state(path)
+            except Exception as exc:  # best effort: losing the handoff is worse
+                print(f"relay: warning: could not restrict the handoff file ({exc}).")
         elif hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -665,25 +720,39 @@ def write_handoff(path, text):
             handle.write(text)
         return True
     except BaseException:
-        if fd is not None:
-            os.close(fd)
-        path.unlink(missing_ok=True)
+        try:
+            if fd is not None:
+                os.close(fd)
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
 
 
 def cmd_handoff(argv):
-    title, do_open, accept_weak = "continue", True, False
+    title, do_open, accept_weak, body_file = "continue", True, False, None
     it = iter(argv)
     for a in it:
         if a == "--title":
             title = next(it, title)
+        elif a == "--body-file":
+            body_file = next(it, None)
+            if not body_file:
+                sys.exit("relay: --body-file needs a path.")
         elif a == "--no-open":
             do_open = False
         elif a == "--accept-weak":
             accept_weak = True
-    body = sys.stdin.read().strip()
+    if body_file:
+        try:
+            # utf-8-sig: Windows editors and PowerShell 5.1 prepend a BOM.
+            body = Path(body_file).read_text(encoding="utf-8-sig").strip()
+        except (OSError, ValueError) as exc:
+            sys.exit(f"relay: could not read --body-file as UTF-8 ({exc}).")
+    else:
+        body = sys.stdin.read().lstrip("\ufeff").strip()
     if len(body) < 40:
-        sys.exit("relay: handoff body is empty/too short — pipe the handoff on stdin.")
+        sys.exit("relay: handoff body is empty/too short — pipe the handoff on stdin or pass --body-file.")
     if jev_client is not None:
         try:
             jcfg = jev_client.load_config(ROOT / "config.json")
@@ -706,7 +775,10 @@ def cmd_handoff(argv):
         except Exception:
             pass
     cfg = config()
-    sweep(cfg)
+    try:
+        sweep(cfg)
+    except Exception:
+        pass  # housekeeping must never prevent saving the handoff
     cwd = os.getcwd()
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or "unknown"
     dirty = git(cwd, "status", "--porcelain")
@@ -724,7 +796,7 @@ def cmd_handoff(argv):
         if new_dir:  # restricting an existing folder could strip inherited access from old handoffs
             try:
                 _restrict_windows_state(HANDOFFS)
-            except (subprocess.SubprocessError, OSError) as exc:
+            except Exception as exc:
                 print(f"relay: warning: could not restrict the handoffs folder ({exc}).")
     else:
         os.chmod(HANDOFFS, 0o700)
@@ -740,7 +812,7 @@ def cmd_handoff(argv):
         state["handoff_done"] = hid
         try:
             save_state(session_id, state)
-        except (subprocess.SubprocessError, OSError) as exc:
+        except Exception as exc:
             print(f"relay: warning: could not record handoff state ({exc}).")
 
     next_prompt = f"relay:{hid} continue \"{title}\" from the handoff."

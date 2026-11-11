@@ -38,7 +38,8 @@ class RelayJevTests(unittest.TestCase):
         self.handoffs = self.root / "handoffs"
         self.state = self.root / "state"
         self.log_path = self.root / "jev-log.jsonl"
-        env_patch = mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
+        env_patch = mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key",
+                                                      "CLAUDE_RELAY_NO_CLIPBOARD": "1"})
         env_patch.start()
         self.addCleanup(env_patch.stop)
         self.addCleanup(self._reset_classify)
@@ -267,6 +268,7 @@ class RelayJevTests(unittest.TestCase):
         out = io.StringIO()
         code = 0
         with mock.patch.object(relay_module.sys, "stdin", io.StringIO(body)), \
+                mock.patch.object(relay_module, "copy_to_clipboard", return_value=False), \
                 contextlib.redirect_stdout(out):
             try:
                 relay_module.cmd_handoff(["--no-open", "--title", "test", *extra_args])

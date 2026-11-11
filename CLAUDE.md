@@ -50,7 +50,7 @@ NEXT PROMPT: latest user prompt verbatim, for task shifts or RED rollover
 HANDOFF
 ```
 
-If the shell rejects the heredoc (for example, `unexpected EOF while looking for matching`), do not retry it. Write the same body to a scratch file with the file tool and run `__PYTHON__ __RELAY__ handoff --title "<short title>" < <file>`.
+If the shell rejects the heredoc (for example, `unexpected EOF while looking for matching`), do not retry it. Write the same body to a scratch file with the file tool and run `__PYTHON__ __RELAY__ handoff --title "<short title>" --body-file <file>`.
 
 The installer resolves the helper paths above to this installation. The relay saves the handoff, then either opens a new Claude tab (rollover: open) or copies the relay prompt to the clipboard (rollover: copy). Report what the script actually printed; saving alone does not prove a tab opened. If no launch was acknowledged, tell the user to start a new session and send the printed `relay:<id>` prompt. After a successful handoff, stop working here.
 
