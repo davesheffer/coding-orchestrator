@@ -130,7 +130,15 @@ class AgentReportTests(unittest.TestCase):
 
     def test_unresolvable_workspace_paths_do_not_raise(self):
         long_path = Path(os.path.abspath(os.sep + 'a' * 40000))
-        with tempfile.TemporaryDirectory() as temp:
+        real_resolve = Path.resolve
+
+        def resolve(self, *args, **kwargs):
+            # POSIX non-strict resolve swallows ENAMETOOLONG; Windows raises. Force the raise everywhere.
+            if len(str(self)) > 30000:
+                raise OSError(36, 'File name too long')
+            return real_resolve(self, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(Path, 'resolve', resolve):
             root = Path(temp)
             (root / 'run').mkdir()
             (root / 'run/report.json').write_text(json.dumps(
