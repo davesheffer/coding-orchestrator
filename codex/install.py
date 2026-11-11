@@ -157,9 +157,21 @@ def managed_block(data: bytes, path: Path) -> bytes:
     return data[start:end + len(END)]
 
 
+def target_newline(existing: bytes | None) -> bytes | None:
+    """An existing file's line ending (CRLF only when every break is one); None when it has none to follow."""
+    if existing is None or b"\n" not in existing:
+        return None
+    return b"\n" if b"\n" in existing.replace(b"\r\n", b"") else b"\r\n"
+
+
 def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> bytes:
     block = managed_block(source, Path("source AGENTS.md"))
-    newline = b"\r\n" if b"\r\n" in block else b"\n"
+    newline = target_newline(existing)
+    if newline is None:
+        newline = b"\r\n" if b"\r\n" in block else b"\n"
+    else:
+        # Follow the file being edited, so the source checkout's endings never mix into it.
+        block = block.replace(b"\r\n", b"\n").replace(b"\n", newline)
     # Install only the managed block, never text outside the source's markers.
     if existing is None:
         return block + newline
@@ -168,7 +180,10 @@ def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> byt
         return existing + (b"" if not existing or existing.endswith(b"\n") else newline) + block + newline
     if existing.count(START) != 1 or existing.count(END) != 1 or start > end:
         fail(f"invalid managed markers in {path}")
-    return existing[:start] + block + existing[end + len(END):]
+    tail = existing[end + len(END):]
+    if tail.startswith(b"\r\n"):
+        tail = newline + tail[2:]  # the break after the block follows the file, not the source
+    return existing[:start] + block + tail
 
 
 def validate_destination_root(dest: Path) -> None:
@@ -208,6 +223,40 @@ def hook_command(dest: Path) -> str:
     return f'{python} "{path}"' if os.name == "nt" else f"{python} {shlex.quote(path)}"
 
 
+def same_path(left: str, right: str) -> bool:
+    """Whether two spellings name one file; on Windows a home can differ in case or separators."""
+    if re.search(r"(^|[\\/])\.\.?([\\/]|$)", left):
+        return False  # a dot component can hide where the path really leads
+    if os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right)):
+        return True
+    try:
+        return os.path.isabs(left) and os.path.isabs(right) and os.path.samefile(left, right)
+    except (OSError, ValueError):
+        return False
+
+
+def is_jev_command(value: object, command: str, script: str) -> bool:
+    """Match hook_command's output, also when the same script path is spelled differently."""
+    if not isinstance(value, str):
+        return False
+    if value == command:
+        return True
+    python = command.partition(" ")[0]
+    if not value.startswith(python + " "):
+        return False
+    quoted = value[len(python) + 1:]
+    if os.name == "nt":
+        # hook_command wraps the path in double quotes and refuses a path containing one.
+        if len(quoted) < 3 or quoted[0] != '"' or quoted[-1] != '"' or '"' in quoted[1:-1]:
+            return False
+        return same_path(quoted[1:-1], script)
+    try:
+        parts = shlex.split(quoted)
+    except ValueError:
+        return False
+    return len(parts) == 1 and same_path(parts[0], script)
+
+
 def dump_json(doc) -> bytes:
     """UTF-8 JSON; a lone surrogate (valid JSON escape) falls back to ASCII escapes."""
     try:
@@ -222,6 +271,7 @@ def merge_jev_hooks(path: Path, prior: bytes | None, dest: Path, enabled: bool) 
     if not isinstance(hooks, dict):
         fail(f"hooks must be an object in {path}")
     command = hook_command(dest)
+    script = str(dest / "bin" / "jev-hook.py")
     events = {"PreToolUse": (JEV_SHELL_MATCHER + "|Agent|Task|spawn_agent", 10),
               "SubagentStart": ("critic", 5), "SubagentStop": ("scout|runner|builder|critic", 5),
               "UserPromptSubmit": (None, 5)}
@@ -233,7 +283,8 @@ def merge_jev_hooks(path: Path, prior: bytes | None, dest: Path, enabled: bool) 
         for group in groups:
             if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
                 fail(f"invalid hook group in {path}")
-            handlers = [h for h in group["hooks"] if not (isinstance(h, dict) and h.get("command") == command)]
+            handlers = [h for h in group["hooks"]
+                        if not (isinstance(h, dict) and is_jev_command(h.get("command"), command, script))]
             if len(handlers) == len(group["hooks"]):
                 remaining.append(group)
                 continue

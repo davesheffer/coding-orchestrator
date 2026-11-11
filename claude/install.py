@@ -118,9 +118,21 @@ STRAY_HUNCH = re.compile(
     re.S)
 
 
+def target_newline(existing: bytes | None) -> bytes | None:
+    """An existing file's line ending (CRLF only when every break is one); None when it has none to follow."""
+    if existing is None or b"\n" not in existing:
+        return None
+    return b"\n" if b"\n" in existing.replace(b"\r\n", b"") else b"\r\n"
+
+
 def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> bytes:
     block = managed_block(source, Path("source CLAUDE.md"))
-    newline = b"\r\n" if b"\r\n" in block else b"\n"
+    newline = target_newline(existing)
+    if newline is None:
+        newline = b"\r\n" if b"\r\n" in block else b"\n"
+    else:
+        # Follow the file being edited, so the source checkout's endings never mix into it.
+        block = block.replace(b"\r\n", b"\n").replace(b"\n", newline)
     # Install only the managed block: the source file is also this repo's own
     # project instructions, so anything outside the markers is not ours to copy.
     if existing is None or digest(existing.replace(b"\r\n", b"\n")) in LEGACY_CLAUDE_HASHES:
@@ -135,6 +147,8 @@ def merge_instructions(existing: bytes | None, source: bytes, path: Path) -> byt
     stray = STRAY_HUNCH.match(tail)
     if stray:
         tail = tail[stray.end():] or newline
+    elif tail.startswith(b"\r\n"):
+        tail = newline + tail[2:]  # the break after the block follows the file, not the source
     return existing[:start] + block + tail
 
 
@@ -161,6 +175,18 @@ def fill_placeholders(text: str, values: dict[str, str]) -> str:
     return re.sub("|".join(map(re.escape, values)), lambda match: values[match.group()], text)
 
 
+def same_path(left: str, right: str) -> bool:
+    """Whether two spellings name one file; on Windows a home can differ in case or separators."""
+    if re.search(r"(^|[\\/])\.\.?([\\/]|$)", left):
+        return False  # a dot component can hide where the path really leads
+    if os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right)):
+        return True
+    try:
+        return os.path.isabs(left) and os.path.isabs(right) and os.path.samefile(left, right)
+    except (OSError, ValueError):
+        return False
+
+
 def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
     """Match only complete commands emitted by our current/legacy template."""
     if not isinstance(command, str):
@@ -175,7 +201,7 @@ def is_old_relay_hook(command: object, relay: Path, action: str) -> bool:
         "~/.claude/relay/relay.py",
     }
     return (len(parts) >= 3 and parts[0] in OWNED_PYTHONS
-            and parts[1] in owned_paths and parts[2] == action
+            and any(same_path(parts[1], owned) for owned in owned_paths) and parts[2] == action
             and parts[3:] in ([], ["2>/dev/null", "||", "true"]))
 
 
@@ -205,7 +231,8 @@ def is_jev_hook(command: object, bin_dir: Path) -> bool:
                        f"$HOME/.claude/bin/{script}", f"${{HOME}}/.claude/bin/{script}",
                        f"~/.claude/bin/{script}"}
         args = [sub] if sub else []
-        if (len(parts) >= 2 and parts[0] in OWNED_PYTHONS and parts[1] in owned_paths
+        if (len(parts) >= 2 and parts[0] in OWNED_PYTHONS
+                and any(same_path(parts[1], owned) for owned in owned_paths)
                 and parts[2:] in (args, args + ["2>/dev/null", "||", "true"])):
             return True
     return False
@@ -227,12 +254,14 @@ def strip_owned(groups: list, event: str, owned) -> list:
     for group in groups:
         if not isinstance(group, dict) or not isinstance(group.get("hooks", []), list):
             fail(f"settings.json hooks.{event} contains an invalid group")
-        kept = [h for h in group.get("hooks", [])
+        hooks = group.get("hooks", [])
+        kept = [h for h in hooks
                 if not (isinstance(h, dict) and h.get("type") == "command"
                         and owned(h.get("command")))]
-        if kept or not group.get("hooks"):
+        if kept or not hooks:
             copy = dict(group)
-            copy["hooks"] = kept
+            if len(kept) != len(hooks):
+                copy["hooks"] = kept
             cleaned.append(copy)
     return cleaned
 
@@ -339,12 +368,14 @@ def create_backup(path: Path, data: bytes) -> Path:
             pass
 
 
-def dump_json(doc) -> bytes:
+def dump_json(doc, newline: bytes | None = None) -> bytes:
     """UTF-8 JSON; a lone surrogate (valid JSON escape) falls back to ASCII escapes."""
     try:
-        return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        data = (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     except UnicodeEncodeError:
-        return (json.dumps(doc, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+        data = (json.dumps(doc, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+    # JSON escapes line breaks inside strings, so every "\n" here is layout.
+    return data.replace(b"\n", newline) if newline else data
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -418,7 +449,9 @@ def main(argv: list[str] | None = None) -> int:
     merged_settings = merge_hooks(settings, hook_template, dest / "relay" / "relay.py")
     merged_settings = merge_jev_hook(merged_settings, dest / "bin", args.jev)
     merged_settings.setdefault("model", "claude-opus-5-5")
-    desired[settings_path] = dump_json(merged_settings)
+    # Compare parsed JSON: a file that already says the same is left as it is, in its own layout.
+    if settings_existing is None or merged_settings != settings:
+        desired[settings_path] = dump_json(merged_settings, target_newline(settings_existing))
     if config_existing is None:
         desired[config_path] = (root / "relay" / "config.json").read_bytes()
     if args.rollover:

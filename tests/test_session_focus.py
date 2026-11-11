@@ -208,6 +208,26 @@ class SessionFocusTests(unittest.TestCase):
         self.assertIn("editor launch failed (no handler for vscode://)", message)
         self.assertEqual(list((self.home / "launches").iterdir()), [])
 
+    def test_launch_timeout_withdraws_the_request(self):
+        self.register()
+
+        def hung(uri):
+            raise focus.subprocess.TimeoutExpired(["code", "--open-url", uri], 15)
+
+        code, message = self.run_focus(hung)
+        self.assertEqual(code, 1)
+        self.assertIn("editor launch failed (", message)
+        self.assertIn("timed out after 15 seconds", message)
+        self.assertNotIn("\n", message)
+        self.assertEqual(list((self.home / "launches").iterdir()), [])
+
+    def test_main_reports_a_subprocess_failure_in_one_line(self):
+        failure = focus.subprocess.TimeoutExpired("code", 15)
+        with patch.object(focus, "focus", side_effect=failure), \
+                patch("builtins.print") as printed:
+            self.assertEqual(focus.main(["--session", SESSION]), 1)
+        printed.assert_called_once_with(f"session-focus: {failure}")
+
     def test_started_reads_this_process(self):
         if focus.os.name != "nt":
             self.assertIsNone(focus.started(os.getpid()))

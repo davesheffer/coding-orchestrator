@@ -40,8 +40,11 @@ On Claude Code, scout is enforced: a frontmatter PreToolUse hook (`bin/role-guar
 interpreter is missing. Scout commands run the Python interpreter pinned at install time; rerun the
 installer after moving or upgrading Python (until then scout Bash fails closed). Remaining fail-open cases are a hook timeout and agent files loaded from an
 untrusted project folder (Claude Code skips their frontmatter hooks). `ro.py` refuses repos whose local
-config defines filters, fsmonitor, diff commands, gpg programs, or includes; filter drivers from your
-own global config (for example git-lfs) still run. Critic, builder, and runner remain instruction-only.
+config defines filters, fsmonitor, diff commands, gpg programs, includes, a partial clone or promisor
+remote, remote upload/receive-pack or `vcs` helpers, or protocol allow rules. It never
+fetches a missing object on demand (`GIT_NO_LAZY_FETCH=1`), and `ro.py diff` does not refresh the index.
+Filter drivers from your own global config (for example git-lfs) still run. Critic, builder, and runner
+remain instruction-only.
 
 The cross-client tier mapping is **Sol → Opus 5.5**, **Astra → Fable**,
 **Tera → Sonnet**, and **Luna → Sonnet**. Tera has no separate bundled role;
@@ -107,8 +110,9 @@ Role permissions are weaker than their names suggest:
   mode, the subagent runs in that same mode and Claude Code ignores the
   `permissionMode` you set." In those modes only each role's `tools:` list
   constrains it.
-- Scout and critic are read-only by instruction. They keep `Bash`, which is not
+- Critic is read-only by instruction. It keeps `Bash`, which is not
   sandboxed; `permissionMode: plan` blocks edit tools but not every shell command.
+  Scout is the exception: its Bash is enforced by the role guard described above.
   Builder's ban on commit and push is likewise instruction-only.
 - Runner uses `permissionMode: dontAsk`, which auto-denies any Bash command that
   would otherwise prompt, except read-only commands and those matching your
@@ -143,7 +147,9 @@ unknown and not to infer a zone:
 
 A **handoff** is a self-contained Markdown note (goal, state, decisions, files,
 verified vs unverified, next step, and optionally the user's next prompt) that
-the model pipes to `relay.py handoff --title "<title>"`. The relay saves it as
+the model pipes to `relay.py handoff --title "<title>"` (or passes with
+`--body-file <path>`, a UTF-8 file, when the shell rejects the heredoc; a `< file`
+redirect is a parse error in Windows PowerShell 5.1). The relay saves it as
 `relay/handoffs/<id>.md` and produces a resume prompt such as
 `relay:1a2b3c4d continue "<title>" from the handoff.` Sending that prompt in a
 fresh session injects the handoff so the new session continues the work. Only a
@@ -153,10 +159,13 @@ PROMPT is presented as the previous session's recorded request. The gauge still
 applies on that turn. Handoff files written by this version are private (mode
 0600 in a 0700 folder; on Windows, an owner-only ACL applied to each new file
 and to a newly created handoffs folder — an existing handoffs folder keeps its
-current ACL) and a new handoff never replaces an existing id.
+current ACL) and a new handoff never replaces an existing id. The Windows ACL
+step is best-effort: if it fails, the relay prints a warning and still saves the
+handoff.
 Handoffs and per-session state older than `handoff_ttl_hours` (72) are removed
 when a handoff is written and, at most once an hour, when a prompt is submitted;
-resuming a handoff refreshes its age.
+resuming a handoff refreshes its age, and every prompt or stop refreshes that
+session's own state, so a session still in use keeps it.
 
 Rollover has two modes:
 
@@ -177,8 +186,8 @@ Rollover has two modes:
   resume prompt to the clipboard and prints it. Start a new Claude session (a
   new tab or `/clear`) and paste it. The clipboard is `pbcopy` on macOS, `clip`
   on Windows, or the first of `wl-copy`, `xclip`, or `xsel` found on Linux. If
-  none works, the relay prints `clipboard unavailable` and the prompt; the
-  handoff still succeeds.
+  none works, or `CLAUDE_RELAY_NO_CLIPBOARD=1` is set (tests, headless runs), the
+  relay prints `clipboard unavailable` and the prompt; the handoff still succeeds.
 
 Choose the mode in any of these ways (highest precedence first):
 
@@ -190,9 +199,12 @@ Choose the mode in any of these ways (highest precedence first):
 
 `relay.py handoff --no-open` behaves as `copy` for a single handoff. Without
 `--rollover`, the installer never changes an existing `relay/config.json`, which
-also holds the zone thresholds.
+also holds the zone thresholds. A threshold or `handoff_ttl_hours` value that is
+not a number (numeric strings are accepted) falls back to its default.
 
-Each relay measurement reads at most the last **8 MiB** of the transcript. Missing
+Each relay measurement reads at most the last **8 MiB** of the transcript.
+Synthetic entries (an API error or interrupted turn, which report zero usage) are
+skipped in favour of the last real measurement. Missing
 usage or a compaction boundary without subsequent usage yields **unknown**, never
 a guessed zone or forced rollover. The relay's transcript format is a heuristic;
 live client validation remains necessary after client upgrades.

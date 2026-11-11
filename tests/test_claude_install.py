@@ -54,6 +54,14 @@ class ClaudeInstallTests(unittest.TestCase):
             else ("file", p.read_bytes(), stat.S_IMODE(p.stat().st_mode))
         ) for p in self.home.rglob("*") if p.is_file() or p.is_symlink()}
 
+    def symlink(self, link, target, **kwargs):
+        try:
+            link.symlink_to(target, **kwargs)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 1314:
+                raise
+            self.skipTest("this Windows account lacks the privilege to create symlinks")
+
     def test_fresh_install_uses_custom_home_and_is_idempotent(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -171,9 +179,9 @@ class ClaudeInstallTests(unittest.TestCase):
                 merged = install_module.merge_instructions(polluted, source, Path("CLAUDE.md"))
                 self.assertEqual(merged, source)
                 self.assertEqual(install_module.merge_instructions(merged, source, Path("CLAUDE.md")), source)
-                private = b"mine\n" + polluted + b"also mine\n"
+                private = b"mine" + newline + polluted + b"also mine" + newline
                 self.assertEqual(install_module.merge_instructions(private, source, Path("CLAUDE.md")),
-                                 b"mine\n" + source.rstrip() + newline + b"also mine\n")
+                                 b"mine" + newline + source + b"also mine" + newline)
 
     def test_upgrade_keeps_hunch_text_the_user_placed_elsewhere(self):
         source = b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n<!-- CLAUDE-ORCHESTRATOR:END -->\n"
@@ -187,6 +195,90 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(install_module.merge_instructions(None, source, Path("CLAUDE.md")), source)
         self.assertEqual(install_module.merge_instructions(b"mine\r\n", source, Path("CLAUDE.md")),
                          b"mine\r\n" + source)
+        # A file without a line break has no ending to follow, so it is treated like a new one.
+        self.assertEqual(install_module.merge_instructions(b"", source, Path("CLAUDE.md")), source)
+        self.assertEqual(install_module.merge_instructions(b"mine", source, Path("CLAUDE.md")),
+                         b"mine\r\n" + source)
+
+    def test_instructions_follow_an_existing_lf_file(self):
+        block = b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n<!-- CLAUDE-ORCHESTRATOR:END -->"
+        source = (block + b"\n").replace(b"\n", b"\r\n")
+        old = b"<!-- CLAUDE-ORCHESTRATOR:START -->\nold\n<!-- CLAUDE-ORCHESTRATOR:END -->"
+        for existing, expected in (
+                (b"mine\n", b"mine\n" + block + b"\n"),
+                (b"mine\nlast", b"mine\nlast\n" + block + b"\n"),
+                (b"mine\n" + old + b"\nafter\n", b"mine\n" + block + b"\nafter\n"),
+                # Mixed endings count as LF: the block must not add more CRLF.
+                (b"one\r\ntwo\n", b"one\r\ntwo\n" + block + b"\n")):
+            with self.subTest(existing=existing):
+                merged = install_module.merge_instructions(existing, source, Path("CLAUDE.md"))
+                self.assertEqual(merged, expected)
+                self.assertEqual(install_module.merge_instructions(merged, source, Path("CLAUDE.md")), merged)
+
+    def test_instructions_follow_an_existing_crlf_file(self):
+        source = b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n<!-- CLAUDE-ORCHESTRATOR:END -->\n"
+        block = source.rstrip().replace(b"\n", b"\r\n")
+        old = b"<!-- CLAUDE-ORCHESTRATOR:START -->\r\nold\r\n<!-- CLAUDE-ORCHESTRATOR:END -->"
+        for existing, expected in (
+                (b"mine\r\n", b"mine\r\n" + block + b"\r\n"),
+                (b"mine\r\nlast", b"mine\r\nlast\r\n" + block + b"\r\n"),
+                (b"mine\r\n" + old + b"\r\nafter\r\n", b"mine\r\n" + block + b"\r\nafter\r\n")):
+            with self.subTest(existing=existing):
+                merged = install_module.merge_instructions(existing, source, Path("CLAUDE.md"))
+                self.assertEqual(merged, expected)
+                self.assertEqual(install_module.merge_instructions(merged, source, Path("CLAUDE.md")), merged)
+
+    def test_install_keeps_line_endings_of_existing_instructions_and_settings(self):
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                shutil.rmtree(self.home, ignore_errors=True)
+                self.home.mkdir(parents=True)
+                self.home.joinpath("CLAUDE.md").write_bytes(b"private" + newline)
+                self.home.joinpath("settings.json").write_bytes(
+                    b'{\n  "theme": "dark"\n}\n'.replace(b"\n", newline))
+                result = self.run_install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for name in ("CLAUDE.md", "settings.json"):
+                    data = self.home.joinpath(name).read_bytes()
+                    self.assertGreater(data.count(b"\n"), 3, name)
+                    self.assertEqual(data.count(b"\r"), data.count(b"\n") if newline == b"\r\n" else 0, name)
+                    self.assertEqual(data.count(b"\r\n"), data.count(b"\r"), name)
+                settings = json.loads(self.home.joinpath("settings.json").read_bytes())
+                self.assertEqual(settings["theme"], "dark")
+                self.assertIn("Stop", settings["hooks"])
+
+    def test_semantically_identical_settings_are_not_rewritten(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        path = self.home / "settings.json"
+        settings = json.loads(path.read_bytes())
+        reformatted = json.dumps(settings, indent=4, sort_keys=True).encode().replace(b"\n", b"\r\n")
+        self.assertNotEqual(reformatted, path.read_bytes())
+        path.write_bytes(reformatted)
+        for args in (("--dry-run",), (), ()):
+            with self.subTest(args=args):
+                result = self.run_install(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("settings.json", result.stdout)
+                self.assertEqual(path.read_bytes(), reformatted)
+        self.assertEqual(list(self.home.glob("settings.json.bak*")), [])
+
+    def test_user_hook_group_without_hooks_key_is_left_as_it_is(self):
+        bare, empty = {"matcher": "mine"}, {"matcher": "other", "hooks": []}
+        self.assertEqual(install_module.strip_owned([bare, empty], "Stop", lambda command: True), [bare, empty])
+        template = install_module.parse_json(ROOT / "hooks.json", (ROOT / "hooks.json").read_bytes())
+        merged = install_module.merge_hooks({"hooks": {"Stop": [bare, empty]}}, template,
+                                            self.home / "relay/relay.py")
+        self.assertEqual(merged["hooks"]["Stop"][:2], [bare, empty])
+        self.assertEqual(len(merged["hooks"]["Stop"]), 3)
+        self.assertEqual(self.run_install().returncode, 0)
+        path = self.home / "settings.json"
+        settings = json.loads(path.read_bytes())
+        settings["hooks"]["Stop"].insert(0, bare)
+        path.write_text(json.dumps(settings), encoding="utf-8")
+        written = path.read_bytes()
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_bytes(), written)
 
     def test_preserves_private_instructions_settings_and_relay_config(self):
         self.home.mkdir(parents=True)
@@ -352,6 +444,7 @@ class ClaudeInstallTests(unittest.TestCase):
         env = dict(os.environ)
         env.pop("CLAUDE_HOME", None)
         env["HOME"] = str(Path(self.temp.name) / "unrelated-home")
+        env["CLAUDE_RELAY_NO_CLIPBOARD"] = "1"  # never write the real clipboard
         relay = self.home / "relay/relay.py"
         body = "GOAL: preserve Unicode \u05e9\u05dc\u05d5\u05dd \U0001f680\nNEXT STEP: verify installed handoff"
         handoff = subprocess.run([sys.executable, str(relay), "handoff", "--no-open"],
@@ -503,6 +596,51 @@ class ClaudeInstallTests(unittest.TestCase):
                         "python3 'unterminated", None):
             self.assertFalse(install_module.is_jev_hook(command, bin_dir), command)
 
+    def test_hook_ownership_ignores_path_case_where_the_os_does(self):
+        home = Path(self.temp.name) / "Claude Home"
+        other = Path(str(home).swapcase())
+        relay = f"python3 {shlex.quote(str(home / 'relay/relay.py'))} stop 2>/dev/null || true"
+        jev = f"python3 {shlex.quote(str(home / 'bin/jev-guard.py'))} gate 2>/dev/null || true"
+        foreign = "python3 /other-project/relay/relay.py stop 2>/dev/null || true"
+        # Stand in for a case-insensitive OS, so this also runs where normcase is the identity.
+        with mock.patch.object(install_module.os.path, "normcase", str.lower):
+            self.assertTrue(install_module.is_old_relay_hook(relay, other / "relay/relay.py", "stop"))
+            self.assertTrue(install_module.is_jev_hook(jev, other / "bin"))
+            self.assertFalse(install_module.is_old_relay_hook(foreign, other / "relay/relay.py", "stop"))
+            self.assertFalse(install_module.is_jev_hook(relay, other / "bin"))
+
+    def test_hook_ownership_rejects_dot_components(self):
+        relay = Path(self.temp.name) / "Claude Home" / "relay/relay.py"
+        for spelling in (f"$HOME/.claude/relay/x/../relay.py", f"$HOME/.claude/relay/./relay.py",
+                         str(relay.parent / "x" / ".." / "relay.py")):
+            with self.subTest(spelling=spelling):
+                command = f"python3 {shlex.quote(spelling)} stop"
+                self.assertFalse(install_module.is_old_relay_hook(command, relay, "stop"), command)
+        self.assertTrue(install_module.is_old_relay_hook(
+            f"python3 {shlex.quote(str(relay))} stop", relay, "stop"))
+
+    def test_healing_a_mixed_file_normalises_the_break_after_the_block(self):
+        crlf_source = (b"<!-- CLAUDE-ORCHESTRATOR:START -->\nrules\n<!-- CLAUDE-ORCHESTRATOR:END -->\n").replace(b"\n", b"\r\n")
+        existing = b"mine\n" + crlf_source.rstrip() + b"\r\n"
+        merged = install_module.merge_instructions(existing, crlf_source, Path("CLAUDE.md"))
+        self.assertNotIn(b"\r", merged)
+        self.assertEqual(merged, b"mine\n" + crlf_source.replace(b"\r\n", b"\n"))
+
+    @unittest.skipUnless(os.name == "nt", "path case only folds on Windows")
+    def test_reinstall_with_differently_cased_home_does_not_duplicate_hooks(self):
+        self.assertEqual(self.run_install("--jev").returncode, 0)
+        first = json.loads((self.home / "settings.json").read_bytes())["hooks"]
+        self.home = Path(str(self.home).swapcase())
+        result = self.run_install("--jev")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hooks = json.loads((self.home / "settings.json").read_bytes())["hooks"]
+        self.assertEqual({event: len(groups) for event, groups in hooks.items()},
+                         {event: len(groups) for event, groups in first.items()})
+        for groups in hooks.values():
+            for group in groups:
+                for hook in group["hooks"]:
+                    self.assertIn(str(self.home), hook["command"])
+
     def test_hook_interpreter_follows_platform_and_upgrades_strip_either_form(self):
         with mock.patch.object(install_module.os, "name", "nt"):
             self.assertEqual(install_module.hook_python(), "python")
@@ -633,6 +771,7 @@ class ClaudeInstallTests(unittest.TestCase):
         env = dict(os.environ)
         env.pop("CLAUDE_HOME", None)
         env["HOME"] = str(Path(self.temp.name) / "unrelated-home")
+        env["CLAUDE_RELAY_NO_CLIPBOARD"] = "1"  # never write the real clipboard
         relay = self.home / "relay/relay.py"
         instructions = self.home.joinpath("CLAUDE.md").read_text(encoding="utf-8")
         self.assertIn(f"{install_module.hook_python()} {shlex.quote(str(relay))} handoff", instructions)
@@ -697,7 +836,7 @@ class ClaudeInstallTests(unittest.TestCase):
         self.home.joinpath("settings.json").unlink()
         outside = Path(self.temp.name) / "outside"
         outside.mkdir()
-        self.home.joinpath("agents").symlink_to(outside, target_is_directory=True)
+        self.symlink(self.home.joinpath("agents"), outside, target_is_directory=True)
         self.assertNotEqual(self.run_install("--force").returncode, 0)
         self.assertEqual(list(outside.iterdir()), [])
 

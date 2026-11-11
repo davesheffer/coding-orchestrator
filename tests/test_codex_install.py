@@ -32,6 +32,14 @@ class CodexInstallTests(unittest.TestCase):
         env = os.environ | {"CODEX_HOME": str(self.home)}
         return subprocess.run([sys.executable, str(INSTALL), *args], env=env, text=True, capture_output=True)
 
+    def symlink(self, link, target, **kwargs):
+        try:
+            link.symlink_to(target, **kwargs)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 1314:
+                raise
+            self.skipTest("this Windows account lacks the privilege to create symlinks")
+
     def test_instruction_interpreter_follows_platform(self):
         with mock.patch.object(install_module.os, "name", "nt"):
             self.assertEqual(install_module.platform_python(), "python")
@@ -67,6 +75,37 @@ class CodexInstallTests(unittest.TestCase):
                     merged = install_module.merge_instructions(existing, source, Path("AGENTS.md"))
                     self.assertEqual(merged, (existing or b"") + source)
                     self.assertEqual(install_module.merge_instructions(merged, source, Path("AGENTS.md")), merged)
+
+    def test_instructions_follow_existing_line_endings(self):
+        lf = b"<!-- CODEX-ORCHESTRATOR:START -->\nrules\n<!-- CODEX-ORCHESTRATOR:END -->"
+        crlf = lf.replace(b"\n", b"\r\n")
+        old = b"<!-- CODEX-ORCHESTRATOR:START -->old<!-- CODEX-ORCHESTRATOR:END -->"
+        for source, existing, expected in (
+                (crlf + b"\r\n", b"mine\n", b"mine\n" + lf + b"\n"),
+                (crlf + b"\r\n", b"mine\nlast", b"mine\nlast\n" + lf + b"\n"),
+                (crlf + b"\r\n", b"mine\n" + old + b"\nafter\n", b"mine\n" + lf + b"\nafter\n"),
+                # Mixed endings count as LF: the block must not add more CRLF.
+                (crlf + b"\r\n", b"one\r\ntwo\n", b"one\r\ntwo\n" + lf + b"\n"),
+                (lf + b"\n", b"mine\r\n", b"mine\r\n" + crlf + b"\r\n"),
+                (lf + b"\n", b"mine\r\nlast", b"mine\r\nlast\r\n" + crlf + b"\r\n"),
+                (lf + b"\n", b"mine\r\n" + old + b"\r\nafter\r\n", b"mine\r\n" + crlf + b"\r\nafter\r\n")):
+            with self.subTest(existing=existing):
+                merged = install_module.merge_instructions(existing, source, Path("AGENTS.md"))
+                self.assertEqual(merged, expected)
+                self.assertEqual(install_module.merge_instructions(merged, source, Path("AGENTS.md")), merged)
+
+    def test_install_keeps_line_endings_of_existing_instructions(self):
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                shutil.rmtree(self.home, ignore_errors=True)
+                self.home.mkdir(parents=True)
+                self.home.joinpath("AGENTS.md").write_bytes(b"private" + newline)
+                result = self.run_install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data = self.home.joinpath("AGENTS.md").read_bytes()
+                self.assertGreater(data.count(b"\n"), 3)
+                self.assertEqual(data.count(b"\r"), data.count(b"\n") if newline == b"\r\n" else 0)
+                self.assertEqual(data.count(b"\r\n"), data.count(b"\r"))
 
     def test_fresh_install_parses_and_installs_helper(self):
         result = self.run_install()
@@ -179,7 +218,7 @@ class CodexInstallTests(unittest.TestCase):
                 self.assertEqual(installed.returncode, 0, installed.stderr)
                 actual = (self.home / "AGENTS.md").read_bytes()
                 self.assertTrue(actual.startswith(b"private instructions\r\n"))
-                self.assertTrue(actual.endswith(preference))
+                self.assertTrue(actual.endswith(preference.replace(b"\r\n", b"\n", 1)))
                 self.assertEqual(actual.count(b"<!-- CODEX-CRITIC-NETWORK-FALLBACK:START -->"), 1)
                 self.assertEqual((self.home / "AGENTS.md.bak").read_bytes(), original)
                 self.assertEqual((self.home / "config.toml").read_bytes(), config)
@@ -215,7 +254,9 @@ class CodexInstallTests(unittest.TestCase):
 
     def test_repeat_is_stable_and_merges_existing_instructions(self):
         self.home.mkdir(parents=True)
-        prefix, suffix = b"before\n", b"after\n"
+        # One line ending throughout, as the installer leaves it: a mixed file would be rewritten once.
+        newline = b"\r\n" if b"\r\n" in SOURCE_AGENTS else b"\n"
+        prefix, suffix = b"before" + newline, b"after" + newline
         self.home.joinpath("AGENTS.md").write_bytes(prefix + SOURCE_AGENTS + suffix)
         self.home.joinpath("config.toml").write_text("model = 'local'\n")
         self.assertEqual(self.run_install().returncode, 0)
@@ -258,7 +299,7 @@ class CodexInstallTests(unittest.TestCase):
         self.home.rmdir()
         target = Path(self.temp.name) / "target"
         target.mkdir()
-        self.home.symlink_to(target, target_is_directory=True)
+        self.symlink(self.home, target, target_is_directory=True)
         self.assertNotEqual(self.run_install().returncode, 0)
         self.assertEqual(list(target.iterdir()), [])
 
@@ -295,8 +336,8 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = self.home.joinpath("AGENTS.md").read_bytes()
         self.assertTrue(actual.startswith(b"private prefix\r\n"))
-        self.assertTrue(actual.endswith(b"\r\nprivate suffix"))
-        self.assertIn(SOURCE_AGENTS.rstrip(b"\n"), actual)
+        self.assertTrue(actual.endswith(b"\nprivate suffix"))  # mixed file: LF
+        self.assertIn(b"\r\n" + SOURCE_AGENTS.replace(b"\r\n", b"\n").rstrip(b"\n") + b"\nprivate suffix", actual)
         self.assertEqual(self.home.joinpath("AGENTS.md.bak").read_bytes(), original)
         before = self.snapshot()
         self.assertEqual(self.run_install().returncode, 0)
@@ -329,7 +370,7 @@ class CodexInstallTests(unittest.TestCase):
             with self.subTest(path=relative):
                 target = self.home / relative
                 target.parent.mkdir(exist_ok=True)
-                target.symlink_to(outside)
+                self.symlink(target, outside)
                 before = self.snapshot()
                 result = self.run_install("--force")
                 self.assertNotEqual(result.returncode, 0)
@@ -453,12 +494,12 @@ class CodexInstallTests(unittest.TestCase):
         for name in ("agents", "bin"):
             with self.subTest(path=name):
                 target = self.home / name
-                target.symlink_to(outside, target_is_directory=True)
+                self.symlink(target, outside, target_is_directory=True)
                 self.assertNotEqual(self.run_install("--force").returncode, 0)
                 self.assertEqual(list(outside.iterdir()), [])
                 self.assertFalse((self.home / "AGENTS.md").exists())
                 target.unlink()
-        self.home.joinpath("AGENTS.md").symlink_to(outside / "missing")
+        self.symlink(self.home.joinpath("AGENTS.md"), outside / "missing")
         self.assertNotEqual(self.run_install("--force").returncode, 0)
         self.assertFalse(self.home.joinpath("agents").exists())
 
@@ -528,6 +569,55 @@ class CodexInstallTests(unittest.TestCase):
         self.assertIs(json.loads(out)["jev"]["enabled"], True)
         hooks = install_module.merge_jev_hooks(Path("hooks.json"), b'{"note": "\\ud83d"}', self.home, True)
         self.assertEqual(json.loads(hooks)["note"], "\ud83d")
+
+    def test_path_ownership_rejects_dot_components(self):
+        base = str(Path(self.temp.name) / "Codex Home" / "bin")
+        self.assertTrue(install_module.same_path(base + "/jev-hook.py", base + "/jev-hook.py"))
+        for spelling in (base + "/x/../jev-hook.py", base + "/./jev-hook.py", "../" + base + "/jev-hook.py"):
+            with self.subTest(spelling=spelling):
+                self.assertFalse(install_module.same_path(spelling, base + "/jev-hook.py"))
+
+    def test_healing_a_mixed_file_normalises_the_break_after_the_block(self):
+        crlf_source = (b"<!-- CODEX-ORCHESTRATOR:START -->\nrules\n<!-- CODEX-ORCHESTRATOR:END -->\n").replace(b"\n", b"\r\n")
+        existing = b"mine\n" + crlf_source.rstrip() + b"\r\n"
+        merged = install_module.merge_instructions(existing, crlf_source, Path("AGENTS.md"))
+        self.assertNotIn(b"\r", merged)
+        self.assertEqual(merged, b"mine\n" + crlf_source.replace(b"\r\n", b"\n"))
+
+    def test_jev_hook_ownership_ignores_path_case_where_the_os_does(self):
+        path = Path("hooks.json")
+        user = {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-hook"}]}
+        prior = json.dumps({"hooks": {"PreToolUse": [user]}}).encode()
+        first = install_module.merge_jev_hooks(path, prior, self.home, True)
+        other = Path(str(self.home).swapcase())
+        # Stand in for a case-insensitive OS, so this also runs where normcase is the identity.
+        with mock.patch.object(install_module.os.path, "normcase", str.lower):
+            again = json.loads(install_module.merge_jev_hooks(path, first, other, True))["hooks"]
+            removed = json.loads(install_module.merge_jev_hooks(path, first, other, False))["hooks"]
+        command = install_module.hook_command(other)
+        self.assertEqual(again["PreToolUse"][0], user)
+        self.assertEqual({event: len(groups) for event, groups in again.items()},
+                         {"PreToolUse": 2, "SubagentStart": 1, "SubagentStop": 1, "UserPromptSubmit": 1})
+        for event, groups in again.items():
+            self.assertEqual(groups[-1]["hooks"][0]["command"], command, event)
+        self.assertEqual(removed, {"PreToolUse": [user]})
+        script = str(self.home / "bin" / "jev-hook.py")
+        for near_miss in (command + " && audit", "user-hook", None, command.replace("jev-hook", "other")):
+            self.assertFalse(install_module.is_jev_command(near_miss, command, script), near_miss)
+
+    @unittest.skipUnless(os.name == "nt", "path case only folds on Windows")
+    def test_reinstall_with_differently_cased_home_does_not_duplicate_hooks(self):
+        self.assertEqual(self.run_install("--jev").returncode, 0)
+        first = json.loads(self.home.joinpath("hooks.json").read_bytes())["hooks"]
+        self.home = Path(str(self.home).swapcase())
+        result = self.run_install("--jev")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hooks = json.loads(self.home.joinpath("hooks.json").read_bytes())["hooks"]
+        self.assertEqual({event: len(groups) for event, groups in hooks.items()},
+                         {event: len(groups) for event, groups in first.items()})
+        for groups in hooks.values():
+            self.assertEqual([h["command"] for g in groups for h in g["hooks"]],
+                             [install_module.hook_command(self.home)])
 
     def test_hooks_json_without_owned_hooks_is_never_rewritten(self):
         for original in (b'{"foo": 1}\n', b'{"hooks": {"Stop": []}}\n', b'{"hooks": {}}'):
