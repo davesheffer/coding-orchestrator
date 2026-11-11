@@ -129,7 +129,8 @@ class DecideTests(unittest.TestCase):
 
     def test_explicit_model_is_never_downgraded(self):
         self.agent(self.home, "builder", "sonnet")
-        for model in ("fable", "claude-fable-5-2", "opusplan"):
+        for model in ("opus", "claude-opus-4-1", "opusplan", "opus[1m]", "Opus[1M]",
+                      "claude-opus-4-1[1m]"):
             with self.subTest(model=model):
                 self.calls.clear()
                 self.payload["tool_input"]["model"] = model
@@ -144,6 +145,43 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(jev.verdict("sonnet", 0.99, "fable", self.cfg, explicit=True),
                          ("explicit model kept", None, None))
         self.assertEqual(jev.verdict("sonnet", 0.99, "fable", self.cfg), ("applied", "sonnet", None))
+
+    def test_explicit_top_tier_model_skips_the_classifier(self):
+        # Nothing ranks above it and an explicit model never goes down: no call, no log.
+        for model in ("fable", "claude-fable-5-2", "Fable", "FABLE[1m]", " fable "):
+            with self.subTest(model=model):
+                self.calls.clear()
+                self.payload["tool_input"]["model"] = model
+                logs = []
+                self.assertIsNone(self.decide(self.payload, self.cfg,
+                                              self.classify(choice="sonnet", confidence=0.99), logs.append))
+                self.assertEqual((self.calls, logs), ([], []))
+        # The strongest kept label is the top tier once fable is removed.
+        cfg = {**self.cfg, "labels": {k: v for k, v in self.cfg["labels"].items() if k != "fable"}}
+        self.payload["tool_input"]["model"] = "opus[1m]"
+        self.assertIsNone(self.decide(self.payload, cfg, self.classify(choice="sonnet", confidence=0.99)))
+        self.assertEqual(self.calls, [])
+        # A top-tier model from the agent's frontmatter is still classified (it may go down).
+        del self.payload["tool_input"]["model"]
+        self.agent(self.home, "builder", "fable")
+        out = self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.99))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "sonnet")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_suffixed_and_mixed_case_models_are_ranked(self):
+        for model, tier in (("opus[1m]", "opus"), ("Opus[1M]", "opus"), ("SONNET", "sonnet"),
+                            ("sonnet [1m]", "sonnet"), ("claude-opus-4-1[1m]", "opus"),
+                            ("OpusPlan[1m]", "opus"), ("Claude-Fable-5-2", "fable")):
+            self.assertEqual(jev.model_tier(model, jev.TIER_RANK), tier, model)
+        self.assertEqual(jev.model_tier("gpt-5[1m]", jev.TIER_RANK), "gpt-5[1m]")
+        # Same tier: not rewritten. A weaker choice: kept. A stronger one: upgraded.
+        self.payload["tool_input"]["model"] = "Opus[1m]"
+        self.assertEqual(jev.verdict("opus", 0.99, "Opus[1m]", self.cfg, explicit=True),
+                         ("same model", None, None))
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.99)))
+        self.payload["tool_input"]["model"] = "Sonnet[1m]"
+        out = self.decide(self.payload, self.cfg, self.classify(choice="opus", confidence=0.4))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
 
     def test_explicit_model_still_upgrades_and_escalates(self):
         logs = []
@@ -167,6 +205,37 @@ class DecideTests(unittest.TestCase):
         del self.payload["tool_input"]["model"]
         self.payload["tool_input"]["subagent_type"] = "general-purpose"
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="opus", confidence=0.4)))
+
+    def test_unknown_current_follows_the_codex_rule(self):
+        # No model and no frontmatter: the subagent inherits the parent's model, so the
+        # weakest kept tier is a likely downgrade and needs downgrade_min_confidence.
+        del self.payload["tool_input"]["model"]
+        self.payload["tool_input"]["subagent_type"] = "general-purpose"
+        self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.7)))
+        out = self.decide(self.payload, self.cfg, self.classify(choice="sonnet", confidence=0.85))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "sonnet")
+        # Other choices need min_confidence.
+        out = self.decide(self.payload, self.cfg, self.classify(choice="opus", confidence=0.6))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+        # Escalation is relative to the choice, whatever its confidence.
+        logs = []
+        probabilities = {"sonnet": 0.55, "opus": 0.3, "fable": 0.15}
+        out = self.decide(self.payload, self.cfg, self.probs("sonnet", 0.55, probabilities), logs.append)
+        hook = out["hookSpecificOutput"]
+        self.assertEqual(hook["updatedInput"]["model"], "opus")
+        self.assertEqual(hook["permissionDecisionReason"],
+                         "jev: inherit → opus (escalated, P(stronger) 0.45)")
+        self.assertEqual((logs[0]["choice"], logs[0]["escalated_to"]), ("sonnet", "opus"))
+        self.assertEqual(jev.verdict("opus", 0.45, None, self.cfg, {"opus": 0.45, "fable": 0.42}),
+                         ("applied", "fable", 0.42))
+        self.assertEqual(jev.verdict("sonnet", 0.75, None, self.cfg, {"sonnet": 0.75, "opus": 0.25}),
+                         ("below confidence threshold", None, None))
+        # With a single kept tier nothing is a downgrade.
+        cfg = {**self.cfg, "labels": {"sonnet": self.cfg["labels"]["sonnet"]}}
+        self.assertEqual(jev.verdict("sonnet", 0.6, None, cfg), ("applied", "sonnet", None))
+        # A model the hook cannot rank is not "unknown": min_confidence, no escalation.
+        self.assertEqual(jev.verdict("sonnet", 0.6, "gpt-5", self.cfg, probabilities),
+                         ("applied", "sonnet", None))
 
     def probs(self, choice, confidence, probabilities):
         def fn(body, key):
@@ -263,6 +332,17 @@ class DecideTests(unittest.TestCase):
         self.payload["tool_input"]["subagent_type"] = "critic"
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify()))
         self.assertEqual(self.calls, [])
+
+    def test_namespaced_agent_is_pinned_by_its_last_segment(self):
+        for name in ("review:critic", "plugin:tools:fork"):
+            self.payload["tool_input"]["subagent_type"] = name
+            self.assertIsNone(self.decide(self.payload, self.cfg, self.classify()), name)
+        self.assertEqual(self.calls, [])
+        # Only the last segment counts, and only whole.
+        for name in ("critic:builder", "review:critic-helper", "uncritic"):
+            self.payload["tool_input"]["subagent_type"] = name
+            self.assertIsNotNone(self.decide(self.payload, self.cfg, self.classify()), name)
+        self.assertEqual(len(self.calls), 3)
 
     def test_missing_key_is_noop(self):
         with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):

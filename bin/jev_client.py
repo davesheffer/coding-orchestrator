@@ -96,16 +96,32 @@ DEFAULTS = {
 
 
 def load_config(path=CONFIG_PATH):
+    """The Jev settings: DEFAULTS with the file's `jev` entry over them. An absent file
+    is the defaults. A file that exists but can't be read as a JSON object (or whose
+    `jev` entry is not one) is the defaults too, with what is wrong with it in
+    `config_problem`: a push then fails closed (see jev-guard.py), since nothing says
+    whether the gate was meant to be on or which key it was meant to use."""
     cfg = dict(DEFAULTS)
     user = {}
+    problem = None
     try:
-        loaded = json.loads(Path(path).read_text(encoding="utf-8")).get("jev")
-        if isinstance(loaded, dict):
-            user = loaded
-    except Exception:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        if not isinstance(loaded, dict):
+            problem = "does not hold a JSON object"
+        elif isinstance(loaded.get("jev"), dict):
+            user = loaded["jev"]
+        elif loaded.get("jev") is not None:
+            problem = "has a jev entry that is not a JSON object"
+    except FileNotFoundError:
         pass
-    # log_path is internal (codex/jev-hook.py sets it after loading), never user-supplied.
-    cfg.update({k: v for k, v in user.items() if k not in ("labels", "features", "log_path")})
+    except Exception:
+        problem = "cannot be read as JSON"
+    # log_path and config_problem are internal (codex/jev-hook.py sets log_path after
+    # loading), never user-supplied.
+    cfg.update({k: v for k, v in user.items()
+                if k not in ("labels", "features", "log_path", "config_problem")})
+    if problem:
+        cfg["config_problem"] = f"{path} {problem}"
     # User labels merge over the defaults; a null value removes that tier.
     labels = dict(DEFAULTS["labels"])
     if isinstance(user.get("labels"), dict):
@@ -206,7 +222,7 @@ def endpoint_allowed(endpoint):
 def effective_timeout(cfg, cap=MAX_DEADLINE_SECONDS):
     try:
         timeout = float(cfg.get("timeout_seconds"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # a huge int overflows float()
         timeout = cap
     if not math.isfinite(timeout):
         timeout = cap
@@ -256,29 +272,84 @@ def resolve_executable(name):
     return None
 
 
-def api_key(cfg):
+def _key_file(path):
+    """(key, problem) for the file `jev.api_key_file` names: the key it holds, or what
+    is wrong with the file. The problem never quotes the file's content."""
+    try:
+        target = Path(path).expanduser()
+        if target.is_dir():
+            return None, "is a directory"
+        key = target.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None, "does not exist"
+    except UnicodeError:
+        return None, "is not UTF-8 text"
+    except Exception:
+        return None, "cannot be read"
+    # A key is one short token; anything else (a private key, a dotfile) is the
+    # wrong file and must never be sent as a Bearer header.
+    if not key:
+        return None, "is empty"
+    if len(key) > 512:
+        return None, "is too long to be an API key"
+    if any(ch.isspace() for ch in key):
+        return None, "holds more than one word"
+    return key, None
+
+
+def _api_key(cfg):
+    """(key, problem): the API key, and what is wrong with `jev.api_key_file` when it is
+    set but gives none, or with `jev.api_key_source` when that is set (and no key file
+    is) but gives none (see api_key_problem, api_key_source_problem). The key file is
+    read once, so the two cannot disagree."""
     key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     if key:
-        return key
+        return key, None
     path = cfg.get("api_key_file")
     if isinstance(path, str) and path:
-        try:
-            key = Path(path).expanduser().read_text(encoding="utf-8").strip()
-        except Exception:
-            return None
-        # A key is one short token; anything else (a private key, a dotfile) is the
-        # wrong file and must never be sent as a Bearer header.
-        if not key or len(key) > 512 or any(ch.isspace() for ch in key):
-            return None
-        return key
-    if cfg.get("api_key_source") == "claude_settings":
-        try:
-            settings = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
-            value = settings.get("env", {}).get("TYPESAFE_API_KEY")
-            return value.strip() or None if isinstance(value, str) else None
-        except Exception:
-            return None
-    return None
+        return _key_file(path)
+    if path is not None and path != "":
+        # Set, but not to a path (a number, a list): as unusable as a bad file.
+        return None, "is not a file path"
+    source = cfg.get("api_key_source")
+    if source is None or source == "":
+        return None, None
+    # A key source chosen on purpose that gives no key is a misconfiguration, like a bad
+    # key file (a push fails closed), not a key that was never set up.
+    if source != "claude_settings":
+        return None, "is not a known key source"
+    try:
+        settings = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8-sig"))
+        value = settings.get("env", {}).get("TYPESAFE_API_KEY")
+    except FileNotFoundError:
+        return None, "names Claude Code settings that do not exist"
+    except Exception:
+        return None, "names Claude Code settings that cannot be read"
+    key = value.strip() if isinstance(value, str) else ""
+    if not key:
+        return None, "names Claude Code settings with no TYPESAFE_API_KEY"
+    return key, None
+
+
+def api_key_problem(cfg):
+    """What is wrong with the configured key file (e.g. "is empty"), or None when a key
+    is usable or none is configured at all. Unlike a key that was never set up, a key
+    file that cannot be used is a misconfiguration (ask() records "BadApiKeyFile"); so
+    is an `api_key_file` that is set to something other than a path, and a set
+    `api_key_source` that gives no key (then the problem is the source's, see
+    api_key_source_problem)."""
+    return _api_key(cfg)[1]
+
+
+def api_key_source_problem(cfg):
+    """Whether api_key_problem is about `jev.api_key_source` rather than the key file:
+    no key file is set, so the source was the one read."""
+    path = cfg.get("api_key_file")
+    return (path is None or path == "") and api_key_problem(cfg) is not None
+
+
+def api_key(cfg):
+    return _api_key(cfg)[0]
 
 
 def http_classify(body, cfg, key):
@@ -302,7 +373,8 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=
 
     classify_fn(body, key) returns the parsed response; it defaults to the HTTP
     call and always runs under the hard deadline. When `errors` is a list, a
-    failed call appends a short reason (the exception class name, "NoApiKey" or
+    failed call appends a short reason (the exception class name, "NoApiKey",
+    "BadApiKeyFile" for a configured key file or key source that cannot be used, or
     "MalformedResponse") so callers can log it; never the body or the key.
     Disabled features and disallowed endpoints append nothing.
 
@@ -316,10 +388,10 @@ def ask(cfg, feature, state, questions, classify_fn=None, errors=None, deadline=
     """
     if not feature_enabled(cfg, feature) or not endpoint_allowed(cfg.get("endpoint")):
         return None
-    key = api_key(cfg)
+    key, problem = _api_key(cfg)
     if not key:
         if errors is not None:
-            errors.append("NoApiKey")
+            errors.append("BadApiKeyFile" if problem else "NoApiKey")
         return None
     timeout = effective_timeout(cfg, min(max(float(timeout_cap), 0.0), MAX_ASK_DEADLINE_SECONDS))
     if deadline is not None:

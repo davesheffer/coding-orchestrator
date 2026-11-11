@@ -194,6 +194,19 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(jev_client.ask(cfg, "shift", {}, {}, ok), {})
         self.assertEqual([c.args[2] for c in call.call_args_list], [1.5, 3.0, 3.0])
 
+    def test_effective_timeout_survives_junk_values(self):
+        # float(10 ** 400) raises OverflowError, like config_number's huge int.
+        for bad in (10 ** 400, "soon", None, [3], float("nan"), float("inf")):
+            with self.subTest(bad=repr(bad)[:20]):
+                self.assertEqual(jev_client.effective_timeout({"timeout_seconds": bad}),
+                                 jev_client.MAX_DEADLINE_SECONDS)
+        self.assertEqual(jev_client.effective_timeout({"timeout_seconds": 10 ** 400}, 7), 7)
+        self.assertEqual(jev_client.effective_timeout({"timeout_seconds": "2.5"}), 2.5)
+        # ask() computes the timeout before calling the classifier: it must not raise.
+        cfg = self.config({})
+        cfg["timeout_seconds"] = 10 ** 400
+        self.assertEqual(jev_client.ask(cfg, "shift", {}, {}, lambda body, key: {"answers": {}}), {})
+
     def test_ask_http_timeout_follows_deadline(self):
         cfg = self.config({"timeout_seconds": 3})
         seen = []
@@ -329,6 +342,83 @@ class ClientTests(unittest.TestCase):
                 bad.write_text(text, encoding="utf-8")
                 self.assertIsNone(jev_client.api_key({"api_key_file": str(bad)}), text[:20])
 
+    def test_unusable_key_file_is_a_problem_but_no_key_at_all_is_not(self):
+        def boom(body, key):
+            raise AssertionError("classifier called without a key")
+        cfg = self.config({})
+        states = (("missing", None, "does not exist"), ("empty", b"", "is empty"),
+                  ("blank", b" \r\n\t", "is empty"), ("long", b"x" * 600, "is too long to be an API key"),
+                  ("binary", b"\xff\xfe\x00tok-secret", "is not UTF-8 text"),
+                  ("words", b"tok-secret-1 tok-secret-2", "holds more than one word"),
+                  ("dir", None, "is a directory"))
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
+            for name, content, problem in states:
+                path = self.dir / f"key-{name}"
+                if name == "dir":
+                    path.mkdir()
+                elif content is not None:
+                    path.write_bytes(content)
+                with self.subTest(name=name):
+                    bad = {**cfg, "api_key_file": str(path)}
+                    self.assertIsNone(jev_client.api_key(bad))
+                    self.assertEqual(jev_client.api_key_problem(bad), problem)
+                    errors = []
+                    self.assertIsNone(jev_client.ask(bad, "shift", {}, {}, boom, errors=errors))
+                    self.assertEqual(errors, ["BadApiKeyFile"])
+            # Nothing configured at all is not a file problem.
+            for none in ({**cfg, "api_key_file": None}, {**cfg, "api_key_file": ""}):
+                self.assertIsNone(jev_client.api_key_problem(none))
+                errors = []
+                self.assertIsNone(jev_client.ask(none, "shift", {}, {}, boom, errors=errors))
+                self.assertEqual(errors, ["NoApiKey"])
+            good = self.dir / "key-good"
+            good.write_text("tok-123\n", encoding="utf-8")
+            self.assertIsNone(jev_client.api_key_problem({**cfg, "api_key_file": str(good)}))
+        # The environment variable wins, so a bad file behind it is not consulted.
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "env-key"}):
+            self.assertIsNone(jev_client.api_key_problem({**cfg, "api_key_file": str(self.dir / "key-empty")}))
+
+    def test_api_key_file_that_is_not_a_path_is_a_problem(self):
+        # Critic 5: a number or a list read as "no key configured", which fails open.
+        def boom(body, key):
+            raise AssertionError("classifier called without a key")
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
+            for value in (123, 0, 1.5, True, False, ["x"], [], {"path": "x"}, {}):
+                # As load_config passes it through from disk, and set on the dict.
+                for cfg in (self.config({"api_key_file": value}),
+                            {**self.config({}), "api_key_file": value},
+                            {**self.config({"api_key_source": "claude_settings"}),
+                             "api_key_file": value}):
+                    with self.subTest(value=value):
+                        self.assertEqual(cfg["api_key_file"], value)
+                        self.assertIsNone(jev_client.api_key(cfg))
+                        self.assertEqual(jev_client.api_key_problem(cfg), "is not a file path")
+                        errors = []
+                        self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, boom, errors=errors))
+                        self.assertEqual(errors, ["BadApiKeyFile"])
+        # The environment variable still wins over it.
+        self.assertEqual(jev_client.api_key({"api_key_file": 123}), "test-key")
+        self.assertIsNone(jev_client.api_key_problem({"api_key_file": 123}))
+
+    def test_ask_reads_the_key_file_once(self):
+        # Critic 8: the key and its problem came from two reads, so a file that failed
+        # the first and passed the second was recorded as "no key configured".
+        def boom(body, key):
+            raise AssertionError("classifier called without a key")
+        cfg = {**self.config({}), "api_key_file": str(self.dir / "key")}
+        reads = [(None, "cannot be read"), ("tok-123", None)]
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}), \
+                mock.patch.object(jev_client, "_key_file", side_effect=reads) as read:
+            errors = []
+            self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, boom, errors=errors))
+            self.assertEqual(errors, ["BadApiKeyFile"])
+            self.assertEqual(read.call_count, 1)
+            # The next call reads it again and uses the key it now holds.
+            keys = []
+            answers = jev_client.ask(cfg, "shift", {}, {},
+                                     lambda body, key: keys.append(key) or {"answers": {}})
+            self.assertEqual((answers, keys, read.call_count), ({}, ["tok-123"], 2))
+
     def test_resolve_executable_skips_cwd_and_relative_path_entries(self):
         name = "jevtool"
         exe = name + (".exe" if os.name == "nt" else "")
@@ -353,6 +443,75 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(Path(jev_client.resolve_executable(name)), real / exe)
         with mock.patch.dict(os.environ, {"PATH": str(planted), "PATHEXT": ".COM;.EXE"}):
             self.assertIsNone(jev_client.resolve_executable(name))
+
+    def test_unreadable_config_file_is_flagged_and_an_absent_one_is_not(self):
+        # Round 6, item 9: a config.json that exists but can't be read fell back to the
+        # defaults silently, which read as "no key configured" (a push failed open).
+        self.assertNotIn("config_problem", jev_client.load_config(self.dir / "missing.json"))
+        path = self.dir / "config.json"
+        for content, problem in (('{"jev": {"enabled": true,}}', "cannot be read as JSON"),
+                                 ("", "cannot be read as JSON"),
+                                 ("[1, 2]", "does not hold a JSON object"),
+                                 ('{"jev": 1}', "has a jev entry that is not a JSON object"),
+                                 ('{"jev": "on"}', "has a jev entry that is not a JSON object")):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                cfg = jev_client.load_config(path)
+                self.assertEqual(cfg["config_problem"], f"{path} {problem}")
+                self.assertFalse(cfg["enabled"])
+        path.write_bytes(b"\xff\xfe{")
+        self.assertIn("cannot be read as JSON", jev_client.load_config(path)["config_problem"])
+        # Readable files: no problem (a BOM from a Windows editor is fine, and so is a
+        # file with no jev entry), and the file can't set the marker itself.
+        for content in ('\ufeff{"jev": {"enabled": true}}', '{"rollover": "copy"}', '{"jev": null}',
+                        '{"jev": {"config_problem": "x"}}'):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assertNotIn("config_problem", jev_client.load_config(path))
+        path.write_text('\ufeff{"jev": {"enabled": true}}', encoding="utf-8")
+        self.assertTrue(jev_client.load_config(path)["enabled"])
+
+    def test_key_source_set_on_purpose_that_gives_no_key_is_a_problem(self):
+        # Round 6, item 9: `api_key_source: "claude_settings"` with no key there read as
+        # "no key configured" (a push failed open).
+        def boom(body, key):
+            raise AssertionError("classifier called without a key")
+        home = self.dir / "home"
+        (home / ".claude").mkdir(parents=True)
+        settings = home / ".claude" / "settings.json"
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}), \
+                mock.patch.object(Path, "home", return_value=home):
+            for content, problem in (
+                    (None, "names Claude Code settings that do not exist"),
+                    ("{not json", "names Claude Code settings that cannot be read"),
+                    ('{"env": {}}', "names Claude Code settings with no TYPESAFE_API_KEY"),
+                    ('{"env": {"TYPESAFE_API_KEY": "  "}}',
+                     "names Claude Code settings with no TYPESAFE_API_KEY")):
+                with self.subTest(content=content):
+                    if content is not None:
+                        settings.write_text(content, encoding="utf-8")
+                    cfg = self.config({"api_key_source": "claude_settings"})
+                    self.assertIsNone(jev_client.api_key(cfg))
+                    self.assertEqual(jev_client.api_key_problem(cfg), problem)
+                    self.assertTrue(jev_client.api_key_source_problem(cfg))
+                    errors = []
+                    self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, boom, errors=errors))
+                    self.assertEqual(errors, ["BadApiKeyFile"])
+            for source in ("keychain", 1, True):
+                cfg = self.config({"api_key_source": source})
+                self.assertEqual(jev_client.api_key_problem(cfg), "is not a known key source")
+            # Not set, null or "": no key configured at all (fails open with a warning).
+            for jev in ({}, {"api_key_source": None}, {"api_key_source": ""},
+                        {"api_key_file": None}, {"api_key_file": ""}):
+                cfg = self.config(jev)
+                self.assertIsNone(jev_client.api_key_problem(cfg))
+                self.assertFalse(jev_client.api_key_source_problem(cfg))
+                errors = []
+                self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, boom, errors=errors))
+                self.assertEqual(errors, ["NoApiKey"])
+            settings.write_text('{"env": {"TYPESAFE_API_KEY": " tok-s "}}', encoding="utf-8")
+            self.assertEqual(jev_client.api_key(self.config({"api_key_source": "claude_settings"})),
+                             "tok-s")
 
 
 if __name__ == "__main__":

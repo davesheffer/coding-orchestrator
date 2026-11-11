@@ -344,6 +344,17 @@ class CodexJevTests(unittest.TestCase):
             self.assertEqual(decision["permissionDecision"], "deny")
             self.assertIn("fail-closed", decision["permissionDecisionReason"])
             self.assertEqual(self.run_main(bash("ls -la")), (0, ""))
+            # the forms the guard's scanner reads through, as in jev-guard.py's crash path
+            for command in ("g\\it push", "git 'pu'sh origin main", 'git "push" --force',
+                            "gi't' pu\\sh", 'bash -c "g\\it pu\\sh"', "git \\\npush",
+                            "git send-pack origin main", "git -C x 'send-pack' origin main",
+                            "C:\\Git\\cmd\\git.exe push"):
+                with self.subTest(command=command):
+                    code, out = self.run_main(bash(command))
+                    self.assertEqual(code, 0)
+                    self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+            for command in ("git status", "echo 'pu'sh", "git stash list"):
+                self.assertEqual(self.run_main(bash(command)), (0, ""), command)
             # unparsable payload: match the raw text
             code, out = self.run_main(None, raw="{not json git push")
             self.assertEqual(code, 0)
@@ -400,10 +411,38 @@ class CodexJevTests(unittest.TestCase):
             module.risk({"tool_name": "PowerShell", "tool_input": {"command": "git push"}}, cfg)
             module.risk({"tool_name": "local_shell", "tool_input": {"command": ["git", "push", "it's"]}}, cfg)
         self.assertEqual(seen[0]["tool_name"], "Bash")
-        self.assertEqual(seen[0]["tool_input"], {"command": "bash -lc 'git push'", "cwd": "x"})
+        # A `[<shell>, -lc, <script>]` argv is its script, which the guard's scanner can read.
+        self.assertEqual(seen[0]["tool_input"], {"command": "git push", "cwd": "x"})
         self.assertEqual(seen[1]["tool_name"], "PowerShell")
         self.assertEqual(seen[1]["tool_input"]["command"], "git push")
         self.assertEqual(seen[2]["tool_input"]["command"], "git push 'it'\"'\"'s'")
+
+    def test_shell_command_unwraps_only_a_shell_script_argv(self):
+        script = "cd repo && git push --force origin main"
+        for argv in (["bash", "-lc", script], ["sh", "-c", script], ["/bin/zsh", "-lc", script],
+                     ["C:\\Program Files\\Git\\bin\\bash.exe", "-c", script], ["BASH", "-ic", script]):
+            self.assertEqual(module.shell_command({"command": argv}), script, argv)
+        self.assertEqual(module.shell_command({"cmd": ["bash", "-lc", script]}), script)
+        # Anything else is still joined with POSIX quoting.
+        for argv, joined in ((["bash", "-lc", "git push", "extra"], "bash -lc 'git push' extra"),
+                             (["bash", "run.sh", "git push"], "bash run.sh 'git push'"),
+                             (["python", "-c", "print(1)"], "python -c 'print(1)'"),
+                             (["git", "-c", "push"], "git -c push"),
+                             (["bash", "-lc"], "bash -lc")):
+            self.assertEqual(module.shell_command({"command": argv}), joined, argv)
+
+    def test_shell_argv_push_is_parsed_by_the_real_guard(self):
+        # Joined, `bash -lc 'git push'` was one quoted word: denied once, then let through
+        # unreviewed. As its script it is a parsed push, here with no upstream to diff.
+        guard = module.guard_module()
+        cfg = module.settings() | {"enabled": True}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(module, "STATE", Path(tmp) / "state"), patch.object(module, "log"):
+            payload = {"tool_name": "shell", "session_id": "s1", "cwd": tmp,
+                       "tool_input": {"command": ["bash", "-lc", "git push"]}}
+            out = module.risk(payload, cfg, lambda body, key: self.fail("no classifier call expected"))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                         guard.UNJUDGED_PUSH_REASON)
 
     def test_installer_matcher_names_the_same_shell_tools(self):
         spec = importlib.util.spec_from_file_location("codex_install_for_jev", ROOT / "codex" / "install.py")

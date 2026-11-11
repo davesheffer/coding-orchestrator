@@ -8,7 +8,11 @@ input's `model`. Moving to a stronger tier needs less confidence than moving to
 a weaker one, and a task escalates when the stronger tiers together are likely
 enough, because under-routing costs more than over-routing. A call that sets `model`
 itself is never moved to a weaker tier when the hook can rank
-that model. Configuration lives under the "jev" key of
+that model, and is not classified at all when it already names the strongest kept
+tier. With no model and no agent frontmatter the subagent inherits the parent's
+model, so the rule is codex/jev-hook.py's: only the weakest kept tier needs the
+downgrade confidence, and escalation is relative to the classifier's choice.
+Configuration lives under the "jev" key of
 `<install>/relay/config.json`; the API key comes from TYPESAFE_API_KEY or
 `jev.api_key_file`.
 
@@ -35,6 +39,8 @@ from jev_client import (  # noqa: E402  (re-exported for callers and tests)
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # Claude Code model aliases that run a known tier (opusplan plans with opus).
 MODEL_ALIASES = {"opusplan": "opus"}
+# A trailing bracket suffix on a model name (`opus[1m]`, the 1M-context variant).
+MODEL_SUFFIX_RE = re.compile(r"\s*\[[^\[\]]*\]$")
 INSTRUCTIONS = ("Which model tier should run this subagent task? "
                 "Pick the least expensive tier that will reliably do it well; "
                 "when torn between two tiers, pick the stronger one.")
@@ -83,10 +89,10 @@ def explicit_model(tool_input):
 def model_tier(model, tiers):
     """The tier alias for a model: the alias itself (or its MODEL_ALIASES tier), or the tier
     from `tiers` named inside a full Claude id (claude-opus-4-1 is opus when "opus" is in
-    tiers); else the model."""
+    tiers); else the model. Case and a trailing `[...]` suffix are ignored (`Opus[1m]`)."""
     if not isinstance(model, str):
         return model
-    lowered = model.strip().lower()
+    lowered = MODEL_SUFFIX_RE.sub("", model.strip().lower())
     lowered = MODEL_ALIASES.get(lowered, lowered)
     if lowered in tiers:
         return lowered
@@ -128,13 +134,16 @@ def verdict(choice, confidence, current, cfg, probabilities=None, explicit=False
     """(why, model, escalated_mass): why an answer is skipped, or "applied" with the
     model to run (shared with bin/eval-jev-routing.py). escalated_mass is set when
     the classifier kept the current tier but stronger tiers together are likely enough.
-    explicit: the call set `current` itself, so it is never moved to a weaker tier."""
+    explicit: the call set `current` itself, so it is never moved to a weaker tier.
+    With no current model at all, the rule is unknown_verdict's."""
     if not isinstance(current, str):
         current = None  # e.g. a dict/list tool_input.model: treat as unknown
     if not isinstance(choice, str) or choice not in cfg["labels"]:
         return "invalid label", None, None
     if not valid_confidence(confidence):
         return "invalid confidence", None, None
+    if current is None and choice in TIER_RANK:
+        return unknown_verdict(choice, confidence, cfg, probabilities)
     # Resolve against every known tier, so thresholds don't depend on which labels are kept.
     tier = model_tier(current, TIER_RANK)
     escalated = escalation(tier, choice, probabilities, cfg)
@@ -150,9 +159,30 @@ def verdict(choice, confidence, current, cfg, probabilities=None, explicit=False
     return "applied", choice, None
 
 
+def unknown_verdict(choice, confidence, cfg, probabilities=None):
+    """verdict() when the current tier is unknown (no explicit model, no frontmatter): the
+    subagent inherits the parent's model, so only the weakest kept tier is a likely
+    downgrade and needs downgrade_min_confidence, other choices need min_confidence, and
+    a task escalates when the tiers above the choice are likely enough (the rule of
+    codex/jev-hook.py's route)."""
+    ranks = {t: r for t, r in TIER_RANK.items() if t in cfg["labels"]}
+    escalated = stronger_tier(probabilities, ranks, TIER_RANK[choice], cfg["escalate_mass"])
+    if escalated:
+        return "applied", escalated[0], escalated[1]
+    # With a single kept tier nothing is a downgrade.
+    weakest = len(ranks) > 1 and TIER_RANK[choice] == min(ranks.values())
+    floor = cfg["downgrade_min_confidence"] if weakest else cfg["min_confidence"]
+    if confidence < float(floor):
+        return "below confidence threshold", None, None
+    return "applied", choice, None
+
+
 def pinned(tool_input, cfg):
-    """True when the call is never classified (pinned agent or respected explicit model)."""
-    if tool_input.get("subagent_type") in (cfg.get("pinned_agents") or []):
+    """True when the call is never classified (pinned agent or respected explicit model).
+    A namespaced agent is pinned by its last segment too (`review:critic` by `critic`)."""
+    name = tool_input.get("subagent_type")
+    pins = cfg.get("pinned_agents") or []
+    if name in pins or (isinstance(name, str) and name.rsplit(":", 1)[-1] in pins):
         return True
     # Same predicate as current_model: only a non-blank string pins; a non-string is invalid
     # (logged by decide), not a silent pin.
@@ -185,13 +215,23 @@ def escalation(current, choice, probabilities, cfg):
 
 
 def threshold(current, choice, cfg):
-    """Upgrades need little confidence, downgrades a lot; unknown direction uses min_confidence."""
+    """Upgrades need little confidence, downgrades a lot; a current model the hook cannot
+    rank uses min_confidence (no current model at all: see unknown_verdict)."""
     if current in TIER_RANK and choice in TIER_RANK:
         if TIER_RANK[choice] > TIER_RANK[current]:
             return float(cfg["upgrade_min_confidence"])
         if TIER_RANK[choice] < TIER_RANK[current]:
             return float(cfg["downgrade_min_confidence"])
     return float(cfg["min_confidence"])
+
+
+def top_tier(model, cfg):
+    """True when `model` ranks at or above every kept label: an explicit one can then be
+    neither upgraded nor (being explicit) downgraded, so asking the classifier is waste."""
+    tier = model_tier(model, TIER_RANK)
+    if not isinstance(tier, str) or tier not in TIER_RANK:
+        return False
+    return all(TIER_RANK[tier] >= TIER_RANK[label] for label in cfg["labels"] if label in TIER_RANK)
 
 
 def build_questions(cfg):
@@ -220,6 +260,8 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
                     "reason": "skipped: invalid model"})
         return None
     current = current_model(payload, tool_input, home)
+    if explicit_model(tool_input) and top_tier(current, cfg):
+        return None  # e.g. an explicit fable: no move is possible, so no classifier call
     shown = display_model(current)
     start = time.monotonic()
     errors = []

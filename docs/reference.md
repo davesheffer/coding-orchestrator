@@ -216,9 +216,9 @@ features. Your own hooks and other `jev` keys stay. A
 
 | Feature | Runs in | Question for Jev | What happens | Sent to TypeSafe |
 |---|---|---|---|---|
-| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A choice that differs from the current model is applied through `updatedInput.model` when confident enough: moving to a stronger tier needs less confidence than moving to a weaker one, and a task escalates when stronger tiers together are likely enough | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
+| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A choice that differs from the current model is applied through `updatedInput.model` when confident enough: moving to a stronger tier needs less confidence than moving to a weaker one, and a task escalates when stronger tiers together are likely enough. A call that sets the strongest kept tier itself is not classified | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
 | `shift` | `UserPromptSubmit` → `relay/relay.py prompt` | Does the new prompt continue the recent prompts / handoff goal? | Below `shift_low`: "TASK SHIFT DETECTED — roll over now". Above `shift_high`: the generic task-shift reminder is dropped | Last 5 prompts (500 chars each), handoff GOAL, new prompt (2,000 chars) |
-| `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds | Operation, changed file names, diff (`send_diff`, `max_diff_chars`), with secret-looking files and tokens redacted (below) |
+| `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds. A push that forces, deletes a remote ref or sends more than the named refs is always asked about. A push is denied on every attempt while Jev is configured but unreachable (below) | Operation, changed file names, a push's force/delete/refspec notes (ref names), diff (`send_diff`, `max_diff_chars`), with secret-looking files and tokens redacted (below) |
 | `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A hand-back report with missing sections or unsupported EVIDENCE is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections, with tokens redacted (below) |
 | `handoff_grade` | `relay.py handoff` | How actionable is this handoff for a fresh session (0–4)? Is NEXT STEP concrete? Do VERIFIED claims cite commands? | Below `handoff_min_score`: prints the gaps and **exits 3 without saving**. `--accept-weak` saves anyway | The handoff body (12,000 chars) |
 
@@ -240,11 +240,20 @@ with `HEAD`, because nothing is staged when the hook runs; new untracked files
 contents are omitted because an untracked path can be a symlink outside the
 repository; review new files directly before relying on the gate's advice.
 
-`risk_gate` is advisory, not enforcement. It finds `git`, `git.exe` and a path
+`risk_gate` is advisory, not enforcement, and it covers `git commit` and
+`git push` only. Other outward or destructive actions are not checked: `gh`
+(`pr merge`, `release`, `api`), `npm publish` and other publish or deploy
+CLIs, and local `git branch -D`, `git tag -d` or `git reset --hard`. A remote
+ref deleted through a push (`git push origin --delete x`, `git push origin :x`)
+is part of that push and is checked with it.
+
+It finds `git`, `git.exe` and a path
 to either (`/usr/bin/git`), after `;`, `&&`, `||`, `|`, `(`, `{`, a backtick
 or a newline, and after `VAR=value`, `then`/`do`/`else` and the
-`time`/`exec`/`command`/`env`/`nice`/`sudo` wrappers (with plain flags such as
-`nice -n 5`). It understands `git -c k=v`, `--no-pager`, `-C <dir>` and earlier
+`time`/`exec`/`command`/`env`/`nice`/`sudo`/`winpty` wrappers (with plain flags such as
+`nice -n 5`). A command that is nothing but a shell running a script
+(`bash -lc '<script>'`, `sh -c "<script>"`, also after `winpty`) is gated as
+that script. It understands `git -c k=v`, `--no-pager`, `-p`/`-P`, `-C <dir>` and earlier
 `cd <dir>` steps in the same command, including a subshell
 (`cd <dir> && git add -A && git commit`, `(cd <dir> && git commit)`) and, on
 Windows, Git Bash paths such as `cd /c/Users/me/repo`. It ignores literal quoted text,
@@ -252,13 +261,130 @@ comments and quoted heredoc bodies, while scanning executable substitutions in
 double quotes and unquoted heredocs. It honours backslash escapes and
 `\`-newline continuations, and gates
 every commit and push in the command: with a push anywhere, it asks about the
-staged diff plus the unpushed commits, as a push. A push is compared with its
+staged diff plus the unpushed commits, as a push. A command for the PowerShell
+tool is read with PowerShell's rules instead: a backtick is the escape (inside
+double quotes too), a backslash is an ordinary character (`"C:\a\"` ends at its
+second quote), a doubled quote inside a quoted string is that quote, a `${…}`
+variable name is not a comment, and `<# … #>` is a block comment (only the
+block is dropped; an unclosed `<#` drops nothing). A here-string, `--%` or a
+typographic quote makes the gate read the whole PowerShell command, comments and
+all, as if every word ran. A push is compared with its
 upstream, else the push remote's default branch (`refs/remotes/<remote>/HEAD`,
-where the remote is `remote.pushDefault` or `origin`), else `origin/main`, else
-`origin/master`; with none of these, the push is not checked. Known bypasses:
-`sh -c`/`bash -c`, general `eval`, a shell alias or function, `xargs`, git run through a
+where the remote is the one named, `remote.pushDefault` or `origin`), else `origin/main`, else
+`origin/master`; with none of these, the push is denied once as unreviewable.
+The push's own arguments are read too. A refspec that names another source
+(`git push origin feature`, `feature:main`) is diffed from that ref against its
+remote-tracking counterpart (`refs/remotes/<remote>/<destination>`); a source
+that does not resolve, or is only known at run time (`$branch`), is denied once
+as unreviewable. `git push <remote>` with no refspec uses the upstream only when
+it is on that remote, else `refs/remotes/<remote>/<current branch>`. `git push`
+with no remote at all goes where git sends it (`branch.<name>.pushRemote`, then
+`remote.pushDefault`, then `branch.<name>.remote`, then `origin`) and is compared
+with that destination's remote-tracking ref (`@{push}`), which is the upstream
+only when both name the same ref. A
+destination with no remote-tracking ref (a new branch, a tag, a remote never
+fetched) is diffed against the remote's default branch as above and is always
+put to Jev with a note that what the remote already holds is unknown. A force (`-f`, `--force`,
+`--force-with-lease`, `--force-if-includes`, `+refspec`), a deleted remote ref
+(`-d`, `--delete`, `:ref`) and a push wider than the named refs (`--mirror`,
+`--all`, `--branches`, `--tags`, `--follow-tags`, `--prune`, a `*` pattern)
+change the remote whatever the diff shows, so such a push is always put to
+Jev, with a one-line note in place of the missing diff, even after a critic
+run. The same goes for what makes the arguments unreliable: an abbreviated long
+option is read as the option git would take it for (`--del`, `--mirr`), and an
+option `git push` does not have, a word only known at run time (`$F`,
+`$(…)`, backticks, `{a,b}`), a remote that is a URL, a path or not configured,
+an option naming the program run on the remote end (`--receive-pack`, `--exec`),
+and inline config (`git -c remote.*`/`push.*`/`branch.*`/`url.*`/`include.*`/`includeIf.*`,
+`--config-env`, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_PARAMETERS`
+in the command) each add such a note. An override of a noted push covers only
+that push (its directory, remote and refs, or the whole command when those
+could not be read). Known bypasses:
+`sh -c`/`bash -c` inside a longer command, general `eval`, a shell alias or function, `xargs`, git run through a
 variable (`$GIT push`), wrappers with value options
-(`sudo -u me git`), and keywords such as `if git commit`. It also misses
+(`sudo -u me git`), and keywords such as `if git commit`. A push or commit
+written one of these ways that the gate still notices is denied once; its
+identical retry is then gated as a plain push (or commit) in the command's
+directory, so the unpushed range there is still reviewed. Such a wrapped push
+is always put to Jev, noted as one whose arguments could not be read, even with
+nothing unpushed there, and it still fails closed (below). A push is noticed
+anywhere a command may run it: behind any wrapper (`ssh-agent git push`, `uv
+run git push`), as another command's argument (`git bisect run git push`,
+`git submodule foreach git push`), in a quoted script given to a command that
+is not known to only read it (`watch 'git push'`, `git rebase -x 'git push'`),
+around a redirection (`2>&1 git push`, `git >/dev/null push`), fed to a command
+that runs its input (`echo git push | xargs env`, `"git push" | iex`), spelled
+with a glob or `$IFS` (`git pus?`, `git${IFS}push`), supplied by `xargs` or
+`parallel` (`xargs -I{} git {} origin`), as `git send-pack`, `git http-push` or a
+`git-push` command word, and in a `$'…'` script, which is never unwrapped.
+With a runner that splits quoted spans into words again anywhere in the command
+(`eval`, PowerShell's `Start-Process`, `saps`, `start`, `watch`, `parallel`,
+`pwsh`/`powershell`), a push word anywhere after a git word (or `-ArgumentList`)
+counts, whatever options, values or quotes come between (`eval git -C . 'push
+origin'`; quotes, backslashes and backticks are removed first).
+`gh pr create` (or `gh pr new`) without a head counts as a push, as gh
+may push the current branch; a head is only an option word of its own
+(`--head`, `--head=…`, `-H`, `-H…`), not another option's value (`--title
+--head`, `-t -H`). `gh repo create … --push` counts too; `gh repo sync` is out of scope (it syncs a fork on
+GitHub's side or pulls into the local branch, and pushes nothing from here).
+Text the gate cannot read but a shell runs counts as a push too: a decoder
+piped into a shell (`base64 -d`/`--decode`, `xxd -r`, `openssl base64 -d`,
+`certutil -decode` … `| sh`, `bash`, `zsh`, `pwsh`, `iex`), PowerShell's
+`FromBase64String` given to `iex`, and `powershell`/`pwsh` given an encoded
+command (`-enc`, `-e`, `-EncodedCommand`). A `cmd` command is also read with its
+`^` carets removed (`cmd /c "g^it push"`), and a word with a backslash-escaped
+blank is read like the quoted span it spells (`git -c core.pager=git\ push -p
+log`, `GIT_PAGER=git\ push git -p log`) unless it is a message or search value.
+Shells nested deeper than the gate reads (`bash -c` inside `bash -c` …) count
+as a push when a push word is anywhere inside, and so does a git word there
+followed by anything but one of git's own commands. A git subcommand that is
+none of git's own is looked up as a config alias (`git config --get
+alias.<name>`, in the repository the command runs in, at most 8 lookups within
+one second) wherever the gate reads a git word: in plain sight, inside `bash -c
+'…'`, `eval '…'`, `"$(…)"` or input fed to a shell, as another command's
+argument (`ssh-agent git p`, `git submodule foreach git p`), and spelled with
+backslashes (`g\it p`, `git \p`). Only one in plain sight is looked up: one
+inside such a span or behind a wrapper (`bash -c 'git p'`, `env -C r git p`,
+`sudo`, `find -execdir`, `Start-Process`, `powershell -c`) counts without a
+lookup, as it may run anywhere (fail closed). One whose value holds a push word or starts
+with `!` counts as a push, and so does a lookup that fails for any reason other
+than "no such key" or does not finish within that second (fail closed). Any
+such subcommand counts without a lookup next to inline config that may define it
+(`-c alias.*`, `-c include.path=…`, `--config-env`) or when the command sets
+where git reads its config in the environment (`GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG`,
+`GIT_CONFIG_PARAMETERS`/`_COUNT`/`_KEY_<n>`, `HOME`, `XDG_CONFIG_HOME`,
+`GIT_DIR`, `GIT_COMMON_DIR`; as `NAME=value`, `env`, `export` or PowerShell's
+`$env:NAME =`). What is known to be only text is not a
+push: the arguments of a command that only reads or prints them
+(`grep "git push" docs/`, `echo git push`; `git grep` too, unless it has `-O` or
+`--open-files-in-pager`, which run a pager command), a message given to git's
+own `commit`, `tag`, `merge`, `stash` or `notes` (`git commit -m "git push"`,
+`-am`, `-sm`; a substitution in it still runs unless a backslash escapes it,
+and `-m` after another program's `tag` or `commit` word is no message), a search
+or format value (`git log --grep="git push"`, `--pretty=format:"…"`),
+`git config --get alias.push`, a comment (a `#` that starts a word, in a
+command with no backtick, `${`, `((`, `$'`, extglob `@(`, `=~` regex or
+array subscript `a[…]` where bash may read such a `#` as text) and a
+`cat <<EOF` body (the delimiter read as bash reads it; one the gate cannot read
+for sure keeps the text). Writing such text to a file (`echo "git push" >>
+NOTES.md`, `| tee -a`) or passing it to a program the gate does not know
+(`notify "git push done"`) may still cost one denial. A file written by a
+redirection (`cat <<EOF > notes.md`) keeps that text inert only while nothing
+but such a reader or `git status`/`diff`/`log`/`add` comes after it in the
+command; after anything else (`make`, `git commit`, `npm run`) all of the
+command is read. A reader that writes a file itself (`sort -o`, `uniq IN OUT`,
+`tee`) or a group's redirection (`{ …; } > f`) counts as a write; a write under
+`.git/` (a hook, config), after a `cd` into one, or to a target built at run
+time (`$d/x`, `.g\it/x`) followed by a git command, a loop keyword with any
+write, a reader given `--pre` (`rg --pre sh`), or a background `&` anywhere
+makes all of the command be read. `nul` counts as a file. A line ending in `|`,
+`&&` or `||` goes on with the next line that is not blank, past any heredoc
+bodies it opens, so `cat <<EOF |` with `sh` after the body runs that body.
+Remaining limits: a command built from variables (`a=git; b=push; $a $b`), a
+shell alias or function defined outside the command, and a git config alias
+that is not in the configuration of the repository the command runs in (one a
+`!` alias or an included file defines at run time). It also misses
 `git commit <pathspec>` with nothing staged, and `GIT_DIR`/`GIT_WORK_TREE`
 environment overrides. It also
 does not scan the body of a `bash <<EOF ... EOF` heredoc or a separate
@@ -294,11 +420,36 @@ other secret formats are sent as-is.
 the text listed in their row above; turn those features off if you want to
 avoid sending it.
 
-Everything fails open. A missing key, a disabled feature, an HTTP error, a
-malformed answer, or a timeout gives exactly the pre-Jev behaviour. Every
+Everything fails open except a push. For routing, shift detection, report
+checks, handoff grading and commits, a missing key, a disabled feature, an HTTP
+error, a malformed answer, or a timeout gives exactly the pre-Jev behaviour. A
+`git push` with something to review fails closed instead: while Jev is
+configured but did not judge it (down, timed out, an endpoint that is not
+allowed, a malformed answer, or a crashed gate), the push is denied on every
+attempt, and retrying does not override it; run the push yourself or retry
+once Jev answers. A key that was never configured (no `TYPESAFE_API_KEY`, no
+`jev.api_key_file` and no `jev.api_key_source`) is the exception: the push is allowed, with a one-line
+warning (a hook `systemMessage` on Claude Code, and the hook's stderr) and a
+`fail_open` log entry, because it would otherwise block every push for good. A
+key file that is set but unusable (missing, empty, too long, more than one
+word, not UTF-8, a directory), or an `api_key_file` set to something other
+than a string, is a misconfiguration and fails closed like an outage; the
+denial names the problem, and the setting only when it reads as a path (it
+starts with `~` or holds a `/` or `\`), never the file's content, and the log
+error is `BadApiKeyFile`. An empty `api_key_file` counts as not configured, and
+so does an unset, `null` or empty `api_key_source`. A key source that is set
+but gives no key (`"claude_settings"` with no usable `TYPESAFE_API_KEY` in
+Claude Code's `settings.json`, or a value that is not a known source) fails
+closed the same way; the denial names `claude_settings` but never another
+value. A Jev config file that exists but cannot be read as a JSON object (or
+whose `jev` entry is not one) fails every push closed too, whether or not the
+gate was meant to be on, naming the file and the problem; an absent file means
+the defaults (gate off), and a UTF-8 byte-order mark is accepted. A
+disabled `risk_gate` checks nothing. Every
 classifier call has a hard deadline of `min(timeout_seconds, 4)` seconds.
 Denials and the handoff's exit 3 are the only ways a Jev hook changes the
-outcome of a call, and each can be overridden by retrying.
+outcome of a call, and each except the fail-closed push can be overridden by
+retrying.
 
 Provide `TYPESAFE_API_KEY` in your shell environment, in the `"env"` block of
 Claude Code's `settings.json`, or as a file path in `jev.api_key_file`. The key
@@ -314,10 +465,10 @@ installed `relay/config.json`:
 | `timeout_seconds` | `3` | Classifier deadline, capped at 4 s |
 | `log` | `true` | Append one line per decision to `relay/jev-log.jsonl` |
 | `upgrade_min_confidence`, `downgrade_min_confidence` | `0.35`, `0.8` | route: confidence needed to move to a stronger or weaker tier than the current one. Moving up is easy because under-routing is the costly error |
-| `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
-| `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
-| `respect_explicit_model` | `false` | route: never override a call that already sets `model`. When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id) |
-| `pinned_agents` | `["critic", "fork"]` | route: subagent types that are never rerouted |
+| `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown (no `model` on the call and none in the agent's frontmatter, so the subagent inherits the parent's model), or is a model the hook cannot rank. With no model at all the rule is Codex's: only the weakest kept tier counts as a likely downgrade and needs `downgrade_min_confidence` instead. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
+| `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). With no current model at all, the tiers stronger than Jev's choice are counted instead |
+| `respect_explicit_model` | `false` | route: never override a call that already sets `model`. When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id, in any case and with or without a `[1m]`-style suffix); one that already names the strongest kept tier is not sent to Jev at all |
+| `pinned_agents` | `["critic", "fork"]` | route: subagent types that are never rerouted. A namespaced type is matched by its last `:` segment too (`review:critic`) |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
 | `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted. A removed tier's full model id (e.g. `claude-opus-4-1` with `opus` removed) can still be rewritten to a kept tier, as its alias would be. `opusplan` counts as the opus tier, so it is never rewritten to `opus` |
 | `shift_low`, `shift_high` | `0.25`, `0.75` | shift: probability-of-continuation thresholds |
@@ -511,7 +662,11 @@ and `escalate_mass` moves a task to a stronger model when the stronger models
 are likely enough; an unsure answer leaves the parent's model. It checks risky `git commit` or
 `git push` calls, asks weak subagent reports for one more pass, detects clear
 task shifts, and grades Codex handoffs written through `rollover-open.py`.
-The Git check is advisory and can be overridden by retrying the same command.
+A shell call given as `[<shell>, "-c"|"-lc", <script>]` is checked as its script.
+The Git check is advisory and covers `git commit` and `git push` only; a denial
+can be overridden by retrying the same command, except a push while Jev is
+configured but unreachable, which stays denied (a missing key lets it through
+with a warning).
 Restricted launched agents and native role profiles disable hooks, so Jev
 hooks run from the main session only. Inspect decisions in
 `~/.codex/jev/jev-log.jsonl`.

@@ -32,6 +32,9 @@ INSTRUCTIONS = ("Choose the least expensive Codex model that will reliably compl
 PINNED = {"scout", "runner", "builder", "critic"}
 # Codex shell tool names; codex/install.py's PreToolUse matcher must list the same names.
 SHELL_TOOLS = ("Bash", "PowerShell", "shell", "local_shell", "exec_command")
+# An argv that only runs a script through a POSIX shell: `["bash", "-lc", "<script>"]`.
+SHELL_ARGV_RE = re.compile(r"(?i)(?:.*[/\\])?(?:ba|z|da|k)?sh(?:\.exe)?")
+SHELL_SCRIPT_FLAG_RE = re.compile(r"-[a-z]*c[a-z]*")
 LABELS = {
     "luna": "Bounded searches, summaries and exact offline checks.",
     "sol": "Implementation and routine design or debugging.",
@@ -153,7 +156,8 @@ def route(payload, cfg, classify_fn=None):
 
 def shell_command(tool_input):
     """The command text of a shell tool call; argv lists are joined with POSIX quoting,
-    which is what the guard's scanner parses."""
+    which is what the guard's scanner parses. A `[<shell>, -c|-lc, <script>]` argv is its
+    script: joined, the script would be one quoted word the scanner cannot read."""
     if not isinstance(tool_input, dict):
         return None
     # The unified exec_command tool names its command `cmd`.
@@ -161,6 +165,9 @@ def shell_command(tool_input):
     if command is None:
         command = tool_input.get("cmd")
     if isinstance(command, list) and all(isinstance(part, str) for part in command):
+        if (len(command) == 3 and SHELL_ARGV_RE.fullmatch(command[0])
+                and SHELL_SCRIPT_FLAG_RE.fullmatch(command[1])):
+            return command[2]
         return shlex.join(command)
     return command if isinstance(command, str) else None
 
@@ -277,7 +284,11 @@ def grade_handoff(body, cfg, classify_fn=None):
     return {"score": score, "weak": score < cfg["handoff_min_score"]}
 
 
-OUTWARD_COMMAND_RE = re.compile(r"\bgit\b[^;&|\n]*\bpush\b|\bheroku\b|\bdeploy\b", re.IGNORECASE)
+# Copies of jev-guard.py's crash-path patterns: the command is matched as written and
+# with the quoting the scanner reads through removed (`g\it push`, `git 'pu'sh`).
+OUTWARD_COMMAND_RE = re.compile(
+    r"\bgit\b[^;&|\n]*\b(?:push|send-pack)\b|\bheroku\b|\bdeploy\b", re.IGNORECASE)
+_OUTWARD_QUOTING_RE = re.compile(r"\\(?:\r?\n)?|[\"'`^]")
 CRASH_DENY_REASON = ("[jev risk gate] The risk classifier crashed, so this push/deploy is blocked "
                      "(fail-closed). Do not retry or work around it: ask the user to run it manually "
                      "or retry once Jev answers normally.")
@@ -294,7 +305,9 @@ def fail_closed(raw, payload):
             text = command if command is not None else raw
         else:
             text = raw
-        if OUTWARD_COMMAND_RE.search(text or ""):
+        text = text or ""
+        if OUTWARD_COMMAND_RE.search(text) or OUTWARD_COMMAND_RE.search(
+                _OUTWARD_QUOTING_RE.sub("", text)):
             print(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "deny",
                 "permissionDecisionReason": CRASH_DENY_REASON}}))

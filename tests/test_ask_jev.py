@@ -55,6 +55,14 @@ class AskJevTests(unittest.TestCase):
             path.write_text(content, encoding="utf-8", newline="\n")
         return path
 
+    def symlink(self, target, link):
+        """os.symlink, or skip the test where the platform refuses it (Windows without
+        the symlink privilege raises WinError 1314)."""
+        try:
+            os.symlink(target, link)
+        except OSError as exc:
+            self.skipTest(f"symlinks are not available here: {exc}")
+
     def fake(self, body, key):
         with self.lock:
             self.calls.append(body)
@@ -89,14 +97,14 @@ class AskJevTests(unittest.TestCase):
     def test_skip_reasons(self):
         self.file("good.py")
         (self.outside / "far.py").write_text("x = 1\n", encoding="utf-8")
-        os.symlink(self.outside / "far.py", self.repo / "link_out.py")
+        self.symlink(self.outside / "far.py", self.repo / "link_out.py")
         self.file(".env", "KEY=1\n")
         self.file("secrets/x.txt", "x\n")
         self.file("node_modules/x.js", "x\n")
         self.file("blob.dat", b"abc\0def")
         self.file("empty.txt", "  \n")
         self.file("logo.png", "not really a png\n")
-        os.symlink(self.repo / ".env", self.repo / "notes.txt")
+        self.symlink(self.repo / ".env", self.repo / "notes.txt")
         paths = [str(self.outside / "far.py"), "link_out.py", ".env", "secrets/x.txt", "node_modules/x.js",
                  "blob.dat", "empty.txt", "logo.png", "missing.py", "notes.txt", "good.py"]
         code, output, _ = self.run_args(["-q", NOUL, *paths])
@@ -436,12 +444,18 @@ class AskJevTests(unittest.TestCase):
             with self.subTest(path=path.name), self.assertRaises(ask_jev.UsageError):
                 self.run_args(["-q", f"@{path}", "a.py"])
 
+    def test_symlink_helper_skips_when_the_platform_refuses(self):
+        refused = OSError(1314, "A required privilege is not held by the client")
+        with mock.patch.object(ask_jev.os, "symlink", side_effect=refused), \
+                self.assertRaises(unittest.SkipTest):
+            self.symlink(self.outside, self.repo / "linked")
+
     def test_glob_does_not_follow_symlinked_dirs(self):
         self.file("a.py")
         inner = self.outside / "pkg"
         inner.mkdir()
         (inner / "far.py").write_text("x = 1\n", encoding="utf-8")
-        os.symlink(self.outside, self.repo / "linked")
+        self.symlink(self.outside, self.repo / "linked")
         paths, skipped = ask_jev.expand(["**/*.py"], False, str(self.repo), self.repo.resolve())
         self.assertEqual(paths, ["a.py"])
         paths, _ = ask_jev.expand(["."], True, str(self.repo), self.repo.resolve())
