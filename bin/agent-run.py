@@ -32,6 +32,18 @@ DISABLED = ('apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_exte
 # Every other saved status (blocked-*, completed, model-unverified, failed-no-retry)
 # is terminal and must survive a later exception along with its exit semantics.
 NON_TERMINAL_STATUSES = ('preflight', 'preflight-passed', 'model-unavailable')
+# The final answer is echoed for the caller's context; a role's report card ends it,
+# so a longer answer keeps its tail and names the file that holds all of it.
+FINAL_ECHO_CHARS = 20000
+
+
+def exit_status(returncode):
+    """A failed child's code as this launcher's exit status.
+
+    A Windows crash exits with an NTSTATUS such as 3221225477, which SystemExit cannot
+    carry (OverflowError, exit 4294967295); anything outside 1..255 becomes 1. The raw
+    value stays in report.json."""
+    return returncode if 0 < returncode <= 255 else 1
 
 
 def toml(value):
@@ -580,7 +592,12 @@ unverified.
             save()
             print(json.dumps(attempt), flush=True)
             if message_path.exists():
-                print(message_path.read_text(encoding='utf-8', errors='replace'), flush=True)
+                final = message_path.read_text(encoding='utf-8', errors='replace')
+                if len(final) > FINAL_ECHO_CHARS:
+                    print(f'[final answer: last {FINAL_ECHO_CHARS} of {len(final)} characters; '
+                          f'full text in {message_path}]', flush=True)
+                    final = final[-FINAL_ECHO_CHARS:]
+                print(final, flush=True)
             return 0 if report['status'] == 'completed' else 4
         can_retry = events_complete and retryable_model_error(events, result.returncode)
         attempt['model_fallback_allowed'] = can_retry
@@ -588,7 +605,7 @@ unverified.
         save()
         if not can_retry or i == len(models) - 1:
             print(f'Agent stopped (exit {result.returncode}); inspect {logs}. Main session must assess partial work before continuing.')
-            return result.returncode or 1
+            return exit_status(result.returncode)
         print('Model unavailable before work started; trying the next configured model.', flush=True)
     # Unreachable in practice (the loop above always returns); fail closed if it ever falls through.
     return 1

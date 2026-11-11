@@ -20,11 +20,15 @@ import os
 import subprocess
 import sys
 
-FIELDS = "number,title,headRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,author"
+FIELDS = ("number,title,headRefName,isDraft,state,mergeable,mergeStateStatus,reviewDecision,"
+          "statusCheckRollup,author")
 # STALE is a final conclusion (GitHub gave up on an incomplete check), so it is a
 # finished check that did not pass, never one to keep waiting for.
 BAD = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}
 OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+# COMPLETED is a finished check run that reported no conclusion: nothing left to wait
+# for, but not a pass either. It is counted apart, so the summary never reads as green.
+UNKNOWN = {"COMPLETED"}
 
 
 def resolve_executable(name, exts):
@@ -60,6 +64,41 @@ def wrapper_command():
     return base if os.access(base, os.X_OK) else resolve_executable("gh", ("",))
 
 
+class BadOutput(Exception):
+    """gh printed something pr-status cannot read. Raised where it is found (possibly in a
+    worker thread) and printed once by main, so several bad replies still make one line."""
+
+
+def parse_json(text, what):
+    """gh's stdout as JSON; empty or non-JSON output (exit 0) is a one-line error."""
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        raise BadOutput(f"pr-status: {what} printed no valid JSON") from None
+
+
+def bad_shape(what):
+    raise BadOutput(f"pr-status: {what} printed JSON of an unexpected shape")
+
+
+def pull_request(value, what):
+    """One PR record as gh prints it: an object with an integer `number`, whose check
+    rollup is a list or absent. Anything else is a one-line error, never a traceback."""
+    if not isinstance(value, dict) or type(value.get("number")) is not int:
+        bad_shape(what)
+    rollup = value.get("statusCheckRollup")
+    if rollup is not None and not isinstance(rollup, list):
+        bad_shape(what)
+    return value
+
+
+def pull_requests(value, what):
+    """A `pr list` result: a list of PR records."""
+    if not isinstance(value, list):
+        bad_shape(what)
+    return [pull_request(one, what) for one in value]
+
+
 def gh(*args):
     exe = wrapper_command()
     if exe is None:
@@ -75,24 +114,70 @@ def gh(*args):
     return r.stdout
 
 
-def checks(rollup):
-    ok = bad = pending = 0
-    names = []
+def state_of(c):
+    state = str(c.get("conclusion") or c.get("state") or c.get("status") or "").upper()
+    # A check run whose status says it has not finished is pending, whatever conclusion it
+    # already carries, unless that conclusion is a failure.
+    status = str(c.get("status") or "").upper()
+    if status not in ("", "COMPLETED") and state not in BAD:
+        return "PENDING"
+    return state
+
+
+def latest_checks(rollup):
+    """The rollup with exact duplicates collapsed: entries of one check (type, workflow
+    and name) with the same details URL count once, as the worst of their states, so a
+    failure is never hidden. GitHub's rollup already lists only the latest attempt after
+    a re-run, so nothing else is dropped: sibling jobs of one name in one workflow run
+    and entries without a URL all count. An entry that is not an object is kept as it is."""
+    def rank(c):
+        state = state_of(c)
+        return 2 if state in BAD else (0 if state in OK else 1)
+
+    kept, where = [], {}
     for c in rollup or []:
-        state = (c.get("conclusion") or c.get("state") or c.get("status") or "").upper()
-        name = c.get("name") or c.get("context") or "?"
+        if not isinstance(c, dict):
+            kept.append(c)
+            continue
+        url =str(c.get("detailsUrl") or c.get("targetUrl") or "")
+        key = (str(c.get("__typename") or ""), str(c.get("workflowName") or ""),
+               str(c.get("name") or c.get("context") or "?"), url)
+        if not url or key not in where:
+            if url:
+                where[key] = len(kept)
+            kept.append(c)
+        elif rank(c) > rank(kept[where[key]]):
+            kept[where[key]] = c
+    return kept
+
+
+def checks(rollup):
+    ok = bad = pending = unknown = 0
+    names = []
+    for c in latest_checks(rollup):
+        if not isinstance(c, dict):
+            # Not a check gh would print: nothing says it passed, so the summary is never green.
+            unknown += 1
+            names.append("done ? (not a check object)")
+            continue
+        state = state_of(c)
+        name = str(c.get("name") or c.get("context") or "?")
         if state in OK:
             ok += 1
         elif state in BAD:
             bad += 1
             names.append(f"FAIL {name}")
+        elif state in UNKNOWN:
+            unknown += 1
+            names.append(f"done {name} (no conclusion)")
         else:
             pending += 1
             names.append(f"wait {name}")
-    if not (ok or bad or pending):
+    if not (ok or bad or pending or unknown):
         return "none", names
-    verdict = "FAIL" if bad else ("wait" if pending else "green")
-    return f"{verdict} {ok}ok/{bad}bad/{pending}wait", names
+    # Green only when every check passed: one that finished without a conclusion is `unsure`.
+    verdict = "FAIL" if bad else ("wait" if pending else ("unsure" if unknown else "green"))
+    return f"{verdict} {ok}ok/{bad}bad/{pending}wait" + (f"/{unknown}?" if unknown else ""), names
 
 
 def positive_number(value):
@@ -105,7 +190,32 @@ def positive_number(value):
     return number
 
 
+def fetch_prs(args, repo, author, numbers):
+    """The PR records to show. A reply gh printed that pr-status cannot read raises BadOutput,
+    from a worker thread too: pool.map re-raises the first one here, the rest are dropped."""
+    if numbers:
+        def fetch(number):
+            return pull_request(parse_json(gh("pr", "view", str(number), *repo, "--json", FIELDS), "pr view"),
+                                "pr view")
+
+        with ThreadPoolExecutor(max_workers=min(4, len(numbers))) as pool:
+            return list(pool.map(fetch, numbers))
+    # Fetch one extra record to distinguish a full page from truncation.
+    prs = pull_requests(parse_json(gh("pr", "list", *repo, *author, "--state", "open",
+                                      "--limit", str(args.limit + 1), "--json", FIELDS), "pr list"),
+                        "pr list")
+    if len(prs) > args.limit:
+        print(f"pr-status: showing {args.limit} open PRs; more exist. "
+              "Increase --limit to include them.", file=sys.stderr)
+        prs = prs[:args.limit]
+    return prs
+
+
 def main(argv=None):
+    # A piped stdout uses the console code page, which cannot encode every PR title.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("numbers", nargs="*", type=lambda value: positive_number(value.removeprefix("#")))
     parser.add_argument("-R", "--repo")
@@ -116,34 +226,34 @@ def main(argv=None):
     repo = ["-R", args.repo] if args.repo else []
     author = ["--author", args.author] if args.author else []
     numbers = list(dict.fromkeys(args.numbers))
-    if numbers:
-        def fetch(number):
-            return json.loads(gh("pr", "view", str(number), *repo, "--json", FIELDS))
-
-        with ThreadPoolExecutor(max_workers=min(4, len(numbers))) as pool:
-            prs = list(pool.map(fetch, numbers))
-    else:
-        # Fetch one extra record to distinguish a full page from truncation.
-        prs = json.loads(gh("pr", "list", *repo, *author, "--state", "open",
-                            "--limit", str(args.limit + 1), "--json", FIELDS))
-        if len(prs) > args.limit:
-            print(f"pr-status: showing {args.limit} open PRs; more exist. "
-                  "Increase --limit to include them.", file=sys.stderr)
-            prs = prs[:args.limit]
+    try:
+        prs = fetch_prs(args, repo, author, numbers)
+    except BadOutput as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
     if not prs:
         print("no open PRs")
         return
-    print(f"{'PR':>5} {'CI':22} {'merge':12} {'review':10} {'branch':24} title")
+    # Every row is built before the first is printed, so a bad record cannot leave half a table.
+    lines = [f"{'PR':>5} {'CI':22} {'merge':12} {'review':10} {'branch':24} title"]
     for p in sorted(prs, key=lambda p: p["number"]):
         ci, names = checks(p.get("statusCheckRollup"))
-        merge = (p.get("mergeStateStatus") or p.get("mergeable") or "?").lower()
+        # Every printed field is text, whatever type the record gave it.
+        merge = str(p.get("mergeStateStatus") or p.get("mergeable") or "?").lower()
         if p.get("isDraft"):
             merge = "draft"
-        review = (p.get("reviewDecision") or "-").lower().replace("_", " ")[:10]
-        print(f"#{p['number']:>4} {ci:22} {merge[:12]:12} {review:10} {p['headRefName'][:24]:24} {p['title'][:60]}")
+        # Only an explicit number can name a PR that is no longer open.
+        state = str(p.get("state") or "").lower()
+        if state in ("merged", "closed"):
+            merge = state
+        review = str(p.get("reviewDecision") or "-").lower().replace("_", " ")[:10]
+        lines.append(f"#{p['number']:>4} {ci:22} {merge[:12]:12} {review:10} "
+                     f"{str(p.get('headRefName') or '')[:24]:24} {str(p.get('title') or '')[:60]}")
         if args.failed:
-            for n in names[:8]:
-                print(f"        {n[:90]}")
+            # Failures first, so a long list of waits cannot push them past the cut.
+            failures_first = sorted(names, key=lambda n: not n.startswith("FAIL "))
+            lines.extend(f"        {n[:90]}" for n in failures_first[:8])
+    print("\n".join(lines))
 
 
 if __name__ == "__main__":

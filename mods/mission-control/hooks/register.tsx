@@ -22,19 +22,23 @@ import {
   clockSeconds,
   clockTime,
   describeTool,
+  hadBrief,
   hunchCli,
   hunchInvocation,
   hunchName,
   hunchOutcome,
+  isContextCall,
   isRole,
   isToastSeverity,
   jevStatus,
   kTokens,
+  label,
   localDay,
   maxLevel,
-  parseCard,
+  parseAnswer,
   parseLines,
   reapStale,
+  redact,
   repoName,
   roleOf,
   seconds,
@@ -44,6 +48,7 @@ import {
   STALE_MS,
   toolDetail,
   wasInterrupted,
+  weakReason,
   zoneOf,
 } from './parse'
 
@@ -187,16 +192,19 @@ async function pollJev($: EngineInterface) {
     for (const line of lines.slice(alertCursor)) {
       if (line.feature === 'risk_gate' && line.decision === 'deny') {
         const why = line.fail_closed === true ? `fail-closed, Jev ${String(line.error ?? 'unavailable')}` : 'risky'
-        $.ui.toast(`⛔ Jev risk gate denied ${String(line.op ?? 'the action')} (${why})`, { timeoutMs: 10000 })
+        // Masked whole, then cut: a secret the cut would split may no longer look like one.
+        $.ui.toast(redact(`⛔ Jev risk gate denied ${String(line.op ?? 'the action')} (${why})`).slice(0, 2000), { timeoutMs: 10000 })
       } else if (line.feature === 'report_check' && (line.decision === 'deny' || line.decision === 'weak')) {
-        $.ui.toast(`⚠ Jev: ${String(line.subagent_type ?? 'subagent')} report ${String(line.decision)}`, { timeoutMs: 8000 })
+        $.ui.toast(redact(`⚠ Jev: ${String(line.subagent_type ?? 'subagent')} report ${String(line.decision)}`).slice(0, 2000), {
+          timeoutMs: 8000,
+        })
       }
     }
   }
   alertCursor = lines.length
 
   if (before !== null && before.isOnline === true && status.isOnline === false) {
-    $.ui.toast(`Jev went offline: ${status.lastError ?? 'unavailable'}; risk gate now fails closed`, { timeoutMs: 10000 })
+    $.ui.toast(redact(`Jev went offline: ${status.lastError ?? 'unavailable'}; risk gate now fails closed`), { timeoutMs: 10000 })
   }
   await refreshStatus($)
 }
@@ -236,9 +244,17 @@ async function startHunchCall(
     summary: '',
     level: 'info',
   }
+  const isContext = isContextCall(invocation.name)
+  // A new task drops the id-less brief: it belonged to the task before.
+  const isStart = (invocation.name === 'task' || invocation.name === 'cli task') && invocation.target.startsWith('start')
   await update($, hunch, log => ({
     ...log,
     taskId: agentId === undefined ? (invocation.taskId ?? log.taskId) : log.taskId,
+    contextTasks: isContext
+      ? [...(log.contextTasks ?? []).filter(one => one !== (invocation.taskId ?? '')), invocation.taskId ?? ''].slice(-50)
+      : isStart
+        ? log.contextTasks?.filter(one => one !== '')
+        : log.contextTasks,
     total: log.total + 1,
     calls: [...reapStale(log.calls, call.startedAt).filter(one => one.id !== id), call].slice(-HUNCH_KEEP),
   }))
@@ -269,9 +285,7 @@ async function finishHunchCall($: EngineInterface, id: string, result: ToolCallR
 
   // A task closed through the tool without the brief Hunch says to read first.
   const isFinish = call.name === 'task' && call.target.startsWith('finish')
-  const hadContext = log.calls.some(
-    one => one.name === 'context' && (taskId === undefined || one.taskId === undefined || one.taskId === taskId),
-  )
+  const hadContext = hadBrief(log, taskId)
   if (isFinish && !isError && !hadContext) {
     level = maxLevel(level, 'warn')
     summary = `no hunch_context this task · ${summary}`
@@ -304,19 +318,19 @@ async function finishHunchCall($: EngineInterface, id: string, result: ToolCallR
   const first = fresh[0]
   if (first !== undefined) {
     const more = fresh.length > 1 ? ` +${fresh.length - 1} more` : ''
-    $.ui.toast(`🧠 Hunch invariant [${first.severity}]${where}: ${first.statement}${more}`, { timeoutMs: 10000 })
+    $.ui.toast(redact(`🧠 Hunch invariant [${first.severity}]${where}: ${first.statement}${more}`), { timeoutMs: 10000 })
   }
   if (outcome.verdict === 'BLOCK') {
-    $.ui.toast(`⛔ Hunch merge verdict BLOCK${where}: fix the cited invariant before merging`, { timeoutMs: 12000 })
+    $.ui.toast(redact(`⛔ Hunch merge verdict BLOCK${where}: fix the cited invariant before merging`), { timeoutMs: 12000 })
   }
   if (call.name === 'escalations' && level === 'alert' && !isError) {
-    $.ui.toast(`🧠 Hunch escalations: ${summary}; ask the user, silence is never approval`, { timeoutMs: 10000 })
+    $.ui.toast(redact(`🧠 Hunch escalations: ${summary}; ask the user, silence is never approval`), { timeoutMs: 10000 })
   }
   if (call.name === 'verify' && level === 'alert') {
-    $.ui.toast(`✖ Hunch verify ${summary}${where}`, { timeoutMs: 10000 })
+    $.ui.toast(redact(`✖ Hunch verify ${summary}${where}`), { timeoutMs: 10000 })
   }
   if (isError && call.name !== 'verify') {
-    $.ui.toast(`✖ Hunch ${call.name} ${isDenied ? 'denied' : 'failed'}: ${summary}`, { timeoutMs: 8000 })
+    $.ui.toast(redact(`✖ Hunch ${call.name} ${isDenied ? 'denied' : 'failed'}: ${summary}`), { timeoutMs: 8000 })
   }
   if (isFinish && !hadContext && !isError) {
     $.ui.toast('⚠ Hunch task finished without a hunch_context brief', { timeoutMs: 8000 })
@@ -534,7 +548,7 @@ export const register: Register = on => {
       const at = await $.clock.now()
       const detail = e.text.length > 70 ? capDetail(e.text) : undefined
       await update($, turnOpen, () => true)
-      await logActivity($, { id: `prompt-${at}`, at, who: 'you', text: `asked: "${clip(e.text, 70)}"`, status: 'note', detail })
+      await logActivity($, { id: `prompt-${at}`, at, who: 'you', text: `asked: "${label(e.text, 70)}"`, status: 'note', detail })
     } catch {
       // the timeline is a view; a prompt never waits on it
     }
@@ -577,7 +591,7 @@ export const register: Register = on => {
     await measure($, e.context.tokens, e.context.window, e.context.percent, e.cost?.usd)
 
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 
   on('agent.spawn', async ($, e, next) => {
     const spawned = await next(e)
@@ -589,7 +603,7 @@ export const register: Register = on => {
         id: agentId,
         type: e.subagentType,
         model: shortModel(model),
-        description: e.description,
+        description: label(String(e.description ?? ''), 200),
         isBackground: e.background,
         startedAt: await $.clock.now(),
         status: 'running',
@@ -625,7 +639,9 @@ export const register: Register = on => {
     await update($, agents, list => list.map(one => (one.id === agentId ? { ...one, status, endedAt: now } : one)))
 
     const type = run?.type ?? 'subagent'
-    const card = parseCard(e.answer)
+    // The card closes the answer, so only its tail is graded, read as what it is in the whole
+    // answer: a fence the cut falls in stays open, so a quoted card is never taken for this one.
+    const card = parseAnswer(typeof e.answer === 'string' ? e.answer : '')
 
     // Only role agents owe a card; an Explore or general-purpose answer is not graded.
     if (status === 'done' && (isRole(type) || card.hasAnyField)) {
@@ -645,14 +661,7 @@ export const register: Register = on => {
       await update($, reports, list => [...list, report].slice(-20))
 
       if (card.isWeak) {
-        const why = [
-          card.missing.length > 0 ? `missing ${card.missing.join('/')}` : '',
-          card.confidence !== 'high' && card.confidence !== 'missing' ? `confidence ${card.confidence}` : '',
-          card.unverified > 0 ? `${card.unverified} unverified` : '',
-        ]
-          .filter(Boolean)
-          .join(', ')
-        $.ui.toast(`⚠ ${roleOf(type)} report weak: ${why}; verify before relying on it`, { timeoutMs: 8000 })
+        $.ui.toast(`⚠ ${roleOf(type)} report weak: ${weakReason(card)}; verify before relying on it`, { timeoutMs: 8000 })
       }
     }
     const verdict = card.result === '' ? '' : `: ${card.result}`
@@ -668,7 +677,7 @@ export const register: Register = on => {
     await refreshStatus($)
 
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: /^mcp__(?:plugin_hunch_)?hunch__/ }, async ($, e, next) => {
     const name = hunchName(e.tool)
@@ -693,8 +702,9 @@ export const register: Register = on => {
     }
   })
 
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const invocation = e.tool === 'Bash' ? hunchCli(e.command) : undefined
+  // The hunch CLI runs through either shell tool.
+  on('tool.call', { tool: /^(?:Bash|PowerShell)$/ }, async ($, e, next) => {
+    const invocation = e.tool === 'Bash' || e.tool === 'PowerShell' ? hunchCli(e.command) : undefined
     if (invocation === undefined) return next(e)
 
     await startHunchCall($, e.tool_use_id, e.agentId, invocation)

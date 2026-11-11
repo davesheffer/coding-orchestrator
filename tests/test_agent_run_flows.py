@@ -363,6 +363,35 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(len(report['attempts']), 1)
         self.assertIn('RESULT: \ufffd done', self.output)
 
+    def test_crash_exit_code_maps_to_one_and_stays_raw_in_the_report(self):
+        # 0xC0000005 (access violation): SystemExit overflows on it, so the launcher exits 1.
+        stream = '{"type":"thread.started"}\n{"type":"error","message":"unknown error"}\n'
+        for raw, expected in ((3221225477, 1), (-1073741819, 1), (256, 1), (255, 255), (2, 2)):
+            with self.subTest(raw=raw):
+                code, _, report, _ = self.run_flow([(raw, stream)], [ISOLATED])
+                self.assertEqual(code, expected)
+                self.assertEqual(report['status'], 'failed-no-retry')
+                self.assertEqual(report['attempts'][0]['exit'], raw)
+                self.assertIn(f'Agent stopped (exit {raw})', self.output)
+
+    def test_long_final_answer_is_echoed_as_its_tail_with_the_file_path(self):
+        limit = agent.FINAL_ECHO_CHARS
+        final = ('x' * limit + 'RESULT: tail kept').encode()
+        code, _, report, _ = self.run_flow([(0, self.STREAM)], [ISOLATED], final=final)
+        self.assertEqual(code, 0)
+        self.assertIn('RESULT: tail kept', self.output)
+        self.assertNotIn('x' * (limit - len('RESULT: tail kept') + 1), self.output)
+        note = next(line for line in self.output.splitlines() if line.startswith('[final answer: '))
+        self.assertIn(f'last {limit} of {len(final)} characters', note)
+        self.assertIn('0-final.txt', note)
+
+    def test_final_answer_at_the_limit_is_echoed_whole(self):
+        final = ('y' * (agent.FINAL_ECHO_CHARS - 4) + ' end').encode()
+        code, _, _, _ = self.run_flow([(0, self.STREAM)], [ISOLATED], final=final)
+        self.assertEqual(code, 0)
+        self.assertIn(final.decode(), self.output)
+        self.assertNotIn('[final answer: ', self.output)
+
     def test_role_without_instructions_is_refused_before_launch(self):
         code, calls, report, _ = self.run_flow([], [], role='model="gpt-6-luna"\nmodel_reasoning_effort="low"\n',
                                                raises=RuntimeError)

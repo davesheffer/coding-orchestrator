@@ -9,9 +9,11 @@ import math
 import os
 from pathlib import Path
 import statistics
+import sys
 
 TOKEN_FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
                 'output_tokens', 'reasoning_output_tokens')
+MAX_NUMBER = 1e15
 
 
 def percentile(values, fraction):
@@ -30,7 +32,7 @@ def event_usage(path):
         for line in stream:
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 continue
             if (isinstance(event, dict) and event.get('type') == 'turn.completed'
                     and isinstance(event.get('usage'), dict)):
@@ -38,13 +40,22 @@ def event_usage(path):
     return {key: usage.get(key, 0) for key in TOKEN_FIELDS} if usage is not None else None
 
 
+def resolved(value):
+    """An over-long or invalid path resolves to None instead of raising."""
+    try:
+        return Path(value).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def collect(root, workspace=None):
     reports = []
     unreadable = 0
+    target = resolved(workspace) if workspace else None
     for path in sorted(root.glob('*/report.json')):
         try:
             report = json.loads(path.read_text(encoding='utf-8'))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             unreadable += 1
             continue
         if not isinstance(report, dict):
@@ -54,10 +65,51 @@ def collect(root, workspace=None):
         # directory; a bare "" or "." would otherwise match any --workspace filter.
         value = report.get('workspace')
         if workspace and (not isinstance(value, str) or not Path(value).is_absolute()
-                          or Path(value).resolve() != workspace.resolve()):
+                          or target is None or resolved(value) != target):
+            continue
+        # "attempts": null, or an attempt whose "observed" is a string, is a damaged
+        # report: count it as unreadable instead of failing the whole summary.
+        attempts = report.get('attempts', [])
+        if not isinstance(attempts, list) or any(
+                isinstance(attempt, dict) and not isinstance(attempt.get('observed'), (dict, type(None)))
+                for attempt in attempts):
+            unreadable += 1
             continue
         reports.append((path.parent, report))
     return reports, unreadable
+
+
+def measured(value):
+    """A finite, non-negative, non-bool number no larger than 1e15. A huge integer, NaN,
+    Infinity or true would break the median or make --json emit non-strict JSON."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and 0 <= value <= MAX_NUMBER)
+
+
+def attempt_rows(directory, report):
+    """(model, duration_ms, usage) per attempt, or None when the report carries a number
+    that is present but not measured; absent (null) numbers stay unknown."""
+    if report.get('preflight_ms') is not None and not measured(report['preflight_ms']):
+        return None
+    rows = []
+    for index, attempt in enumerate(report.get('attempts', [])):
+        if not isinstance(attempt, dict):
+            continue
+        model = attempt.get('observed') or {}
+        duration = attempt.get('duration_ms')
+        usage = attempt.get('usage') if isinstance(attempt.get('usage'), dict) else None
+        if usage is None:
+            usage = event_usage(directory / f'{index}-events.jsonl')
+        if usage is not None:
+            usage = {key: usage.get(key) for key in TOKEN_FIELDS}
+        if any(value is not None and not measured(value)
+               for value in (duration, *(usage or {}).values())):
+            return None
+        if usage is not None:
+            usage = {key: value or 0 for key, value in usage.items()}
+        rows.append((str(model.get('model') or attempt.get('requested_model') or 'unknown'),
+                     duration, usage))
+    return rows
 
 
 def summarize(root, workspace=None):
@@ -70,10 +122,16 @@ def summarize(root, workspace=None):
     tokens = Counter()
     attempts = 0
     usage_known = 0
+    runs = 0
     network_exceptions = 0
     per_role = defaultdict(lambda: {'runs': 0, 'completed': 0, 'attempts': 0,
                                     'input_tokens': 0, 'output_tokens': 0})
     for directory, report in reports:
+        rows = attempt_rows(directory, report)
+        if rows is None:
+            unreadable += 1
+            continue
+        runs += 1
         role = str(report.get('role', 'unknown'))
         status = str(report.get('status', 'unknown'))
         statuses[status] += 1
@@ -81,29 +139,21 @@ def summarize(root, workspace=None):
         per_role[role]['runs'] += 1
         per_role[role]['completed'] += status == 'completed'
         network_exceptions += report.get('network_exception') is True
-        if isinstance(report.get('preflight_ms'), (int, float)):
+        if report.get('preflight_ms') is not None:
             preflights.append(report['preflight_ms'])
-        for index, attempt in enumerate(report.get('attempts', [])):
-            if not isinstance(attempt, dict):
-                continue
+        for model, duration, usage in rows:
             attempts += 1
             per_role[role]['attempts'] += 1
-            model = attempt.get('observed') or {}
-            models[str(model.get('model') or attempt.get('requested_model') or 'unknown')] += 1
-            if isinstance(attempt.get('duration_ms'), (int, float)):
-                attempts_ms.append(attempt['duration_ms'])
-            usage = attempt.get('usage') if isinstance(attempt.get('usage'), dict) else None
-            if usage is None:
-                usage = event_usage(directory / f'{index}-events.jsonl')
+            models[model] += 1
+            if duration is not None:
+                attempts_ms.append(duration)
             if usage is not None:
-                usage = {key: value if isinstance((value := usage.get(key, 0)), (int, float)) else 0
-                         for key in TOKEN_FIELDS}
                 usage_known += 1
                 tokens.update(usage)
                 per_role[role]['input_tokens'] += usage['input_tokens']
                 per_role[role]['output_tokens'] += usage['output_tokens']
     return {
-        'runs': len(reports), 'unreadable_reports': unreadable,
+        'runs': runs, 'unreadable_reports': unreadable,
         'statuses': dict(sorted(statuses.items())), 'roles': dict(sorted(roles.items())),
         'models': dict(sorted(models.items())), 'network_exception_runs': network_exceptions,
         'attempts': attempts, 'attempts_with_usage': usage_known,
@@ -117,6 +167,10 @@ def summarize(root, workspace=None):
 
 
 def main(argv=None):
+    # A piped stdout uses the console code page, which cannot encode every status or model.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runs', type=Path,
                         default=Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) / 'agent-runs')
@@ -125,9 +179,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.runs.is_dir():
         parser.error(f'run directory does not exist: {args.runs}')
-    result = summarize(args.runs, args.workspace.resolve() if args.workspace else None)
+    workspace = None
+    if args.workspace:
+        workspace = resolved(args.workspace)
+        if workspace is None:
+            parser.error('workspace path cannot be resolved')
+    result = summarize(args.runs, workspace)
     if args.json:
-        print(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2, allow_nan=False))
     else:
         print(f"Runs: {result['runs']} ({result['attempts']} attempts; {result['attempts_with_usage']} with usage)")
         print(f"Status: {result['statuses']}")
