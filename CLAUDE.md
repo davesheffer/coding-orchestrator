@@ -44,6 +44,7 @@ GOAL: intended outcome
 STATE: completed and remaining work, with paths
 DECISIONS & CONSTRAINTS: reasons, preferences, corrections, rejected approaches
 FILES: relevant paths and uncommitted changes
+RUNNING: still-running agents/background tasks: id, purpose, report path, how to collect (or "none")
 VERIFIED vs UNVERIFIED: actual commands and exit codes versus assumptions
 NEXT STEP: exact next action
 NEXT PROMPT: latest user prompt verbatim, for task shifts or RED rollover
@@ -54,7 +55,7 @@ If the shell rejects the heredoc (for example, `unexpected EOF while looking for
 
 The installer resolves the helper paths above to this installation. The relay saves the handoff, then either opens a new Claude tab (rollover: open) or copies the relay prompt to the clipboard (rollover: copy). Report what the script actually printed; saving alone does not prove a tab opened. If no launch was acknowledged, tell the user to start a new session and send the printed `relay:<id>` prompt. After a successful handoff, stop working here.
 
-A `relay:<id>` prompt continues the injected handoff. Recheck material UNVERIFIED claims and act on NEXT PROMPT when present.
+A `relay:<id>` prompt continues the injected handoff. Recheck material UNVERIFIED claims and act on NEXT PROMPT when present. On resuming, collect RUNNING items before relaunching equivalent work; an agent from the old session cannot be messaged, so read its report path, and relaunch only if no report exists.
 <!-- CLAUDE-ORCHESTRATOR:END -->
 
 <!-- HUNCH:START — auto-generated, do not edit by hand -->

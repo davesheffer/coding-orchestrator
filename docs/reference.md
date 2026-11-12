@@ -164,6 +164,10 @@ unknown and not to infer a zone:
 | RED | `hard_tokens` (250k) | Roll over now; the `Stop` hook blocks one stop to enforce it |
 
 A **handoff** is a self-contained Markdown note (goal, state, decisions, files,
+optionally `RUNNING:` (still-running agents or background tasks, where their
+reports land and how to collect them; `RUNNING: none` is valid and a missing
+section is not a gap; when items are listed the injected context reminds the new
+session to check those report paths before relaunching),
 verified vs unverified, next step, and optionally the user's next prompt) that
 the model pipes to `relay.py handoff --title "<title>"` (or passes with
 `--body-file <path>`, a UTF-8 file, when the shell rejects the heredoc; a `< file`
