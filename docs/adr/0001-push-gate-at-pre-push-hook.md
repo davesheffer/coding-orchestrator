@@ -1,6 +1,6 @@
 # ADR 0001: Enforce the push gate at the git pre-push hook, not in shell text
 
-- Status: Proposed (draft, needs owner decision)
+- Status: Proposed; draft implementation on feat/pre-push-gate
 - Date: 2026-11-11
 - Related: `bin/jev-guard.py` (`risk_gate`), [reference.md](../reference.md) "risk_gate is advisory, not enforcement", parked branch `fix/review-jev` (832bcd5)
 
@@ -74,6 +74,14 @@ interpreter). A text parser cannot be the enforcement point.
 ## Open questions for the owner
 
 - Does the hook deny once and allow an identical retry, as today, or deny
-  until a critic run is recorded?
+  until a critic run is recorded? (draft default) Deny until the critic
+  ledger covers the files; a person overrides with `git push --no-verify`.
+  When Jev is off or unavailable the hook warns and allows the push.
 - Install through `core.hooksPath` with chaining, or per repo on request?
+  (draft default) Per repository on request:
+  `claude/install.py --pre-push-hook <repo>` writes the repository's hook
+  (honouring its own `core.hooksPath`), chains an existing hook as
+  `pre-push.local`, and never sets `core.hooksPath` globally.
 - Should `pre-commit` mirror the gate, or is the push gate enough?
+  (draft default) The push gate is enough; `risk_gate` keeps its advisory
+  commit check.

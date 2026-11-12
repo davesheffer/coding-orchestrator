@@ -448,6 +448,51 @@ which is removed after `handoff_ttl_hours`. Independently of Jev, a handoff
 (including any NEXT PROMPT text) is kept in the private `relay/handoffs/<id>.md`
 for the same period.
 
+##### pre-push gate
+
+A draft of [ADR 0001](adr/0001-push-gate-at-pre-push-hook.md): the push check
+runs as git's own `pre-push` hook, so it sees every push however the command was
+spelled (scripts, `make`, aliases, `eval`, another shell). It is opt-in per
+repository. After installing the bundle, run:
+
+```bash
+python claude/install.py --pre-push-hook /path/to/repo
+```
+
+This writes only the repository's `pre-push` hook (at `git rev-parse --git-path
+hooks`, so a repository's `core.hooksPath` is honoured; the installer never sets
+`core.hooksPath` itself). The hook is a small `sh` shim that runs
+`~/.claude/bin/pre-push-gate.py`. An existing `pre-push` hook is renamed to
+`pre-push.local` and runs first with the same arguments and stdin; if it fails, the
+push is refused. Rerunning the command is idempotent. If `pre-push.local` already
+exists next to a foreign hook, the installer stops and asks you to merge them.
+
+For each pushed ref the gate takes the commits being pushed (remote sha..local sha,
+or for a new remote ref the commits on no remote-tracking ref; deleted refs are
+skipped) and the files they touch, including a merge's own conflict resolutions.
+A file needs review when its blob at the pushed commit differs from the **critic
+ledger**, `<git-common-dir>/coding-orchestrator/critic-ledger.json` (shared by the
+repository's worktrees). When a critic run finishes, `jev-guard.py agent-done`
+records there the current blob hash (`git hash-object`) of each file the
+repository changed but has not pushed: unpushed commits, the work tree against
+`HEAD`, and untracked files. A deleted file is recorded as deleted; symlinks and
+submodules are never recorded, so they always need review. Recording is best
+effort and never fails the hook.
+
+With nothing needing review, the push proceeds. Otherwise the gate asks Jev the
+same `risk_gate` question (same redaction, `send_diff` and `max_diff_chars`). A
+risky answer refuses the push (exit 1) with the files needing review; the refusal
+holds, with no identical-retry override, until a critic run covers those files.
+When `risk_gate` is off or Jev is unavailable or unusable, the gate prints a
+warning and lets the push through. A git error reading the pushed range, a missing
+gate script or a crash refuses the push.
+
+Limits: a person overrides the gate with `git push --no-verify`, which skips the
+hook entirely. An agent that can run that, or edit `.git/hooks` or git config, can
+remove the gate too; this is the same trust level as `risk_gate`. Server-side
+branch protection and required reviews are the only real guarantee. The
+`risk_gate` `PreToolUse` hook is unchanged and stays as an early, advisory warning.
+
 #### Optional: Mission Control
 
 Mission Control is a Claude Code mod that shows the orchestrator at work:

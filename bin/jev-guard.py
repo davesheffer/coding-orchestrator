@@ -57,6 +57,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -1646,6 +1647,82 @@ def _untracked_files(cwd, deadline=None, git_opts=None):
     return [n for n in (out or "").split("\0") if n]
 
 
+# The repo-scoped critic ledger read by bin/pre-push-gate.py: file path (repository
+# relative, as git prints it) -> the blob hash its content had when a critic run was
+# recorded, or LEDGER_DELETED for a file that was absent then.
+LEDGER_RELPATH = Path("coding-orchestrator") / "critic-ledger.json"
+LEDGER_DELETED = "deleted"
+LEDGER_GIT_SECONDS = 1.5
+
+
+def ledger_path(cwd, deadline=None):
+    """`<git-common-dir>/coding-orchestrator/critic-ledger.json` for the repository at
+    `cwd` (shared by all its worktrees), or None outside a repository."""
+    out = _run_git(["rev-parse", "--git-common-dir"], cwd, deadline)
+    if not out or not out.strip():
+        return None
+    return (Path(cwd) / out.strip()).resolve() / LEDGER_RELPATH
+
+
+def load_ledger(path):
+    """The ledger's {path: hash} map; a missing or malformed file reads as empty."""
+    try:
+        files = json.loads(Path(path).read_text(encoding="utf-8")).get("files")
+    except Exception:
+        return {}
+    return files if isinstance(files, dict) else {}
+
+
+def record_critic_ledger(cwd, deadline=None):
+    """Record the current blob hash of every file this repository changed but has not
+    pushed (commits on no remote-tracking ref, the work tree against HEAD, untracked
+    files) into the critic ledger. Best effort: any failure leaves the ledger as it was."""
+    deadline = min(deadline or float("inf"), time.monotonic() + LEDGER_GIT_SECONDS)
+    top = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline)
+    path = ledger_path(cwd, deadline)
+    if not top or not top.strip() or path is None:
+        return
+    top = top.strip()
+    names = []
+    for args in (["log", "--format=", "--name-only", "-z", "--no-renames", "--cc", "HEAD",
+                  "--not", "--remotes", "--"],
+                 ["diff", *DIFF_FORMAT_ARGS, "--no-renames", "--name-only", "-z", "HEAD"]):
+        names += [n for n in (_run_git(args, top, deadline) or "").split("\0") if n]
+    names += _untracked_files(top, deadline)[:MAX_UNTRACKED]
+    files, hashable = {}, []
+    for name in dict.fromkeys(names):
+        try:
+            mode = (Path(top) / name).lstat().st_mode
+        except FileNotFoundError:
+            files[name] = LEDGER_DELETED
+            continue
+        except OSError:
+            continue
+        # Regular files only: a symlink or gitlink stays unrecorded (always needs review),
+        # and --stdin-paths reads one path per line.
+        if stat.S_ISREG(mode) and not any(c in name for c in "\r\n"):
+            hashable.append(name)
+    if hashable:
+        remaining = deadline - time.monotonic()
+        git = resolve_executable("git")
+        if remaining <= 0 or git is None:
+            return
+        result = subprocess.run([git, "hash-object", "--stdin-paths"], cwd=top,
+                                input="\n".join(hashable).encode("utf-8", "surrogateescape") + b"\n",
+                                capture_output=True, timeout=max(0.1, remaining))
+        hashes = result.stdout.decode("ascii", "replace").split()
+        if result.returncode != 0 or len(hashes) != len(hashable):
+            return
+        files.update(zip(hashable, hashes))
+    if not files:
+        return
+
+    def merge(s):
+        s["files"] = {**(s.get("files") if isinstance(s.get("files"), dict) else {}), **files}
+
+    update_state(path, merge, deadline)
+
+
 def _usable_path(path):
     """`path` with environment variables expanded and MSYS/`~` translated, or None when
     it is empty or a `$`/backtick is left (a variable set earlier in the command, or a
@@ -2942,6 +3019,18 @@ def _prune_critic_started(started, now_value):
             if isinstance(ts, (int, float)) and now_value - ts < 86400}
 
 
+def _record_ledger(payload, deadline):
+    """Record a finished critic run in the repo-scoped critic ledger (best effort); only
+    for a payload naming its cwd, so a hook never writes into an unrelated repository."""
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        return
+    try:
+        record_critic_ledger(_native_path(cwd), deadline)
+    except Exception:
+        pass
+
+
 def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=STATE_DIR,
                deadline=None):
     """Return the PostToolUse hook output dict, or None.
@@ -2986,6 +3075,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                 update_state(session_state_path(session_id, state_dir), set_critic_ts, deadline)
             except Exception:
                 pass  # persisting critic timestamps is best effort
+            _record_ledger(payload, deadline)
         return None
 
     if tool_name not in ("Agent", "Task"):
@@ -3050,6 +3140,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                          deadline)
         except Exception:
             pass  # persisting critic timestamps is best effort
+        _record_ledger(payload, deadline)
 
     if not feature_enabled(cfg, "report_check"):
         return None
