@@ -899,6 +899,29 @@ class RelayTests(unittest.TestCase):
         self.assertIn('handoff --title "<short title>" --body-file <file>', instructions)
         self.assertNotIn("< <file>", instructions)
 
+    def test_running_section_parsed_and_reminder(self):
+        handoffs = self.home / "relay/handoffs"
+        handoffs.mkdir(parents=True)
+        bodies = {
+            "listed": "GOAL: g\nRUNNING:\n- scout-1: maps X; report C:/r/x.md; SendMessage scout-1\nVERIFIED: none\n",
+            "inline": "GOAL: g\nRUNNING: bg task b1, output C:/o.txt\nNEXT STEP: x\n",
+            "none": "GOAL: g\nRUNNING: none\nVERIFIED: none\n",
+            "absent": "GOAL: g\nSTATE: s\n",
+        }
+        for name, body in bodies.items():
+            (handoffs / f"{name}.md").write_text(body, encoding="utf-8")
+        self.assertIn("scout-1", relay_module.running_items(bodies["listed"]))
+        self.assertNotIn("VERIFIED", relay_module.running_items(bodies["listed"]))
+        self.assertEqual(relay_module.running_items(bodies["none"]), "")
+        self.assertEqual(relay_module.running_items(bodies["absent"]), "")
+        reminder = "Handoff lists running work"
+        with patch.object(relay_module, "HANDOFFS", handoffs):
+            for name, expected in (("listed", True), ("inline", True), ("none", False), ("absent", False)):
+                out = relay_module.handoff_context(name, "s", False)
+                self.assertEqual(reminder in out, expected, name)
+        complete = "GOAL: g\nSTATE: s\nNEXT STEP: x\nVERIFIED: y\n"
+        self.assertEqual(relay_module.handoff_gaps(complete, None, None), [])
+
 
 if __name__ == "__main__":
     unittest.main()
