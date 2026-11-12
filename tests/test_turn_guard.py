@@ -9,6 +9,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import timing  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "bin" / "turn-guard.py"
 CLOSE_STDOUT = "import os, sys; os.close(1); os.execv(sys.executable, [sys.executable] + sys.argv[1:])"
@@ -89,9 +92,11 @@ class TurnGuardTests(unittest.TestCase):
         self.assertIn("nearly spent", out["additionalContext"])
 
     def test_report_regex_is_fast_on_whitespace_runs(self):
-        started = time.monotonic()
-        result = self.stop(last_assistant_message="\n" * 5000 + " " * 20000 + "\n \t \n" * 2000 + "done")
-        self.assertLess(time.monotonic() - started, 5)
+        agents = iter(range(100))  # a fresh agent per run, so no run sees an earlier one's state
+        result = timing.assert_scales(
+            self, lambda n: "\n" * (n // 4) + " " * n + "\n \t \n" * (n // 10) + "done",
+            lambda message: self.stop(f"a{next(agents)}", last_assistant_message=message),
+            5000, 20000, label="whitespace runs", abs_limit=5)
         self.assertIn(b'"block"', result.stdout)
 
     def test_resumed_agent_is_nudged_again_each_cycle(self):

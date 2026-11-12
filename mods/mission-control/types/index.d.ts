@@ -96,6 +96,11 @@ export type HunchLog = {
   total: number
   /** Constraint ids already toasted this session, so a `**` invariant toasts once. */
   seenConstraints: string[]
+  /**
+   * Task ids a `hunch_context` brief (MCP or CLI) was seen for, `''` for one without an id: kept apart
+   * from `calls`, which keeps only the newest and empties on `clear done`. Absent in older state.
+   */
+  contextTasks?: string[]
 }
 
 /** One open Claude Code session, from its `~/.claude/sessions/<pid>.json` registry file. */

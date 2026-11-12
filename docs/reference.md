@@ -142,6 +142,13 @@ the installer warns when that command is not on `PATH`; native PowerShell
 installation alone does not verify those hooks. For a custom destination, set
 `CLAUDE_CONFIG_DIR` to the same directory as `CLAUDE_HOME` when launching Claude.
 
+To check hooks live on Windows with a child `claude -p` (for example a probe
+that passes `--agents` JSON and watches the turn guard or role guard fire), set
+`CLAUDE_CODE_GIT_BASH_PATH` to Git Bash's `bash.exe` (typically
+`C:\Program Files\Git\bin\bash.exe`) in the child's environment. Without it the
+child cannot find a POSIX shell, so Bash calls and the hooks do not run, and a
+probe can look like the hooks are broken when they were never started.
+
 #### Context relay and rollover
 
 The relay (`relay/relay.py`) runs as `UserPromptSubmit` and `Stop` hooks. Once a
@@ -157,6 +164,10 @@ unknown and not to infer a zone:
 | RED | `hard_tokens` (250k) | Roll over now; the `Stop` hook blocks one stop to enforce it |
 
 A **handoff** is a self-contained Markdown note (goal, state, decisions, files,
+optionally `RUNNING:` (still-running agents or background tasks, where their
+reports land and how to collect them; `RUNNING: none` is valid and a missing
+section is not a gap; when items are listed the injected context reminds the new
+session to check those report paths before relaunching),
 verified vs unverified, next step, and optionally the user's next prompt) that
 the model pipes to `relay.py handoff --title "<title>"` (or passes with
 `--body-file <path>`, a UTF-8 file, when the shell rejects the heredoc; a `< file`

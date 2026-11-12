@@ -8,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +16,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
 import jev_client  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import timing  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("ask_jev", ROOT / "bin" / "ask-jev.py")
 ask_jev = importlib.util.module_from_spec(spec)
@@ -335,11 +336,13 @@ class AskJevTests(unittest.TestCase):
                 self.assertEqual(sorted(paths), {"**/**/*.py": ["a.py", "src/deep/d.py"], "***.py": ["a.py", "src/deep/d.py"],
                                                  "src/**/**/d.py": ["src/deep/d.py"]}[pattern])
         deep = "/".join(["d"] * 24) + "/f.py"
-        start = time.monotonic()
-        for pattern in ("**/" * 10 + "*.zzz", "*" * 40 + ".zzz", "*a" * 30 + "*.zzz"):
-            self.assertFalse(ask_jev.translate(pattern).fullmatch(deep))
-            self.assertFalse(ask_jev.translate(pattern).fullmatch("a" * 255))
-        self.assertLess(time.monotonic() - start, 2)
+        def matches(pattern):
+            return (ask_jev.translate(pattern).fullmatch(deep),
+                    ask_jev.translate(pattern).fullmatch("a" * 255))
+        for make, n in ((lambda n: "**/" * n + "*.zzz", 10), (lambda n: "*" * n + ".zzz", 40),
+                        (lambda n: "*a" * n + "*.zzz", 30)):
+            self.assertFalse(any(timing.assert_scales(self, make, matches, n // 4, n, label=make(n),
+                                                      abs_limit=2)))
         with self.assertRaises(ask_jev.UsageError):
             ask_jev.translate("*" * (ask_jev.MAX_PATTERN_CHARS + 1))
 

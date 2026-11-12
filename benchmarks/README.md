@@ -11,6 +11,8 @@ python bin/compare-codex-readonly.py --output <private-path>/codex-readonly.json
 
 The Claude comparison limits each call to read tools and a USD budget. The Codex comparison uses the Windows launcher, its normal permission probes, and `--trial-model`, which accepts only models already configured for the scout role and disables automatic model fallback for that run. Both tools store answer text in the requested private file so a reviewer can inspect correctness. Do not publish those files without reviewing their contents. Literal `required_hits` are a cue for manual review, **not** a correctness grade.
 
+Both commands exit non-zero when any run fails, returns no answer, misses a required term (every term in `required`, or at least `min_hits` of them when a task sets that), or leaves `git status --porcelain` of the target repository different from before the run; `--repo` must therefore be a git work tree.
+
 The specified-edit fixtures in `fixtures/` were copied to separate disposable workspaces for Sonnet and Opus. Each model could edit only `solution.py` through Claude's restricted file tools; an external runner executed `python -m unittest -q`. The `summary` fixture gained missing-record cases after the first pass, so the repair measurement is reported separately. The fixture tests are intentionally small and do not measure large changes, integration, or security-sensitive edits.
 
 ## 2026-09-23 local pilot

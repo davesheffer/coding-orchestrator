@@ -39,6 +39,12 @@ python -m unittest discover -s tests -v
 node vscode/handoff-bridge/test.js
 ```
 
+Timing tests (`tests/timing.py`) check that run time grows about linearly with
+input size rather than staying under a wall-clock bound, so they pass on a busy
+machine. Set `CO_STRICT_TIMING=1` (CI can set it) to also enforce the original
+absolute bounds, and `TIMING_HANG_LIMIT=<seconds>` (default 30) to change how
+long one timed call may run before it counts as a hang.
+
 Changed the Mission Control mod (`mods/mission-control/`)? Also run:
 
 ```bash

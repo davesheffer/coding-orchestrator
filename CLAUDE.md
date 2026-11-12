@@ -13,7 +13,7 @@ The main session owns the request, design, root cause, judgment, verification, a
 | Adversarial review of risky changes or claims | critic | Fable |
 | Design, ambiguity, security/concurrency decisions | main session | Opus 5.5 |
 
-Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and `sonnet` for bounded reading and specified implementation; reserve `fable` for the critic. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work.
+Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and `sonnet` for bounded reading and specified implementation; reserve `fable` for the critic. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work. If a Fable critic fails with a rate limit or overload (429/529), retry it once; if it fails again, run the same fresh critic brief on `opus` and report the substitution with the verdict. Never skip a required review or replace it with a self-review.
 
 - Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
 - Launch independent, delegation-sized units together; respect concurrency limits and avoid overlapping edits. Large Workflow orchestration with dozens of agents requires an explicit user request.
@@ -28,7 +28,7 @@ Provide goal, exact paths/ranges, applicable project rules, constraints, accepta
 
 Require `RESULT / EVIDENCE / CONFIDENCE / UNVERIFIED`, with actual check exit codes. Read builder diffs and require checks after the last edit. Missing evidence, low/medium confidence, or material unverified claims require direct verification or escalation (scout/runner to builder/main; builder to main), not the same retry. A partial subagent result (cap reached) is resumed with SendMessage `continue from your report file`, not relaunched.
 
-Risky or irreversible work requires critic review before completion. Resolve findings and report the actual verdict. Role tool lists and permission modes must be checked against effective client permissions; wording alone does not enforce a sandbox. Do not broaden permissions to make a check pass.
+Risky or irreversible work requires critic review before completion. Resolve findings and report the actual verdict. A critic round blocks only on a regression against the base or the round's own fix not working; log other gaps as residuals for the owner. After three fix/critic rounds on the same change without a pass, stop and bring the owner one decision (ship the version with no base regressions, change approach, or drop it) instead of starting a fourth round. Role tool lists and permission modes must be checked against effective client permissions; wording alone does not enforce a sandbox. Do not broaden permissions to make a check pass.
 
 Keep push, publish, deploy, delete, and send actions in the main session within existing user authorization. Batch genuinely outstanding approvals into one brief with PR, fix, CI, critic verdict, order, and decisions. Continue independent authorized work while waiting. Briefly report the actual work split and verification gaps.
 
@@ -44,6 +44,7 @@ GOAL: intended outcome
 STATE: completed and remaining work, with paths
 DECISIONS & CONSTRAINTS: reasons, preferences, corrections, rejected approaches
 FILES: relevant paths and uncommitted changes
+RUNNING: still-running agents/background tasks: id, purpose, report path, how to collect (or "none")
 VERIFIED vs UNVERIFIED: actual commands and exit codes versus assumptions
 NEXT STEP: exact next action
 NEXT PROMPT: latest user prompt verbatim, for task shifts or RED rollover
@@ -54,7 +55,7 @@ If the shell rejects the heredoc (for example, `unexpected EOF while looking for
 
 The installer resolves the helper paths above to this installation. The relay saves the handoff, then either opens a new Claude tab (rollover: open) or copies the relay prompt to the clipboard (rollover: copy). Report what the script actually printed; saving alone does not prove a tab opened. If no launch was acknowledged, tell the user to start a new session and send the printed `relay:<id>` prompt. After a successful handoff, stop working here.
 
-A `relay:<id>` prompt continues the injected handoff. Recheck material UNVERIFIED claims and act on NEXT PROMPT when present.
+A `relay:<id>` prompt continues the injected handoff. Recheck material UNVERIFIED claims and act on NEXT PROMPT when present. On resuming, collect RUNNING items before relaunching equivalent work; an agent from the old session cannot be messaged, so read its report path, and relaunch only if no report exists.
 <!-- CLAUDE-ORCHESTRATOR:END -->
 
 <!-- HUNCH:START — auto-generated, do not edit by hand -->

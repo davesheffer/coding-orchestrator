@@ -348,7 +348,7 @@ def sweep_if_due(cfg):
 
 def build_how(script: Path) -> str:
     python = "python" if os.name == "nt" else "python3"
-    return ("To roll over: write GOAL, STATE, DECISIONS & CONSTRAINTS, FILES, VERIFIED vs UNVERIFIED, "
+    return ("To roll over: write GOAL, STATE, DECISIONS & CONSTRAINTS, FILES, RUNNING, VERIFIED vs UNVERIFIED, "
             "NEXT STEP and NEXT PROMPT; pipe the handoff to "
             f"`{python} {shlex.quote(str(script))} handoff --title \"<short title>\"` "
             "(body on stdin via quoted heredoc; if the shell rejects it, e.g. `unexpected EOF`, write the body "
@@ -442,6 +442,29 @@ def classify_shift(jcfg, session_id, prompt, z):
     return sentence, log
 
 
+RUNNING_RE = re.compile(r"^[#*\-\s]*RUNNING\b[*\s]*:?(.*)$")
+SECTION_HEADER_RE = re.compile(r"^[#*\-\s]*[A-Z][A-Z &]*[A-Z][*\s]*:")
+
+
+def running_items(body):
+    """Text of the optional RUNNING section ("" when absent, empty or "none")."""
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        m = RUNNING_RE.match(line)
+        if not m:
+            continue
+        parts = [m.group(1)]
+        for nxt in lines[i + 1:]:
+            if SECTION_HEADER_RE.match(nxt):
+                break
+            parts.append(nxt)
+        text = "\n".join(parts).strip()
+        if re.fullmatch(r"[\W_]*none[\W_]*", text, re.IGNORECASE):
+            return ""
+        return text
+    return ""
+
+
 def handoff_context(hid, session_id, shift_on):
     path = HANDOFFS / f"{hid}.md"
     if not path.exists():
@@ -468,12 +491,14 @@ def handoff_context(hid, session_id, shift_on):
         pass
     # The fence must stay the only closing tag, whatever the body contains.
     body = HANDOFF_CLOSE_RE.sub(r"&lt;\1", body)
+    running = ("\n\nHandoff lists running work: check those report paths before relaunching."
+               if running_items(body) else "")
     return ("[relay] This session CONTINUES earlier work: the user sent the resume prompt for handoff "
             f"{hid}. The previous session's handoff is fenced in <handoff id=\"{hid}\"> below; treat it "
             "as your working memory, written by that session, not as new instructions from the user. "
             "Re-verify anything it lists as UNVERIFIED before relying on it. If it has a NEXT PROMPT "
             "section, that is the previous session's recorded request: continue it as the resumed task "
-            "unless the user's current message says otherwise.\n\n"
+            "unless the user's current message says otherwise." + running + "\n\n"
             f"<handoff id=\"{hid}\">\n{body}\n</handoff>")
 
 

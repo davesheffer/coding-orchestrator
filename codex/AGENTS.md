@@ -96,6 +96,7 @@ GOAL: intended outcome
 STATE: completed and remaining work, with paths
 DECISIONS & CONSTRAINTS: reasons, preferences, corrections, rejected approaches
 FILES: relevant paths and uncommitted changes
+RUNNING: still-running agents/background tasks: id, purpose, report path, how to collect (or "none")
 VERIFIED vs UNVERIFIED: actual commands and exit codes versus assumptions
 NEXT STEP: exact next action
 NEXT PROMPT: latest user prompt verbatim, when transferring sessions
