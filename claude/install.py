@@ -444,8 +444,9 @@ def install_pre_push_hook(repo: Path, dest: Path, dry_run: bool) -> int:
                 for d in dirs.stdout.splitlines() if d.strip()] if dirs.returncode == 0 else []
     # Inside the work tree (tracked, or ignored like husky's `.husky/_`) but outside the
     # git directory: the hook would be a work-tree file another tool owns or commits.
-    # Both the resolved path and the path as named count, so a work-tree symlink or
-    # junction to a directory elsewhere is refused too.
+    # The resolved path, the path as named, and the path with only its parent resolved
+    # all count, so a work-tree symlink or junction to a directory elsewhere is refused
+    # too, even when the repository was named through a linked path (macOS /var).
     tops = ([Path(os.path.abspath(top.stdout.strip())), Path(top.stdout.strip()).resolve()]
             if top.returncode == 0 and top.stdout.strip() else [])
     git_roots = [p for d in git_dirs for p in (Path(os.path.abspath(d)), d.resolve())]
@@ -454,7 +455,9 @@ def install_pre_push_hook(repo: Path, dest: Path, dry_run: bool) -> int:
         return (any(path.is_relative_to(t) for t in tops)
                 and not any(path.is_relative_to(d) for d in git_roots))
 
-    if in_work_tree(hooks.resolve()) or in_work_tree(Path(os.path.abspath(hooks))):
+    named = Path(os.path.abspath(hooks))
+    if (in_work_tree(hooks.resolve()) or in_work_tree(named)
+            or in_work_tree(named.parent.resolve() / named.name)):
         fail(f"the hooks directory {hooks} is inside the work tree, so the installer does "
              "not write into it. Install by hand: in its pre-push hook, save stdin to a file, "
              "run your existing checks, then run "
