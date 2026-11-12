@@ -420,7 +420,7 @@ def install_pre_push_hook(repo: Path, dest: Path, dry_run: bool) -> int:
     chains it under its own name. Idempotent: a hook carrying PRE_PUSH_MARKER is ours and
     is rewritten in place; a `pre-push.local` chained by an earlier version is moved to
     `pre-push.d/pre-push`. Refuses a core.hooksPath set globally (it would put the hook in
-    every repository) and a hooks directory tracked by git. Never sets core.hooksPath."""
+    every repository) and a hooks directory inside the work tree. Never sets core.hooksPath."""
     git = shutil.which("git")
     if git is None:
         fail("git is not on PATH")
@@ -439,15 +439,27 @@ def install_pre_push_hook(repo: Path, dest: Path, dry_run: bool) -> int:
              "there would run for every repository; unset it there or set a repository-level "
              "core.hooksPath, then rerun")
     top = _git_out(git, ["rev-parse", "--show-toplevel"], repo)
-    if (top.returncode == 0 and top.stdout.strip()
-            and hooks.resolve().is_relative_to(Path(top.stdout.strip()).resolve())):
-        tracked = _git_out(git, ["ls-files", "-z", "--", str(hooks)], repo)
-        if tracked.returncode != 0 or tracked.stdout.strip("\0"):
-            fail(f"the hooks directory {hooks} is tracked by git, so the installer does not "
-                 "write into it. Install by hand: in its pre-push hook, save stdin to a file, "
-                 "run your existing checks, then run "
-                 f"`{pinned_python()} {(dest / 'bin' / 'pre-push-gate.py').as_posix()} \"$@\"` "
-                 "with that file as stdin and exit with its status")
+    dirs = _git_out(git, ["rev-parse", "--absolute-git-dir", "--git-common-dir"], repo)
+    git_dirs = [Path(d) if Path(d).is_absolute() else repo / d
+                for d in dirs.stdout.splitlines() if d.strip()] if dirs.returncode == 0 else []
+    # Inside the work tree (tracked, or ignored like husky's `.husky/_`) but outside the
+    # git directory: the hook would be a work-tree file another tool owns or commits.
+    # Both the resolved path and the path as named count, so a work-tree symlink or
+    # junction to a directory elsewhere is refused too.
+    tops = ([Path(os.path.abspath(top.stdout.strip())), Path(top.stdout.strip()).resolve()]
+            if top.returncode == 0 and top.stdout.strip() else [])
+    git_roots = [p for d in git_dirs for p in (Path(os.path.abspath(d)), d.resolve())]
+
+    def in_work_tree(path):
+        return (any(path.is_relative_to(t) for t in tops)
+                and not any(path.is_relative_to(d) for d in git_roots))
+
+    if in_work_tree(hooks.resolve()) or in_work_tree(Path(os.path.abspath(hooks))):
+        fail(f"the hooks directory {hooks} is inside the work tree, so the installer does "
+             "not write into it. Install by hand: in its pre-push hook, save stdin to a file, "
+             "run your existing checks, then run "
+             f"`{pinned_python()} {(dest / 'bin' / 'pre-push-gate.py').as_posix()} \"$@\"` "
+             "with that file as stdin and exit with its status")
     hook, chained = hooks / "pre-push", hooks / "pre-push.d" / "pre-push"
     legacy = hooks / "pre-push.local"
     gate = dest / "bin" / "pre-push-gate.py"

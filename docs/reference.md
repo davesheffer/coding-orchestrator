@@ -468,33 +468,116 @@ fails, the push is refused. Rerunning the command is idempotent, and moves a
 `pre-push.local` chained by an earlier version to `pre-push.d/pre-push`. If
 `pre-push.d/pre-push` already exists next to a foreign hook, the installer stops and
 asks you to merge them. It also refuses a `core.hooksPath` set in the global or system
-git config (the hook would run for every repository) and a hooks directory tracked by
-git (such as `.husky`), printing how to call the gate from that hook by hand.
+git config (the hook would run for every repository) and a hooks directory inside the
+work tree, tracked or ignored (such as `.husky` or husky's `.husky/_`), printing how to
+call the gate from that hook by hand.
 
-For each pushed ref the gate takes the commits being pushed (remote sha..local sha,
-or for a new remote ref the commits on none of that remote's tracking refs; deleted
-refs are skipped) and the files they touch, including a merge's own conflict
-resolutions, plus every file whose content differs between the remote sha (for a new
-ref, each commit the range branches off) and the pushed commit, so a merge that drops
-upstream changes is seen. A pushed sha that is not a commit (a tree, blob or tag of
-one) is refused. Each ref is checked on its own: a file needs review when its blob at
-that ref's pushed commit differs from the **critic ledger**,
-`<git-common-dir>/coding-orchestrator/critic-ledger.json` (shared by the
-repository's worktrees). A critic run records only what it was handed, named by
-one line of its Agent prompt:
-`REVIEW-SCOPE: <absolute repo or worktree path> base=<commit-ish> [paths=<p1>,<p2>]`.
-When it finishes, `jev-guard.py agent-done` records in that repository's ledger (not
-the hook's working directory) the current blob hash (`git hash-object`) of each file
-changed between `base` and the work tree (committed, staged, unstaged, untracked and
-not ignored), narrowed to `paths` (files or directories) when given. A missing,
-malformed or repeated scope line, a path that is not a git repository or a `base`
-that does not resolve records nothing, and so does a report whose RESULT line or first
-line says block, blocking or fix first, or that has no RESULT section. Only files
-unchanged since the critic started count: an async critic's launch snapshots their
-hashes, and a foreground critic (no launch event) records only files not modified
-since its start. A deleted file is
-recorded as deleted; symlinks and submodules are never recorded, so they always need review. Recording is best
-effort and never fails the hook.
+Each pushed ref is checked on its own, against one **base** commit (deleted refs are
+skipped). For an existing remote ref the base is the remote sha being updated; for a
+new remote ref it is the single newest commit where the pushed history leaves that
+remote's own tracking refs (`refs/remotes/<remote>/`, the boundary of
+`git rev-list --boundary <local> --not --remotes=<remote>`, reduced with
+`git merge-base --independent`). A new ref whose commits are all on the remote already
+pushes nothing and passes. A new ref leaving the remote at two or more independent
+commits, or sharing no history with it, has no base: its files are listed against
+each boundary commit (or the empty tree) and are never covered. The change is every
+file whose entry differs between the base and the pushed commit (an endpoint diff, so
+an edit later reverted or a file added then deleted pushes no change, and a merge that
+drops upstream changes is seen). A pushed sha that is not a commit (a tree, blob or tag
+of one) is refused, and so is a non-zero remote sha that is not a commit in the
+repository, such as one not fetched yet or a tree (fetch first, then push again).
+Submodule pointer changes are always listed (`--ignore-submodules=dirty` overrides
+`diff.ignoreSubmodules` and `.gitmodules`; a submodule's own uncommitted or untracked
+files are not), and `git replace` refs are ignored (`GIT_NO_REPLACE_OBJECTS=1`).
+
+The **critic ledger**, `<git-common-dir>/coding-orchestrator/critic-ledger.json`
+(shared by the repository's worktrees), holds one approval per approving critic run:
+`{"version": 3, "approvals": [{"base": "<base sha>", "ts": ..., "files": {"<path>":
+"<mode>:<blob>" or "deleted"}}]}`, the newest 100 runs kept. **The exact rule:** an
+approval is one run's whole change set, "remote commit X -> exactly these file
+entries", and approvals never combine. A ref update is covered only when its base is
+exactly X and its changed files are exactly that one approval's files, each at the
+approved entry. A push that changes a subset of a run's files (a partial commit of a
+reviewed change), a superset, or files approved by two separately scoped runs needs
+review, as does any other base or no base; an uncovered ref needs review of all its
+files. A v1 or v2 ledger reads as empty, and the next recorded run rewrites it as v3.
+A later blocking run does not revoke an earlier approval: an approval stays valid
+until it is pruned or the push no longer matches it exactly.
+
+Only an async (background) critic run records, and only what it was handed, named
+by one line of its Agent prompt:
+`REVIEW-SCOPE: <absolute repo or worktree path> base=<full commit sha> [paths=<p1>,<p2>]`.
+`base` must be a full 40- or 64-hex commit sha (a branch name such as `origin/main` or
+a short sha records nothing, since it would resolve when the run finishes, possibly
+after a fetch moved it past what the critic saw). Choose it as the commit the push
+will update: for an existing remote branch, the remote tip you will push over
+(`git rev-parse <remote>/<branch>`); for a new branch, the newest commit where it
+leaves the remote's refs, usually `git merge-base HEAD <remote>/main`. When its
+hand-back arrives, `jev-guard.py agent-done` records in that repository's ledger (not the
+hook's working directory), as the approval for `base`, the current `<mode>:<blob>` of
+each file `git diff <base>` lists (committed, staged, unstaged, and intent-to-add),
+narrowed to `paths` (files or directories) when given, as one new approval. Untracked
+files are never recorded, because `git diff <base>`, the critic's view, does not show
+them: `git add` or `git add -N` new files before the critic runs. Deletions come from
+git (`D` in `git diff --name-status`), not from the disk. Recording is all or nothing
+over the files `git diff <base>` lists (after `paths`): if any one cannot be hashed (a
+changed file missing on disk that git does not report deleted, such as a skip-worktree
+file; a symlink or submodule; a name starting with `"`, which `git hash-object
+--stdin-paths` would unquote) or changed since the critic started, the run records
+nothing, since keeping the rest would approve a smaller change than the critic was
+handed. A tracked file `git diff-files` does not report as
+modified (and whose mode is unchanged) takes its index entry, the critic's `git diff`
+view: a file git treats as unchanged (`assume-unchanged`, or `skip-worktree` while
+present on disk) is recorded at its index entry, whatever the disk holds; other files are hashed
+with `git hash-object`, so a blob committed with CRLF still matches under
+`core.autocrlf=true`. A missing, malformed or repeated scope line, a path that is not
+a git repository, a `base` that is not a full sha of a commit in that repository or is
+not on any remote-tracking ref (unpublished, so earlier unreviewed commits could hide
+behind the last delta) records nothing; when git fails while checking that, nothing is
+recorded either.
+
+The accepted cost of the exact rule is re-review whenever the remote side moves:
+after merging or rebasing onto a moved main, after pushing part of a reviewed series
+(the next push updates the new remote tip, so it needs an approval with that base),
+and after any other remote move, including a force-push over an upstream change. A new
+ref branching off two independent remote commits, or sharing no history with the
+remote, is never covered. In exchange an approval can never be replayed against a
+remote state the critic did not see (for example after upstream returned a file to
+its reviewed starting content, then a forced update or an `-s ours` merge).
+
+The verdict rule is structural: the report's
+first non-empty line, with surrounding whitespace stripped, must be exactly
+`RESULT: SHIP` or `RESULT: approve-with-nits` (any case, an optional final `.`, nothing
+else on the line), and no other line may contain a RESULT header: the word `RESULT`
+(upper case) or `verdict` (any case) anywhere in the line, or `result` (any case) as
+its first word, followed within 20 characters by a colon, or by a spaced dash
+(`RESULT - block`, `final verdict: block`), however it is numbered, quoted, bolded,
+backticked or placed in a table. Prose such as `test result: OK` or `the verdict is
+fine` is not a header. A second RESULT line records nothing even when it also says SHIP, as do text
+after the verdict (`RESULT: SHIP - no blockers`), any other verdict, and a report
+without one. The run records only when its whole file set is
+the same at launch and at hand-back: the async launch snapshots the files' hashes
+(just after the critic starts) and the hand-back must find exactly that snapshot, the
+same names at the same entries (a file edited, restored or reverted out of the diff,
+staged into it or unstaged from it during the run records nothing; a file changed
+and changed back to identical content in between is not detected, and the recorded
+entry is that identical content). A foreground critic has no launch event, so no
+snapshot, and never records (logged as skipped, `no_launch_snapshot`): its file set at
+the end cannot show what it was handed. A scope with no changed files records nothing
+(`no_files`). Each entry is `<mode>:<blob>`, so a mode change (executable bit, symlink)
+needs review. The mode comes from the index for a tracked file where git does not
+trust the executable bit (Windows, or `core.fileMode=false`), else from the file
+system. A deleted file within the scope is recorded as deleted when it was already
+deleted at launch.
+Symlinks and submodules are never hashed, so a change that adds or modifies one always
+needs review (deleting one, or replacing a symlink with a regular file, is recorded
+like any other deletion or file): a symlink or gitlink on disk, or an index entry with symlink mode 120000 (on
+Windows with `core.symlinks=false` git checks a symlink out as a plain file holding
+its target), makes the run record nothing. Recording is best effort and never fails the hook.
+
+Limit: the gate checks each ref's tip, not every commit in the range. Content an
+intermediate commit adds and a later one removes (such as a secret) is never compared
+with the ledger, though it is still pushed and stays in history.
 
 With nothing needing review, the push proceeds. Otherwise the gate asks Jev the
 same `risk_gate` question (same redaction, `send_diff` and `max_diff_chars`). A

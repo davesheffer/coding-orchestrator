@@ -355,9 +355,11 @@ DIFF_HEADER_RE = re.compile(r"^diff --git (?:\"?a/(.*?)\"?) (?:\"?b/(.*?)\"?)$")
 # unredacted. A diff.<driver>.textconv filter (e.g. `gpg -d` for *.gpg) would send its
 # output as hunk text under an unredacted name, and diff.relative would limit the diff
 # to the gate's subdirectory. Command-line flags override config, unlike `-c`
-# overrides which color.diff=always still beats.
+# overrides which color.diff=always still beats. --ignore-submodules=dirty lists every
+# gitlink change whatever diff.ignoreSubmodules or .gitmodules say, but not a
+# submodule's own uncommitted or untracked files, which no commit here contains.
 DIFF_FORMAT_ARGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--no-relative",
-                    "--src-prefix=a/", "--dst-prefix=b/"]
+                    "--src-prefix=a/", "--dst-prefix=b/", "--ignore-submodules=dirty"]
 GIT_SUBPROCESS_BUDGET_SECONDS = 4.0
 # Pushes and deploys leave the machine, so they fail closed: when the classifier is
 # unavailable or the gate itself crashes, they are denied instead of let through.
@@ -1590,7 +1592,9 @@ def _run_git(args, cwd, deadline=None, git_opts=None):
     if git is None:
         return None
     try:
-        result = subprocess.run([git, *args], cwd=cwd, capture_output=True, timeout=timeout)
+        # GIT_NO_REPLACE_OBJECTS: a `git replace` ref must not swap in other content.
+        result = subprocess.run([git, *args], cwd=cwd, capture_output=True, timeout=timeout,
+                                env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"})
     except Exception:
         return None
     if result.returncode != 0:
@@ -1647,15 +1651,27 @@ def _untracked_files(cwd, deadline=None, git_opts=None):
     return [n for n in (out or "").split("\0") if n]
 
 
-# The repo-scoped critic ledger read by bin/pre-push-gate.py: file path (repository
-# relative, as git prints it) -> the blob hash its content had when a critic run was
-# recorded, or LEDGER_DELETED for a file that was absent then.
+# The repo-scoped critic ledger read by bin/pre-push-gate.py, schema v3:
+# {"version": 3, "approvals": [{"base": <base commit sha>, "ts": recorded at, "files":
+# {<path, repository relative as git prints it>: "<mode>:<blob>" or LEDGER_DELETED}}]}.
+# Each approval is one approving critic run's whole change set, "remote commit base ->
+# exactly these entries", never merged with another run: the gate allows a ref update
+# only when its remote side is exactly that base and the paths differing between the
+# base and the pushed commit are exactly the approval's paths, each at the approved
+# entry. Only the newest LEDGER_MAX_APPROVALS runs are kept; an older-format ledger
+# reads as empty.
 LEDGER_RELPATH = Path("coding-orchestrator") / "critic-ledger.json"
 LEDGER_DELETED = "deleted"
-LEDGER_GIT_SECONDS = 1.5
-# File mtimes and time.time() come from clocks of different resolution (and FAT keeps
-# 2 s), so a file written just before a foreground critic's start may stamp just after.
-LEDGER_MTIME_SLACK_SECONDS = 2.0
+# A listed name the recorder cannot hash (missing on disk, symlink, gitlink, a name
+# --stdin-paths would misread). A run holding one records nothing: dropping the name
+# instead would approve a smaller file set than the critic was handed.
+LEDGER_UNHASHABLE = "unhashable"
+LEDGER_VERSION = 3
+LEDGER_MAX_APPROVALS = 100
+FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
+# Recording runs about six git calls; at ~0.5 s each on a slow Windows host 1.5 s
+# recorded nothing. Still capped by the hook's own deadline (SHORT_HOOK_BUDGET_SECONDS).
+LEDGER_GIT_SECONDS = 3.0
 
 
 def ledger_path(cwd, deadline=None):
@@ -1667,59 +1683,108 @@ def ledger_path(cwd, deadline=None):
     return (Path(cwd) / out.strip()).resolve() / LEDGER_RELPATH
 
 
+def _valid_approvals(approvals):
+    """The well-formed entries of a stored "approvals" list: dicts with a full hex sha
+    "base" and a dict "files" whose values are strings."""
+    if not isinstance(approvals, list):
+        return []
+    return [value for value in approvals
+            if isinstance(value, dict) and isinstance(value.get("base"), str)
+            and FULL_SHA_RE.fullmatch(value["base"]) and isinstance(value.get("files"), dict)
+            and all(isinstance(entry, str) for entry in value["files"].values())]
+
+
 def load_ledger(path):
-    """The ledger's {path: hash} map; a missing or malformed file reads as empty."""
+    """The ledger's [{"base", "ts", "files"}] approvals, one per recorded critic run; a
+    missing or malformed file, or an older-format ledger (v1 or v2), reads as []."""
     try:
-        files = json.loads(Path(path).read_text(encoding="utf-8")).get("files")
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
-        return {}
-    return files if isinstance(files, dict) else {}
+        return []
+    if not isinstance(data, dict) or data.get("version") != LEDGER_VERSION:
+        return []
+    return _valid_approvals(data.get("approvals"))
 
 
 def _unpushed_names(top, deadline):
-    """Files changed by commits on no remote-tracking ref, plus those whose content at
+    """(files changed by commits on no remote-tracking ref, plus those whose content at
     HEAD differs from any commit those commits branch off (a merge equal to one parent
-    lists nothing under --cc), or None on a git failure."""
+    lists nothing under --cc), the commit that contains every such branch-off point or
+    None when there is no single one), or None on a git failure."""
     names = _run_git(["-c", "log.showRoot=true", "log", "--format=", "--name-only", "-z",
-                      "--no-renames", "--cc", "HEAD", "--not", "--remotes", "--"], top, deadline)
+                      "--no-renames", "--ignore-submodules=dirty", "--cc", "HEAD", "--not",
+                      "--remotes", "--"], top, deadline)
     commits = _run_git(["rev-list", "--boundary", "HEAD", "--not", "--remotes"], top, deadline)
     if names is None or commits is None:
         return None
     names = [n for n in names.split("\0") if n]
     words = commits.split()
     if not words:
-        return names
+        head = _run_git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], top, deadline)
+        return names, (head.strip() or None) if head else None
     bases = [word[1:] for word in words if word.startswith("-")]
-    if not bases:
+    base = None
+    if bases:
+        newest = _run_git(["merge-base", "--independent", *bases], top, deadline)
+        newest = (newest or "").split()
+        base = newest[0] if len(newest) == 1 else None
+    else:
         empty = _run_git(["hash-object", "-t", "tree", "--stdin"], top, deadline)
         if not empty or not empty.strip():
             return None
         bases = [empty.strip()]
-    for base in bases:
-        out = _run_git(["diff", *DIFF_FORMAT_ARGS, "--name-only", "-z", "--no-renames", base,
+    for each in bases:
+        out = _run_git(["diff", *DIFF_FORMAT_ARGS, "--name-only", "-z", "--no-renames", each,
                         "HEAD", "--"], top, deadline)
         if out is None:
             return None
         names += [n for n in out.split("\0") if n]
-    return names
+    return names, base
 
 
-def _hash_worktree_files(top, names, deadline):
-    """{file: current blob hash or LEDGER_DELETED} for `names` in the work tree at `top`,
-    or None on a failure. Symlinks and gitlinks are left out (they always need review)."""
-    files, hashable = {}, []
+def _hash_worktree_files(top, names, deadline, deleted=()):
+    """{file: "<mode>:<blob>" or LEDGER_DELETED} for `names` in the work tree at `top`,
+    or None on a failure. Every name is in the result. A name in `deleted` (git reports
+    it deleted) is LEDGER_DELETED without looking at the disk; any other name missing or
+    unreadable on disk is LEDGER_UNHASHABLE. Only regular files are hashed: a symlink or
+    gitlink on disk, an index entry with symlink mode 120000 (a symlink checked out as a
+    plain file under core.symlinks=false) or gitlink mode, and a name --stdin-paths would
+    misread are LEDGER_UNHASHABLE too, so a run holding one records nothing."""
+    files, hashable, blobs = {}, [], {}
     for name in dict.fromkeys(names):
-        try:
-            mode = (Path(top) / name).lstat().st_mode
-        except FileNotFoundError:
+        if name in deleted:
             files[name] = LEDGER_DELETED
             continue
+        files[name] = LEDGER_UNHASHABLE
+        try:
+            mode = (Path(top) / name).lstat().st_mode
         except OSError:
             continue
-        # Regular files only: a symlink or gitlink stays unrecorded (always needs review),
-        # and --stdin-paths reads one path per line.
-        if stat.S_ISREG(mode) and not any(c in name for c in "\r\n"):
+        # --stdin-paths reads one path per line and C-unquotes a line starting with '"'.
+        if stat.S_ISREG(mode) and not any(c in name for c in "\r\n") \
+                and not name.startswith('"'):
             hashable.append(name)
+    if hashable:
+        found = _index_entries(top, deadline)
+        if found is None:
+            return None
+        index, blobs = found
+        hashable = [name for name in hashable if index.get(name) not in ("120000", "160000")]
+    if any(name in blobs for name in hashable):
+        # A tracked file diff-files does not report as modified keeps its index entry:
+        # hash-object would apply core.autocrlf and miss a blob committed with CRLF.
+        dirty = _run_git(["diff-files", "--name-only", "-z", "--ignore-submodules=dirty"], top,
+                         deadline)
+        if dirty is None:
+            return None
+        dirty = {n for n in dirty.split("\0") if n}
+        clean = {name for name in hashable if name in blobs and name not in dirty}
+        modes = _worktree_modes(top, sorted(clean), index, deadline)
+        if modes is None:
+            return None
+        clean = {name for name in clean if modes[name] == index[name]}
+        files.update((name, f"{index[name]}:{blobs[name]}") for name in clean)
+        hashable = [name for name in hashable if name not in clean]
     if hashable:
         remaining = deadline - time.monotonic()
         git = resolve_executable("git")
@@ -1731,84 +1796,170 @@ def _hash_worktree_files(top, names, deadline):
         hashes = result.stdout.decode("ascii", "replace").split()
         if result.returncode != 0 or len(hashes) != len(hashable):
             return None
-        files.update(zip(hashable, hashes))
+        modes = _worktree_modes(top, hashable, index, deadline)
+        if modes is None:
+            return None
+        files.update((name, f"{modes[name]}:{blob}") for name, blob in zip(hashable, hashes))
     return files
 
 
+def _index_entries(top, deadline):
+    """({name: index mode}, {name: blob} for unconflicted (stage 0) entries) for the
+    repository at `top`, or None on a git failure."""
+    out = _run_git(["ls-files", "-s", "-z"], top, deadline)
+    if out is None:
+        return None
+    index, blobs = {}, {}
+    for entry in out.split("\0"):
+        meta, sep, name = entry.partition("\t")
+        fields = meta.split()
+        if sep and fields:
+            index[name] = fields[0]
+            if len(fields) == 3 and fields[2] == "0":
+                blobs[name] = fields[1]
+    return index, blobs
+
+
+# Whether lstat's executable bit is git's (not on Windows, which derives it from the
+# file extension); a module constant so tests can take the POSIX path anywhere.
+FILE_SYSTEM_EXEC_BIT = os.name != "nt"
+
+
+def _worktree_modes(top, names, index, deadline):
+    """{name: git file mode} for regular files `names`: from the executable bit where git
+    trusts it (FILE_SYSTEM_EXEC_BIT and core.fileMode not false), else the `index` mode,
+    100644 for untracked files. None on a failure."""
+    file_mode = _run_git(["config", "--bool", "core.fileMode"], top, deadline)
+    if not FILE_SYSTEM_EXEC_BIT or (file_mode or "").strip() == "false":
+        return {name: index.get(name, "100644") for name in names}
+    modes = {}
+    for name in names:
+        try:
+            executable = (Path(top) / name).lstat().st_mode & 0o111
+        except OSError:
+            return None
+        modes[name] = "100755" if executable else "100644"
+    return modes
+
+
+def _name_status(top, rev, deadline):
+    """(names, {deleted names}) for the tracked files (intent-to-add included) differing
+    between commit `rev` and the work tree at `top`, from git's -z name-status, or None
+    on a git failure. Untracked files are never listed: `git diff <base>`, the critic's
+    view of the change, does not show them."""
+    out = _run_git(["diff", *DIFF_FORMAT_ARGS, "--no-renames", "--name-status", "-z", rev,
+                    "--"], top, deadline)
+    if out is None:
+        return None
+    tokens = out.split("\0")
+    names, deleted = [], set()
+    for status, name in zip(tokens[0::2], tokens[1::2]):
+        if name:
+            names.append(name)
+            if status.startswith("D"):
+                deleted.add(name)
+    return names, deleted
+
+
 def critic_ledger_files(cwd, deadline=None):
-    """(ledger path, {file: current blob hash or LEDGER_DELETED}, top level) for every
-    file this repository changed but has not pushed (unpushed commits, the work tree
-    against HEAD, untracked files), or None on a failure. Symlinks and gitlinks are left out."""
+    """(ledger path, {file: current "<mode>:<blob>" or LEDGER_DELETED}, top level, base)
+    for every tracked file this repository changed but has not pushed, or None on a
+    failure. `base` is the published commit that contains every point the unpushed
+    commits branch off (HEAD when nothing is unpushed), or None when there is no single
+    one; with a base the files are those `git diff <base>` lists, else those the unpushed
+    commits and the work tree against HEAD change. Deletions are git's; untracked files,
+    untracked files are left out; symlinks, gitlinks and files missing on disk are
+    LEDGER_UNHASHABLE."""
     deadline = min(deadline or float("inf"), time.monotonic() + LEDGER_GIT_SECONDS)
     top = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline)
     path = ledger_path(cwd, deadline)
     if not top or not top.strip() or path is None:
         return None
     top = top.strip()
-    names = _unpushed_names(top, deadline)
-    if names is None:
+    found = _unpushed_names(top, deadline)
+    if found is None:
         return None
-    names += [n for n in (_run_git(["diff", *DIFF_FORMAT_ARGS, "--no-renames", "--name-only",
-                                    "-z", "HEAD"], top, deadline) or "").split("\0") if n]
-    names += _untracked_files(top, deadline)[:MAX_UNTRACKED]
-    files = _hash_worktree_files(top, names, deadline)
-    return None if files is None else (path, files, top)
+    names, base = found
+    changed = _name_status(top, base or "HEAD", deadline)
+    if changed is None:
+        return None
+    names = changed[0] if base else names + changed[0]
+    files = _hash_worktree_files(top, names, deadline, deleted=changed[1])
+    return None if files is None else (path, files, top, base)
 
 
-def _since_launch(files, top, launch=None, launched_ts=None):
-    """`files` narrowed to those unchanged since the critic started: equal to the `launch`
-    snapshot, else (a foreground critic, no launch event) not modified since `launched_ts`
-    (within LEDGER_MTIME_SLACK_SECONDS) and not deleted; unnarrowed with neither."""
-    if isinstance(launch, dict):
-        return {name: blob for name, blob in files.items() if launch.get(name) == blob}
-    if not isinstance(launched_ts, (int, float)):
+def _since_launch(files, launch=None):
+    """`files` when they equal the `launch` snapshot exactly, else None (the run records
+    nothing: keeping only the unchanged ones would approve a smaller file set than the
+    critic was handed): the same names (a file changed, added to or dropped from the diff
+    during the run fails) at the same entries. Unchecked without a snapshot, which only
+    the direct record_critic_ledger API allows; the hooks never record without one."""
+    if launch is None:
         return files
-    kept = {}
-    for name, blob in files.items():
-        try:
-            if blob != LEDGER_DELETED and (Path(top) / name).lstat().st_mtime <= (
-                    launched_ts + LEDGER_MTIME_SLACK_SECONDS):
-                kept[name] = blob
-        except OSError:
-            continue
-    return kept
+    return dict(files) if isinstance(launch, dict) and launch == files else None
 
 
-def _merge_ledger(path, files, deadline):
-    """Merge `files` into the ledger at `path`; returns how many were recorded."""
-    if not files:
+def _merge_ledger(path, files, base, deadline):
+    """Append `files` to the ledger at `path` as one approval of the change from the
+    commit `base` (a full lower-case hex sha), never merged with an older approval, and
+    keep the newest LEDGER_MAX_APPROVALS; returns how many files were recorded (none
+    without such a base)."""
+    if not files or not isinstance(base, str) or not FULL_SHA_RE.fullmatch(base) \
+            or base != base.lower() or LEDGER_UNHASHABLE in files.values():
         return 0
 
     def merge(s):
-        s["files"] = {**(s.get("files") if isinstance(s.get("files"), dict) else {}), **files}
+        # A v1 or v2 ledger's approvals are dropped, not converted.
+        old = _valid_approvals(s.get("approvals")) if s.get("version") == LEDGER_VERSION else []
+        approvals = old + [{"base": base, "ts": time.time(), "files": dict(files)}]
+        newest = sorted(approvals, key=lambda value: value.get("ts")
+                        if isinstance(value.get("ts"), (int, float)) else 0)
+        s.pop("files", None)
+        s["version"] = LEDGER_VERSION
+        s["approvals"] = newest[-LEDGER_MAX_APPROVALS:]
 
     update_state(path, merge, deadline)
     return len(files)
 
 
-def record_critic_ledger(cwd, deadline=None, launch=None, launched_ts=None):
-    """Record the current blob hash of every file this repository changed but has not
-    pushed (see critic_ledger_files) into the critic ledger, narrowed by _since_launch.
-    A direct API for tests and tools: the hooks record only a critic's REVIEW-SCOPE (see
-    record_scoped_ledger). Best effort: any failure leaves the ledger as it was."""
+def record_critic_ledger(cwd, deadline=None, launch=None):
+    """Record the current "<mode>:<blob>" of every file this repository changed but has
+    not pushed (see critic_ledger_files) into the critic ledger, all or nothing: nothing
+    when one is LEDGER_UNHASHABLE or differs from a given `launch` snapshot (_since_launch).
+    A direct API for tests and tools: the hooks record only an async critic's REVIEW-SCOPE
+    (see _record_critic_run). Best effort: any failure leaves the ledger as it was."""
     found = critic_ledger_files(cwd, deadline)
     if found is None:
         return
-    path, files, top = found
-    _merge_ledger(path, _since_launch(files, top, launch, launched_ts), deadline)
+    path, files, _top, base = found
+    base = base.lower() if isinstance(base, str) else None
+    files = _since_launch(files, launch)
+    if files is not None:
+        _merge_ledger(path, files, base, deadline)
 
 
 # The scope a critic was handed, as one line of its Agent prompt:
-# `REVIEW-SCOPE: <absolute repo or worktree path> base=<commit-ish> [paths=<p1>,<p2>]`.
+# `REVIEW-SCOPE: <absolute repo or worktree path> base=<full commit sha> [paths=<p1>,<p2>]`.
 REVIEW_SCOPE_RE = re.compile(r"(?m)^[ \t]*REVIEW-SCOPE:[ \t]*(.*?)[ \t]*\r?$")
 REVIEW_SCOPE_FIELDS_RE = re.compile(r"(.+?)[ \t]+base=(\S+)(?:[ \t]+paths=(\S.*))?")
-# A critic verdict that holds the change back: nothing is recorded for it.
-BLOCKING_VERDICT_RE = re.compile(r"block|fix[ \t]+first", re.IGNORECASE)
+# The only approving critic verdict (agents/critic.md): the report's first non-empty
+# line, stripped, is exactly this, with nothing else on it.
+APPROVING_RESULT_LINE_RE = re.compile(r"RESULT:[ \t]*(?:SHIP|approve-with-nits)[ \t]*\.?",
+                                      re.IGNORECASE)
+# Any other line that looks like a RESULT header, however decorated (numbered, in a
+# table, quoted, backticked, bold or italic, prefixed): upper-case `RESULT` or `verdict`
+# in any case as a word anywhere, or `result` in any case as the line's first word,
+# followed within 20 characters by a colon, or by a spaced dash. Prose such as "test
+# result: OK" or "the verdict is fine" is not one.
+RESULT_HEADER_ANYWHERE_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])(?:RESULT|(?i:verdict))|^[\W\d_]*(?i:result))(?![A-Za-z0-9])"
+    r"(?:[^:\n]{0,20}:|[ \t]+[-—][ \t])")
 
 
 def parse_review_scope(prompt):
     """{"path", "base", "paths"} from the prompt's single REVIEW-SCOPE line, or the reason
-    there is none ("no_scope", or "bad_scope" for a malformed, repeated or relative one)."""
+    there is none ("no_scope", or "bad_scope" for a malformed, repeated or relative one,
+    or one whose base is not a full hex commit sha). The base is stored lower-case."""
     lines = REVIEW_SCOPE_RE.findall(prompt) if isinstance(prompt, str) else []
     if not lines:
         return "no_scope"
@@ -1817,60 +1968,72 @@ def parse_review_scope(prompt):
         return "bad_scope"
     path, base, paths = match.groups()
     path = _native_path(path.strip().strip('"'))
-    if not path or not Path(path).is_absolute() or base.startswith("-"):
+    # A symbolic base (origin/main) would resolve when the run finishes, after a fetch
+    # may have moved it past what the critic saw; only a full sha names one commit.
+    if not path or not Path(path).is_absolute() or not FULL_SHA_RE.fullmatch(base):
         return "bad_scope"
     if paths is not None:
         paths = [p.strip().replace("\\", "/").strip("/") for p in paths.split(",")]
         if not all(paths):
             return "bad_scope"
-    return {"path": path, "base": base, "paths": paths}
+    return {"path": path, "base": base.lower(), "paths": paths}
 
 
 def resolve_review_scope(scope, deadline=None):
     """{"repo": top level, "base": commit sha, "paths": list or None} for a parsed scope,
-    or the reason it does not resolve ("not_a_repo", "bad_base")."""
+    or the reason it does not resolve ("not_a_repo", "bad_base" when the base is not a
+    commit of that repo, "unpublished_base", "git_failed")."""
     top = _run_git(["rev-parse", "--show-toplevel"], scope["path"], deadline)
     if not top or not top.strip():
         return "not_a_repo"
     top = top.strip()
     sha = _run_git(["rev-parse", "--verify", "--quiet", f"{scope['base']}^{{commit}}"], top,
                    deadline)
-    if not sha or not sha.strip():
+    if not sha or sha.strip().lower() != scope["base"]:
         return "bad_base"
-    return {"repo": top, "base": sha.strip(), "paths": scope["paths"]}
+    sha = scope["base"]
+    # A base that is not published would let a critic handed only the last delta cover
+    # earlier unreviewed commits; it must be on some remote-tracking ref (one git call).
+    # The gate honours the approval only for a push whose remote side is exactly it.
+    refs = _run_git(["for-each-ref", "--count=1", "--contains", sha, "--format=%(refname)",
+                     "refs/remotes"], top, deadline)
+    if refs is None:
+        return "git_failed"
+    if not refs.strip():
+        return "unpublished_base"
+    return {"repo": top, "base": sha, "paths": scope["paths"]}
 
 
 def scoped_ledger_files(scope, deadline=None):
-    """(ledger path, {file: current blob hash or LEDGER_DELETED}) for the files a resolved
-    scope covers: changed between its base and the work tree (committed, staged, unstaged,
-    untracked and not ignored), narrowed to its paths (a file or a directory each). None
-    on a failure."""
+    """(ledger path, {file: current "<mode>:<blob>" or LEDGER_DELETED}) for the files a resolved
+    scope covers: those `git diff <base>` lists, the critic's view (committed, staged,
+    unstaged, intent-to-add; never untracked), narrowed to its paths (a file or a
+    directory each). Deletions are git's D entries. None on a failure."""
     deadline = min(deadline or float("inf"), time.monotonic() + LEDGER_GIT_SECONDS)
     top = scope["repo"]
     path = ledger_path(top, deadline)
-    changed = _run_git(["diff", *DIFF_FORMAT_ARGS, "--no-renames", "--name-only", "-z",
-                        scope["base"], "--"], top, deadline)
+    changed = _name_status(top, scope["base"], deadline)
     if path is None or changed is None:
         return None
-    names = [n for n in changed.split("\0") if n] + _untracked_files(top, deadline)[:MAX_UNTRACKED]
+    names, deleted = changed
     paths = scope.get("paths")
     if paths:
         names = [n for n in names if any(n == p or n.startswith(p + "/") for p in paths)]
-    files = _hash_worktree_files(top, names, deadline)
+    files = _hash_worktree_files(top, names, deadline, deleted=deleted)
     return None if files is None else (path, files)
 
 
 def critic_verdict_approves(report):
-    """True when a critic's report has a RESULT section and neither its RESULT line nor
-    the report's first line says block / blocking / fix first."""
+    """True only when the report's first non-empty line, stripped, is exactly
+    `RESULT: SHIP` or `RESULT: approve-with-nits` (any case, an optional final `.`) and
+    no other line holds a RESULT header (RESULT_HEADER_ANYWHERE_RE). Anything else,
+    including a second verdict that also approves, is False."""
     if not isinstance(report, str):
         return False
-    result = _parse_sections(report).get("RESULT")
-    if not result:
+    lines = [line for line in report.splitlines() if line.strip()]
+    if not lines or not APPROVING_RESULT_LINE_RE.fullmatch(lines[0].strip()):
         return False
-    first = next((line for line in report.splitlines() if line.strip()), "")
-    result_line = next((line for line in result.splitlines() if line.strip()), "")
-    return not (BLOCKING_VERDICT_RE.search(first) or BLOCKING_VERDICT_RE.search(result_line))
+    return not any(RESULT_HEADER_ANYWHERE_RE.search(line) for line in lines[1:])
 
 
 def _usable_path(path):
@@ -2990,7 +3153,8 @@ def _extract_report_text(tool_response):
     if isinstance(tool_response, dict):
         content = tool_response.get("content")
         if isinstance(content, list):
-            return "".join(item["text"] for item in content
+            # Joined by newlines, so one item's last line never fuses with the next's first.
+            return "\n".join(item["text"] for item in content
                            if isinstance(item, dict) and item.get("type") == "text"
                            and isinstance(item.get("text"), str))
         for key in ("result", "text"):
@@ -3206,26 +3370,19 @@ def _launch_snapshot(s, agent_id):
     return snapshot
 
 
-def _prune_verdicts(verdicts, now_value):
-    """critic_verdicts entries newer than 24h, at most 50."""
-    kept = {k: v for k, v in (verdicts if isinstance(verdicts, dict) else {}).items()
-            if isinstance(v, dict) and isinstance(v.get("ts"), (int, float))
-            and now_value - v["ts"] < 86400}
-    return dict(sorted(kept.items(), key=lambda item: item[1]["ts"])[-50:])
-
-
-def _record_critic_run(scope, approved, deadline, log_fn, launch_files=None, launched_ts=None):
-    """Record a finished critic run in the ledger of the repo its REVIEW-SCOPE names (best
-    effort): only for an approving verdict, and only files unchanged since it started.
-    `scope` is a resolved scope, or the reason there is none."""
+def _record_critic_run(scope, approved, deadline, log_fn, launch_files=None):
+    """Record a finished async critic run in the ledger of the repo its REVIEW-SCOPE names
+    (best effort): only for an approving verdict with a launch snapshot, and all or
+    nothing: nothing when any scoped file cannot be hashed or the scope's files are no
+    longer exactly `launch_files`. `scope` is a resolved scope, or the reason there is none."""
     if isinstance(scope, str):
         _ledger_log(log_fn, "skipped", reason=scope)
         return
     if approved is not True:
         _ledger_log(log_fn, "skipped", reason="blocking_or_no_result")
         return
-    if not isinstance(launch_files, dict) and not isinstance(launched_ts, (int, float)):
-        _ledger_log(log_fn, "skipped", reason="no_launch_state")
+    if not isinstance(launch_files, dict):
+        _ledger_log(log_fn, "skipped", reason="no_launch_snapshot")
         return
     try:
         found = scoped_ledger_files(scope, deadline)
@@ -3233,8 +3390,17 @@ def _record_critic_run(scope, approved, deadline, log_fn, launch_files=None, lau
             _ledger_log(log_fn, "skipped", reason="git_failed")
             return
         path, files = found
-        count = _merge_ledger(path, _since_launch(files, scope["repo"], launch_files,
-                                                  launched_ts), deadline)
+        if not files:
+            _ledger_log(log_fn, "skipped", reason="no_files")
+            return
+        if LEDGER_UNHASHABLE in files.values():
+            _ledger_log(log_fn, "skipped", reason="unhashable")
+            return
+        files = _since_launch(files, launch_files)
+        if files is None:
+            _ledger_log(log_fn, "skipped", reason="changed_during_run")
+            return
+        count = _merge_ledger(path, files, scope["base"], deadline)
     except Exception as exc:
         _ledger_log(log_fn, "skipped", reason=type(exc).__name__)
         return
@@ -3251,12 +3417,14 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     timestamps under session state) bridges the async-launch PostToolUse event to the
     later SubagentHandback or completed-foreground-result event.
 
-    The critic ledger records only what a critic was handed: the files of the
+    The critic ledger records only what an async critic was handed: the files of the
     REVIEW-SCOPE line in its prompt, in the repo that line names, and nothing on a
-    blocking verdict or a report without RESULT. An async launch snapshots those files'
-    hashes (`critic_snapshots`, by agent id) and its hand-back records the unchanged
-    ones; a foreground critic has no launch event, so there only files not modified since
-    its start count, and a hand-back's verdict waits in `critic_verdicts` for its result.
+    blocking verdict or a report without RESULT. Its launch snapshots those files'
+    hashes (`critic_snapshots`, by agent id) and its hand-back (or completed result)
+    records them only when the scope's files are still exactly that snapshot. A
+    foreground critic has no launch event, so no snapshot, and never records
+    (skipped reason "no_launch_snapshot"): what it reviewed cannot be told from what
+    changed during its run.
 
     State-lock waits and the classifier call share one monotonic `deadline` (by default
     SHORT_HOOK_BUDGET_SECONDS from entry).
@@ -3280,11 +3448,6 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
             def set_critic_ts(s):
                 started = _prune_critic_started(dict(s.get("critic_started") or {}), now_value)
                 launch["snapshot"] = _launch_snapshot(s, agent_id)
-                if launch["snapshot"] is None and isinstance(agent_id, str):
-                    # A foreground critic: its Agent result (only a stub) records the scope.
-                    verdicts = _prune_verdicts(s.get("critic_verdicts"), now_value)
-                    verdicts[agent_id] = {"ts": now_value, "approved": approved}
-                    s["critic_verdicts"] = verdicts
                 if agent_id in started:
                     launched = started.pop(agent_id)
                 elif started:
@@ -3297,7 +3460,6 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                 # A late hand-back from an earlier critic must not undo a later one's review.
                 s["critic_ts"] = max(s.get("critic_ts") or 0, launched)
                 s["critic_started"] = started
-                launch["ts"] = launched
 
             try:
                 update_state(session_state_path(session_id, state_dir), set_critic_ts, deadline)
@@ -3363,16 +3525,11 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
         now_value = now()
         launch = {}
         report = _extract_report_text(tool_response)
-        stub = bool(HANDBACK_STUB_RE.fullmatch(report))
 
         def set_critic_ts_completed(s):
             started = _prune_critic_started(dict(s.get("critic_started") or {}), now_value)
             launch["snapshot"] = _launch_snapshot(s, agent_id)
-            verdicts = _prune_verdicts(s.get("critic_verdicts"), now_value)
-            verdict = verdicts.pop(agent_id, None) if isinstance(agent_id, str) else None
-            launch["approved"] = (verdict.get("approved") is True if stub and verdict
-                                  else not stub and critic_verdict_approves(report))
-            s["critic_verdicts"] = verdicts
+            s.pop("critic_verdicts", None)  # an older version's foreground verdicts
             if agent_id in started:
                 launched = started.pop(agent_id)
             elif started:
@@ -3386,7 +3543,6 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                 launched = now_value
             s["critic_ts"] = max(s.get("critic_ts") or 0, launched)
             s["critic_started"] = started
-            launch["ts"] = launched
 
         try:
             update_state(session_state_path(session_id, state_dir), set_critic_ts_completed,
@@ -3395,14 +3551,13 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
             pass  # persisting critic timestamps is best effort
         snapshot = launch.get("snapshot")
         if snapshot is not None:
-            _record_critic_run(snapshot, launch.get("approved"), deadline, log_fn,
+            approved = (not HANDBACK_STUB_RE.fullmatch(report)
+                        and critic_verdict_approves(report))
+            _record_critic_run(snapshot, approved, deadline, log_fn,
                                launch_files=snapshot["files"])
         else:
-            scope = parse_review_scope(tool_input.get("prompt"))
-            if isinstance(scope, dict):
-                scope = resolve_review_scope(scope, deadline)
-            _record_critic_run(scope, launch.get("approved"), deadline, log_fn,
-                               launched_ts=launch.get("ts"))
+            # A foreground critic (or an async one whose hand-back already recorded).
+            _ledger_log(log_fn, "skipped", reason="no_launch_snapshot")
 
     if not feature_enabled(cfg, "report_check"):
         return None
