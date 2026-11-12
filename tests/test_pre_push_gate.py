@@ -683,7 +683,9 @@ class GateTests(unittest.TestCase):
         self.assertEqual([(e["decision"], e.get("reason")) for e in logs],
                          [("skipped", "unhashable")])
         self.assertEqual(self.ledger(), {})
-        git(["rm", "-q", "--cached", "link"], self.repo)
+        # Not `git rm --cached`: with core.symlinks=true (POSIX) the plain file `link`
+        # differs from its 120000 index entry, so git refuses to drop it.
+        git(["update-index", "--force-remove", "link"], self.repo)
         git(["commit", "-q", "-m", "a only"], self.repo)
         self.assertEqual(self.run_gate(self.push_line(self.head(), self.base))[0], 1)
 
