@@ -24,7 +24,7 @@ Use the installed named roles. For built-in agents, explicitly select `haiku` fo
 
 ## Briefing and trust
 
-Provide goal, exact paths/ranges, applicable project rules, constraints, acceptance check, and expected output. Give critics the exact diff/base and claim to attack in fresh context, without the author's conclusions.
+Provide goal, exact paths/ranges, applicable project rules, constraints, acceptance check, and expected output. Give critics the exact diff/base and claim to attack in fresh context, without the author's conclusions. Put a `REVIEW-SCOPE: <absolute repo path> base=<commit-ish> [paths=<p1>,<p2>]` line in the critic prompt; the pre-push gate's ledger records only that scope.
 
 Require `RESULT / EVIDENCE / CONFIDENCE / UNVERIFIED`, with actual check exit codes. Read builder diffs and require checks after the last edit. Missing evidence, low/medium confidence, or material unverified claims require direct verification or escalation (scout/runner to builder/main; builder to main), not the same retry. A partial subagent result (cap reached) is resumed with SendMessage `continue from your report file`, not relaunched.
 

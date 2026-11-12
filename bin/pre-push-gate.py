@@ -4,8 +4,10 @@
 Git runs it as `pre-push-gate.py <remote-name> <url>` with one stdin line per ref
 being pushed: `<local ref> <local sha> <remote ref> <remote sha>`. For each line it
 takes the pushed commits (remote sha..local sha, or for a new remote ref the commits
-on no remote-tracking ref; a deleted ref is skipped) and the files they touch. A file
-needs review when its blob at the pushed commit differs from the critic ledger entry
+on none of that remote's tracking refs; a deleted ref is skipped), the files they touch
+and the files whose content differs between the endpoints. A local sha that is not a
+commit is refused. A file needs review when its blob at that ref's pushed commit
+differs from the critic ledger entry
 (`<git-common-dir>/coding-orchestrator/critic-ledger.json`, written by jev-guard.py
 when a critic run finishes) or has none.
 
@@ -69,11 +71,56 @@ def _tree_hashes(jev, sha, cwd):
     return hashes
 
 
-def pushed_changes(jev, lines, cwd):
-    """(names needing a ledger check with their pushed hashes, diff text) for the stdin
-    `lines`, or None when a range could not be read."""
-    current = {}
+class NotACommit(Exception):
+    """A pushed local sha that is a tree, a blob or a tag of one, not a commit."""
+
+
+def _names(out):
+    return [n for n in out.split("\0") if n]
+
+
+def _endpoint_names(jev, local_sha, remote_sha, remote, cwd):
+    """Files whose content at `local_sha` differs from the remote side, or None on a git
+    failure. Per-commit `--cc` listings miss a merge that equals one parent (an `-s ours`
+    merge can revert upstream content unseen), so the endpoints are compared too: against
+    `remote_sha`, or for a new ref against every commit the pushed range branches off
+    the remote's refs (a file equal to one of them is already published there), or the
+    empty tree when it shares no history with them."""
+    if remote_sha is not None:
+        bases = [remote_sha]
+    else:
+        remotes = f"--remotes={remote}" if remote else "--remotes"
+        out = _git(jev, ["rev-list", "--boundary", local_sha, "--not", remotes], cwd)
+        if out is None:
+            return None
+        words = out.split()
+        if not words:
+            return []  # every pushed commit is already on the remote
+        bases = [word[1:] for word in words if word.startswith("-")]
+        if not bases:
+            empty = _git(jev, ["hash-object", "-t", "tree", "--stdin"], cwd)
+            if empty is None or not empty.strip():
+                return None
+            bases = [empty.strip()]
+    common = None
+    for base in bases:
+        out = _git(jev, ["diff", *jev.DIFF_FORMAT_ARGS, "--name-only", "-z", "--no-renames",
+                         base, local_sha, "--"], cwd)
+        if out is None:
+            return None
+        names = set(_names(out))
+        common = names if common is None else common & names
+    return sorted(common or ())
+
+
+def pushed_changes(jev, lines, cwd, remote=None):
+    """([(name, pushed hash)] needing a ledger check, one entry per ref and file, diff
+    text) for the stdin `lines`, or None when a range could not be read. Raises
+    NotACommit for a pushed local sha that is not a commit. Each ref's files are checked
+    against its own pushed tree: two refs pushing one path at different content both count."""
+    current = []
     diff = ""
+    remotes = f"--remotes={remote}" if remote else "--remotes"
     for line in lines:
         parts = line.split()
         if not parts:
@@ -83,27 +130,35 @@ def pushed_changes(jev, lines, cwd):
         _, local_sha, _, remote_sha = parts
         if ZERO_SHA_RE.fullmatch(local_sha):
             continue  # a deleted remote ref pushes no content
+        if _git(jev, ["cat-file", "-t", local_sha], cwd) is None:
+            return None
+        commit = _git(jev, ["rev-parse", "--verify", "--quiet", f"{local_sha}^{{commit}}"], cwd)
+        if commit is None or not commit.strip():
+            raise NotACommit(local_sha)
+        local_sha = commit.strip()
         known = (not ZERO_SHA_RE.fullmatch(remote_sha)
                  and _git(jev, ["cat-file", "-e", f"{remote_sha}^{{commit}}"], cwd) is not None)
-        rev = [f"{remote_sha}..{local_sha}"] if known else [local_sha, "--not", "--remotes"]
+        rev = [f"{remote_sha}..{local_sha}"] if known else [local_sha, "--not", remotes]
         # --cc lists a merge's files only where it differs from every parent (its own
-        # conflict resolutions), not everything it brought in from the other side.
-        names = _git(jev, ["log", "--format=", "--name-only", "-z", "--no-renames", "--cc",
-                           *rev, "--"], cwd)
+        # conflict resolutions); the endpoint comparison adds what a merge took or dropped.
+        names = _git(jev, ["-c", "log.showRoot=true", "log", "--format=", "--name-only", "-z",
+                           "--no-renames", "--cc", *rev, "--"], cwd)
         # Merge diffs are left out of the text: their `diff --cc` headers would escape
         # the redaction, which matches `diff --git` headers only.
-        text = _git(jev, ["log", "--format=", "-p", *jev.DIFF_FORMAT_ARGS, "--no-renames",
-                          *rev, "--"], cwd)
+        text = _git(jev, ["-c", "log.showRoot=true", "log", "--format=", "-p",
+                          *jev.DIFF_FORMAT_ARGS, "--no-renames", *rev, "--"], cwd)
         if names is None or text is None:
             return None
-        names = [n for n in names.split("\0") if n]
+        endpoint = _endpoint_names(jev, local_sha, remote_sha if known else None, remote, cwd)
+        if endpoint is None:
+            return None
+        names = list(dict.fromkeys(_names(names) + endpoint))
         if not names:
             continue
         tree = _tree_hashes(jev, local_sha, cwd)
         if tree is None:
             return None
-        for name in names:
-            current[name] = tree.get(name, jev.LEDGER_DELETED)
+        current += [(name, tree.get(name, jev.LEDGER_DELETED)) for name in names]
         diff += text
     return current, diff
 
@@ -119,7 +174,15 @@ def run(argv, stdin_text, cfg, jev, classify_fn=None, log_fn=None, cwd=None, err
             log_fn({"ts": jev.timestamp(), "feature": "risk_gate", "hook": "pre-push",
                     "decision": decision, "latency_ms": jev.elapsed_ms(start), **extra})
 
-    changes = pushed_changes(jev, stdin_text.splitlines(), cwd)
+    try:
+        changes = pushed_changes(jev, stdin_text.splitlines(), cwd,
+                                 remote=argv[0] if argv else None)
+    except NotACommit:
+        log("deny", reason="not_a_commit")
+        print("[pre-push gate] A pushed ref points at a tree, blob or tag that is not a "
+              "commit, which the gate cannot check, so the push is refused. Push a commit "
+              "instead.", file=err)
+        return 1
     if changes is None:
         log("deny", reason="unjudged_push")
         print("[pre-push gate] Could not read the commits being pushed, so the push was "
@@ -131,9 +194,9 @@ def run(argv, stdin_text, cfg, jev, classify_fn=None, log_fn=None, cwd=None, err
         return 0
     path = jev.ledger_path(cwd)
     ledger = jev.load_ledger(path) if path is not None else {}
-    needs = [name for name, blob in current.items() if ledger.get(name) != blob]
+    needs = list(dict.fromkeys(name for name, blob in current if ledger.get(name) != blob))
     if not needs:
-        log("covered", files=len(current))
+        log("covered", files=len({name for name, _ in current}))
         return 0
 
     def advisory(reason, problem):

@@ -81,7 +81,12 @@ interpreter). A text parser cannot be the enforcement point.
   (draft default) Per repository on request:
   `claude/install.py --pre-push-hook <repo>` writes the repository's hook
   (honouring its own `core.hooksPath`), chains an existing hook as
-  `pre-push.local`, and never sets `core.hooksPath` globally.
+  `pre-push.d/pre-push` (keeping its name), and never sets `core.hooksPath`
+  globally; it refuses a global or system `core.hooksPath` and a hooks
+  directory tracked by git.
 - Should `pre-commit` mirror the gate, or is the push gate enough?
   (draft default) The push gate is enough; `risk_gate` keeps its advisory
   commit check.
+- What does a critic run record in the ledger? (owner decision) Only what the
+  critic was handed, named by a `REVIEW-SCOPE:` line in its prompt, in the
+  repository that line names, and nothing on a blocking verdict.

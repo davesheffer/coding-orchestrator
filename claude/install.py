@@ -384,8 +384,9 @@ PRE_PUSH_MARKER = "# coding-orchestrator pre-push gate (claude/install.py --pre-
 
 
 def pre_push_shim(gate: Path) -> bytes:
-    """The `pre-push` hook: the chained `pre-push.local` (if any) runs first, then the gate;
-    both get git's arguments and stdin. LF endings, since sh runs it on every platform."""
+    """The `pre-push` hook: the chained `pre-push.d/pre-push` (if any) runs first, then the
+    gate; both get git's arguments and stdin. The chained hook keeps its name, so one that
+    dispatches on its own basename still works. LF endings, since sh runs it everywhere."""
     gate_q = shlex.quote(gate.as_posix())
     missing = f"pre-push gate: {gate.as_posix()} is missing; reinstall the bundle or remove this hook"
     lines = [
@@ -396,8 +397,8 @@ def pre_push_shim(gate: Path) -> bytes:
         "input=$(mktemp) || exit 1",
         "trap 'rm -f \"$input\"' EXIT",
         'cat >"$input" || exit 1',
-        'if [ -x "$hookdir/pre-push.local" ]; then',
-        '    "$hookdir/pre-push.local" "$@" <"$input" || exit $?',
+        'if [ -x "$hookdir/pre-push.d/pre-push" ]; then',
+        '    "$hookdir/pre-push.d/pre-push" "$@" <"$input" || exit $?',
         "fi",
         f"if [ ! -f {gate_q} ]; then",
         f"    printf '%s\\n' {shlex.quote(missing)} >&2",
@@ -409,43 +410,82 @@ def pre_push_shim(gate: Path) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def _git_out(git: str, args: list[str], repo: Path) -> subprocess.CompletedProcess:
+    return subprocess.run([git, *args], cwd=repo, capture_output=True, text=True)
+
+
 def install_pre_push_hook(repo: Path, dest: Path, dry_run: bool) -> int:
-    """Write the repository's `pre-push` hook (honouring core.hooksPath), moving an
-    existing foreign hook to `pre-push.local` so the shim chains it. Idempotent: a hook
-    carrying PRE_PUSH_MARKER is ours and is rewritten in place. Never sets core.hooksPath."""
+    """Write the repository's `pre-push` hook (honouring a repository-level
+    core.hooksPath), moving an existing foreign hook to `pre-push.d/pre-push` so the shim
+    chains it under its own name. Idempotent: a hook carrying PRE_PUSH_MARKER is ours and
+    is rewritten in place; a `pre-push.local` chained by an earlier version is moved to
+    `pre-push.d/pre-push`. Refuses a core.hooksPath set globally (it would put the hook in
+    every repository) and a hooks directory tracked by git. Never sets core.hooksPath."""
     git = shutil.which("git")
     if git is None:
         fail("git is not on PATH")
-    result = subprocess.run([git, "rev-parse", "--git-path", "hooks"], cwd=repo,
-                            capture_output=True, text=True)
+    result = _git_out(git, ["rev-parse", "--git-path", "hooks"], repo)
     if result.returncode != 0 or not result.stdout.strip():
         fail(f"not a git repository: {repo}")
     hooks = Path(result.stdout.strip())
     if not hooks.is_absolute():
         hooks = repo / hooks
-    hook, chained = hooks / "pre-push", hooks / "pre-push.local"
+    scoped = _git_out(git, ["config", "--show-scope", "--get", "core.hooksPath"], repo)
+    if scoped.returncode not in (0, 1):
+        fail(f"could not read core.hooksPath in {repo}: {scoped.stderr.strip()}")
+    scope = scoped.stdout.partition("\t")[0].strip() if scoped.returncode == 0 else ""
+    if scope and scope not in ("local", "worktree"):
+        fail(f"core.hooksPath is set in the {scope} git config ({hooks}), so a hook written "
+             "there would run for every repository; unset it there or set a repository-level "
+             "core.hooksPath, then rerun")
+    top = _git_out(git, ["rev-parse", "--show-toplevel"], repo)
+    if (top.returncode == 0 and top.stdout.strip()
+            and hooks.resolve().is_relative_to(Path(top.stdout.strip()).resolve())):
+        tracked = _git_out(git, ["ls-files", "-z", "--", str(hooks)], repo)
+        if tracked.returncode != 0 or tracked.stdout.strip("\0"):
+            fail(f"the hooks directory {hooks} is tracked by git, so the installer does not "
+                 "write into it. Install by hand: in its pre-push hook, save stdin to a file, "
+                 "run your existing checks, then run "
+                 f"`{pinned_python()} {(dest / 'bin' / 'pre-push-gate.py').as_posix()} \"$@\"` "
+                 "with that file as stdin and exit with its status")
+    hook, chained = hooks / "pre-push", hooks / "pre-push.d" / "pre-push"
+    legacy = hooks / "pre-push.local"
     gate = dest / "bin" / "pre-push-gate.py"
     shim = pre_push_shim(gate)
     validate_dir(hooks)
+    validate_dir(chained.parent)
     existing = read_regular(hook)
     if not gate.is_file():
         print(f"warning: {gate} is not installed; the hook refuses every push until "
               "install.py has run", file=os.sys.stderr)
-    if existing == shim:
+    ours = existing is not None and PRE_PUSH_MARKER.encode() in existing
+    foreign = existing is not None and not ours
+    chained_taken = chained.exists() or chained.is_symlink()
+    migrate = ours and (legacy.exists() or legacy.is_symlink())
+    if migrate and chained_taken:
+        fail(f"{legacy} (chained by an earlier install) and {chained} both exist; merge them "
+             "by hand")
+    if existing == shim and not migrate:
         print(f"up to date {hook}")
         return 0
-    foreign = existing is not None and PRE_PUSH_MARKER.encode() not in existing
-    if foreign and (chained.exists() or chained.is_symlink()):
+    if foreign and chained_taken:
         fail(f"{hook} is not ours and {chained} already exists; merge them by hand")
     if dry_run:
         if foreign:
             print(f"move {hook} -> {chained}")
+        if migrate:
+            print(f"move {legacy} -> {chained}")
         print(f"write {hook}")
         return 0
     hooks.mkdir(parents=True, exist_ok=True)
+    if foreign or migrate:
+        chained.parent.mkdir(exist_ok=True)
     if foreign:
         os.replace(hook, chained)
         print(f"move {hook} -> {chained}")
+    if migrate:
+        os.replace(legacy, chained)
+        print(f"move {legacy} -> {chained}")
     atomic_write(hook, shim, 0o755)
     print(f"write {hook}")
     return 0

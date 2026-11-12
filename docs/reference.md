@@ -462,21 +462,38 @@ python claude/install.py --pre-push-hook /path/to/repo
 This writes only the repository's `pre-push` hook (at `git rev-parse --git-path
 hooks`, so a repository's `core.hooksPath` is honoured; the installer never sets
 `core.hooksPath` itself). The hook is a small `sh` shim that runs
-`~/.claude/bin/pre-push-gate.py`. An existing `pre-push` hook is renamed to
-`pre-push.local` and runs first with the same arguments and stdin; if it fails, the
-push is refused. Rerunning the command is idempotent. If `pre-push.local` already
-exists next to a foreign hook, the installer stops and asks you to merge them.
+`~/.claude/bin/pre-push-gate.py`. An existing `pre-push` hook is moved, keeping its
+name, to `pre-push.d/pre-push` and runs first with the same arguments and stdin; if it
+fails, the push is refused. Rerunning the command is idempotent, and moves a
+`pre-push.local` chained by an earlier version to `pre-push.d/pre-push`. If
+`pre-push.d/pre-push` already exists next to a foreign hook, the installer stops and
+asks you to merge them. It also refuses a `core.hooksPath` set in the global or system
+git config (the hook would run for every repository) and a hooks directory tracked by
+git (such as `.husky`), printing how to call the gate from that hook by hand.
 
 For each pushed ref the gate takes the commits being pushed (remote sha..local sha,
-or for a new remote ref the commits on no remote-tracking ref; deleted refs are
-skipped) and the files they touch, including a merge's own conflict resolutions.
-A file needs review when its blob at the pushed commit differs from the **critic
-ledger**, `<git-common-dir>/coding-orchestrator/critic-ledger.json` (shared by the
-repository's worktrees). When a critic run finishes, `jev-guard.py agent-done`
-records there the current blob hash (`git hash-object`) of each file the
-repository changed but has not pushed: unpushed commits, the work tree against
-`HEAD`, and untracked files. A deleted file is recorded as deleted; symlinks and
-submodules are never recorded, so they always need review. Recording is best
+or for a new remote ref the commits on none of that remote's tracking refs; deleted
+refs are skipped) and the files they touch, including a merge's own conflict
+resolutions, plus every file whose content differs between the remote sha (for a new
+ref, each commit the range branches off) and the pushed commit, so a merge that drops
+upstream changes is seen. A pushed sha that is not a commit (a tree, blob or tag of
+one) is refused. Each ref is checked on its own: a file needs review when its blob at
+that ref's pushed commit differs from the **critic ledger**,
+`<git-common-dir>/coding-orchestrator/critic-ledger.json` (shared by the
+repository's worktrees). A critic run records only what it was handed, named by
+one line of its Agent prompt:
+`REVIEW-SCOPE: <absolute repo or worktree path> base=<commit-ish> [paths=<p1>,<p2>]`.
+When it finishes, `jev-guard.py agent-done` records in that repository's ledger (not
+the hook's working directory) the current blob hash (`git hash-object`) of each file
+changed between `base` and the work tree (committed, staged, unstaged, untracked and
+not ignored), narrowed to `paths` (files or directories) when given. A missing,
+malformed or repeated scope line, a path that is not a git repository or a `base`
+that does not resolve records nothing, and so does a report whose RESULT line or first
+line says block, blocking or fix first, or that has no RESULT section. Only files
+unchanged since the critic started count: an async critic's launch snapshots their
+hashes, and a foreground critic (no launch event) records only files not modified
+since its start. A deleted file is
+recorded as deleted; symlinks and submodules are never recorded, so they always need review. Recording is best
 effort and never fails the hook.
 
 With nothing needing review, the push proceeds. Otherwise the gate asks Jev the
