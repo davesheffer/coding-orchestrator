@@ -14,6 +14,9 @@ from pathlib import Path
 from unittest import mock
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import timing  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "jev-guard.py"
 spec = importlib.util.spec_from_file_location("jev_guard", SCRIPT)
@@ -659,27 +662,28 @@ class GateTests(unittest.TestCase):
         self.assertNotIn("state_error", self.logs[-1])
 
     def test_looks_like_push_is_linear(self):
-        for command, label in (("git " * 250_000, "git words"),
-                               ("git " + "-c x " * 200_000, "value options"),
-                               ("git -x " * 150_000, "flag runs"),
-                               ("alias." * 150_000, "alias without push"),
-                               ('"' * 1_000_000, "quotes"),
-                               ("a\\" * 500_000, "backslashes"),
-                               ("git " + "$x " * 250_000, "dynamic words"),
-                               ("git -x " + "-x " * 300_000, "options past the window"),
-                               ("/git-push " * 100_000, "git-push paths"),
-                               ("'git' " * 200_000, "quoted git words"),
-                               ('"git push" ' * 100_000, "quoted pushes"),
-                               ("'" * 1_000_001, "unbalanced quotes"),
-                               ('"\\' * 500_000, "escapes in an unbalanced quote"),
-                               ("{" * 1_000_000, "braces"),
-                               ("git config " * 100_000, "config runs"),
-                               ("git subtree " * 100_000, "subtree runs"),
-                               ("alias.p=$x " * 100_000, "dynamic aliases"),
-                               ("git commit " + '-m "a" ' * 150_000, "messages"),
-                               ("git commit -m" + '"a"' * 300_000, "one long message word"),
-                               ("$g -x " * 150_000, "dynamic words with options")):
-            self._assert_fast(lambda: jev._looks_like_push(command), label)
+        for make, n, label in ((lambda n: "git " * n, 250_000, "git words"),
+                               (lambda n: "git " + "-c x " * n, 200_000, "value options"),
+                               (lambda n: "git -x " * n, 150_000, "flag runs"),
+                               (lambda n: "alias." * n, 150_000, "alias without push"),
+                               (lambda n: '"' * n, 1_000_000, "quotes"),
+                               (lambda n: "a\\" * n, 500_000, "backslashes"),
+                               (lambda n: "git " + "$x " * n, 250_000, "dynamic words"),
+                               (lambda n: "git -x " + "-x " * n, 300_000, "options past the window"),
+                               (lambda n: "/git-push " * n, 100_000, "git-push paths"),
+                               (lambda n: "'git' " * n, 200_000, "quoted git words"),
+                               (lambda n: '"git push" ' * n, 100_000, "quoted pushes"),
+                               (lambda n: "'" * (n + 1), 1_000_000, "unbalanced quotes"),
+                               (lambda n: '"\\' * n, 500_000, "escapes in an unbalanced quote"),
+                               (lambda n: "{" * n, 1_000_000, "braces"),
+                               (lambda n: "git config " * n, 100_000, "config runs"),
+                               (lambda n: "git subtree " * n, 100_000, "subtree runs"),
+                               (lambda n: "alias.p=$x " * n, 100_000, "dynamic aliases"),
+                               (lambda n: "git commit " + '-m "a" ' * n, 150_000, "messages"),
+                               (lambda n: "git commit -m" + '"a"' * n, 300_000,
+                                "one long message word"),
+                               (lambda n: "$g -x " * n, 150_000, "dynamic words with options")):
+            self._assert_fast(jev._looks_like_push, make, n, label)
 
     def test_classify_raising_is_noop(self):
         self.stage_change()
@@ -794,67 +798,63 @@ class GateTests(unittest.TestCase):
 
 
     def test_repeated_value_options_do_not_backtrack(self):
-        cmd = "git" + " --work-tree x" * 40 + " --git-dir y" * 40
-        start = time.monotonic()
-        self.assertIsNone(jev.GIT_COMMAND_RE.search(cmd))
-        self.assertIsNone(jev.GIT_COMMAND_RE.search(jev._strip_heredocs_and_quotes(cmd + ' "a"' * 20)))
-        self.assertLess(time.monotonic() - start, 1.0)
+        def searches(cmd):
+            return (jev.GIT_COMMAND_RE.search(cmd),
+                    jev.GIT_COMMAND_RE.search(jev._strip_heredocs_and_quotes(cmd + ' "a"' * 20)))
+        found = timing.assert_scales(
+            self, lambda n: "git" + " --work-tree x" * n + " --git-dir y" * n, searches,
+            10, 40, label="repeated value options", abs_limit=1.0)
+        self.assertEqual(found, (None, None))
         self.assertIsNotNone(jev.GIT_COMMAND_RE.search("git --work-tree x --git-dir=y --no-pager commit"))
 
-    def _assert_fast(self, scan, label):
-        # Best of 3 runs, so a CPU-load spike on a shared CI runner doesn't fail one.
-        elapsed = []
-        for _ in range(3):
-            start = time.monotonic()
-            scan()
-            elapsed.append(time.monotonic() - start)
-            if elapsed[-1] < 2.0:
-                break
-        self.assertLess(min(elapsed), 2.0, f"{label}: {', '.join(f'{e:.2f}s' for e in elapsed)}")
+    def _assert_fast(self, run, make, n, label):
+        # run(make(n)) must cost about linearly more than run(make(n // 4)): a load
+        # spike on a shared runner can't fail that, a quadratic blowup does.
+        return timing.assert_scales(self, make, run, n // 4, n, label=label, abs_limit=2.0)
 
-    def _assert_scans_fast(self, command, label):
-        self._assert_fast(lambda: list(jev.GIT_COMMAND_RE.finditer(
-            jev._strip_heredocs_and_quotes(command))), label)
+    def _assert_scans_fast(self, make, n, label):
+        self._assert_fast(lambda command: list(jev.GIT_COMMAND_RE.finditer(
+            jev._strip_heredocs_and_quotes(command))), make, n, label)
+
+    def _scan(self, command):
+        return jev._scan_targets(command, "/repo")
 
     def test_many_quoted_args_scan_fast(self):
         # Each quote used to re-join the whole scanned-so-far prefix and rescan it
         # from scratch, making this O(n^2); 20000 quotes previously took ~49s.
-        self._assert_scans_fast("'a' ;" * 20000, "single-quoted")
+        self._assert_scans_fast(lambda n: "'a' ;" * n, 20000, "single-quoted")
 
     def test_many_double_quoted_args_scan_fast(self):
-        self._assert_scans_fast('"a" ' * 20000, "double-quoted")
+        self._assert_scans_fast(lambda n: '"a" ' * n, 20000, "double-quoted")
 
     def test_many_separators_scan_fast(self):
         # Exercises _GIT's leading path-segment group against a long run of
         # separator-heavy, non-matching text.
-        self._assert_scans_fast(";/" * 20000, "separator-heavy")
+        self._assert_scans_fast(lambda n: ";/" * n, 20000, "separator-heavy")
 
     def test_padded_commands_scan_fast(self):
         # Each used to take 5-20s, past the hook timeout (which fails open).
-        for command, label in (("\n" * 20000, "newline run"),
-                               ("cat <<A\n" * 20000, "unterminated heredocs"),
-                               ("a=;" * 20000, "empty env assignments"),
-                               ("a=b\n" * 25000 + "git push", "env assignment lines"),
-                               ("sudo -n\n" * 12500, "wrapper lines"),
-                               ("then\n" * 20000, "keyword lines"),
-                               ("".join(f"cat <<W{i}\n" for i in range(10000)),
+        for make, n, label in ((lambda n: "\n" * n, 20000, "newline run"),
+                               (lambda n: "cat <<A\n" * n, 20000, "unterminated heredocs"),
+                               (lambda n: "a=;" * n, 20000, "empty env assignments"),
+                               (lambda n: "a=b\n" * n + "git push", 25000, "env assignment lines"),
+                               (lambda n: "sudo -n\n" * n, 12500, "wrapper lines"),
+                               (lambda n: "then\n" * n, 20000, "keyword lines"),
+                               (lambda n: "".join(f"cat <<W{i}\n" for i in range(n)), 10000,
                                 "distinct unterminated heredocs")):
-            self._assert_scans_fast(command, label)
-            self._assert_fast(lambda: jev._scan_targets(command, "/repo"), label)
-        start = time.monotonic()
-        targets = jev._scan_targets("git commit -m x;" * 5000 + "git -C other push", "/repo")
-        self.assertLess(time.monotonic() - start, 2.0)
+            self._assert_scans_fast(make, n, label)
+            self._assert_fast(self._scan, make, n, label)
+        targets = self._assert_fast(self._scan, lambda n: "git commit -m x;" * n + "git -C other push",
+                                    5000, "many commits")
         # Every match is resolved: the last push keeps its own directory.
         self.assertIn(("push", os.path.join("/repo", "other"), False, None), targets)
         # Repeated quoted global options once backtracked exponentially (25 s at 26).
-        for n in (30, 60):
-            for command in ("git " + '-C "a" ' * n + "status; git push --force",
-                            "git " + "-c 'x=y' " * n + "status; git push --force",
-                            "git -c x=" + "a" * 600 + ' -C "s"' * n + " status; git push --force"):
-                start = time.monotonic()
-                ops = [t[0] for t in jev._scan_targets(command, "/repo")]
-                self.assertLess(time.monotonic() - start, 2.0, command[:40])
-                self.assertEqual(ops, ["push"], command[:40])
+        for make in (lambda n: "git " + '-C "a" ' * n + "status; git push --force",
+                     lambda n: "git " + "-c 'x=y' " * n + "status; git push --force",
+                     lambda n: "git -c x=" + "a" * 600 + ' -C "s"' * n + " status; git push --force"):
+            for n in (30, 60):
+                self.assertEqual([t[0] for t in self._scan(make(n))], ["push"], make(n)[:40])
+            self._assert_fast(self._scan, make, 60, make(60)[:40])
 
     def test_substitution_env_value_detected(self):
         for command, op in (("FOO=$(date) git push", "push"),
@@ -1113,9 +1113,7 @@ class GateTests(unittest.TestCase):
         # (A kept quoted -C value costs more per command, hence fewer of those.)
         for unit, count in (("git push; ", 32000), ('git -C "a" push; ', 16000),
                             ("git commit -am x; ", 16000)):
-            start = time.monotonic()
-            targets = jev._scan_targets(unit * count, "/repo")
-            self.assertLess(time.monotonic() - start, 2.0, unit)
+            targets = self._assert_fast(self._scan, lambda n: unit * n, count, unit)
             self.assertEqual(len(targets), 1, unit)
         self.assertTrue(jev._scan_targets("git commit -am x; " * 3, "/repo")[0][2])
         self.assertFalse(jev._scan_targets("git commit -m x; git commit -a", "/repo")[0][2])
@@ -1150,10 +1148,9 @@ class GateTests(unittest.TestCase):
     def test_issue_39_long_dash_c_chain(self):
         # -C accumulates like cd and is capped the same way (quadratic before: 2.5 s).
         j = os.path.join
-        command = "git " + "-C a " * 160000 + "push"
-        targets = []
-        self._assert_fast(lambda: targets.append(jev._scan_targets(command, "/repo")), "long -C chain")
-        self.assertEqual([t[:2] for t in targets[-1]], [("push", "/repo")])
+        targets = self._assert_fast(self._scan, lambda n: "git " + "-C a " * n + "push", 160000,
+                                    "long -C chain")
+        self.assertEqual([t[:2] for t in targets], [("push", "/repo")])
         long_chain = "git " + "-C a " * 3000
         for command, cwd in ((long_chain + "-C b push", "/repo"),
                              (long_chain + "-C /opt/x -C y push", j("/repo", j("/opt/x", "y"))),
@@ -1163,10 +1160,9 @@ class GateTests(unittest.TestCase):
 
     def test_issue_39_many_distinct_targets_scan_fast(self):
         # The target dedupe was a list scan per match (6.6 s at 20000).
-        command = "".join(f"git -C d{i} push;" for i in range(20000))
-        start = time.monotonic()
-        targets = jev._scan_targets(command, "/repo")
-        self.assertLess(time.monotonic() - start, 2.0)
+        targets = self._assert_fast(
+            self._scan, lambda n: "".join(f"git -C d{i} push;" for i in range(n)), 20000,
+            "distinct targets")
         self.assertEqual(len(targets), 20000)
         self.assertEqual(targets[-1][:2], ("push", os.path.join("/repo", "d19999")))
 
@@ -1180,9 +1176,8 @@ class GateTests(unittest.TestCase):
     def test_issue_39_long_cd_chain(self):
         # Accumulating `cd a; ` * N was quadratic (19.6 s / 6.4 GB at 80000); past
         # MAX_CD_PATH_CHARS the cds are dropped (payload cwd) until an absolute cd.
-        start = time.monotonic()
-        targets = jev._scan_targets("cd a; " * 80000 + "git push", "/repo")
-        self.assertLess(time.monotonic() - start, 2.0)
+        targets = self._assert_fast(self._scan, lambda n: "cd a; " * n + "git push", 80000,
+                                    "long cd chain")
         self.assertEqual([t[:2] for t in targets], [("push", "/repo")])
         long_chain = "cd a; " * 3000
         self.assertEqual([t[1] for t in jev._scan_targets(long_chain + "cd b; git push", "/repo")],
@@ -1202,23 +1197,33 @@ class GateTests(unittest.TestCase):
             self.assertEqual(self._ops(command), [], command)
 
     def test_issue_39_constructs_scan_fast(self):
-        for command in ("case x in a) " * 5000 + "git push", "esac " * 20000,
-                        "`" * 20001 + "git push", "(" * 10000 + ")" * 10000,
-                        "$(( " + "(" * 10000 + "<<3\n", "<" + "\\\n" * 20000 + "x",
-                        "<<" + "\\\n" * 20000 + "E", 'git -C "' + '\\"' * 20000 + '" push',
-                        "git" + " --git-dir -x" * 5000 + " push", '"git" ;' * 10000,
-                        "x=" + "\\ " * 20000 + " git push", '"' + "'\\\"'" * 5000 + ";cd a" * 2000,
-                        "cd -- " * 5000 + '"d"' * 5000, "case " * 20000, 'case "' * 20000,
-                        "case x" * 20000, "(case x " * 10000 + "in", "a=" * 20000 + "/git push",
-                        "/=" * 20000 + " push", "(cd a && case x in y) " * 5000,
-                        "case $(" * 20000, "case ${" * 20000, "case `" * 20000,
-                        "(case $(x " * 10000, "{case ${x " * 10000, "case $((x " * 10000,
-                        ";case `x " * 10000, "case $(x)$(x)$(x)" * 5000,
-                        "case $(( (" * 10000, "case $((x))$((x))" * 5000,
-                        "case x in a) cd b;; " * 5000 + "git push"):
-            start = time.monotonic()
-            jev._scan_targets(command, "/repo")
-            self.assertLess(time.monotonic() - start, 2.0, command[:30])
+        for make, n in ((lambda n: "case x in a) " * n + "git push", 5000),
+                        (lambda n: "esac " * n, 20000),
+                        (lambda n: "`" * (n + 1) + "git push", 20000),
+                        (lambda n: "(" * n + ")" * n, 10000),
+                        (lambda n: "$(( " + "(" * n + "<<3\n", 10000),
+                        (lambda n: "<" + "\\\n" * n + "x", 20000),
+                        (lambda n: "<<" + "\\\n" * n + "E", 20000),
+                        (lambda n: 'git -C "' + '\\"' * n + '" push', 20000),
+                        (lambda n: "git" + " --git-dir -x" * n + " push", 5000),
+                        (lambda n: '"git" ;' * n, 10000),
+                        (lambda n: "x=" + "\\ " * n + " git push", 20000),
+                        (lambda n: '"' + "'\\\"'" * n + ";cd a" * (n * 2 // 5), 5000),
+                        (lambda n: "cd -- " * n + '"d"' * n, 5000),
+                        (lambda n: "case " * n, 20000), (lambda n: 'case "' * n, 20000),
+                        (lambda n: "case x" * n, 20000), (lambda n: "(case x " * n + "in", 10000),
+                        (lambda n: "a=" * n + "/git push", 20000),
+                        (lambda n: "/=" * n + " push", 20000),
+                        (lambda n: "(cd a && case x in y) " * n, 5000),
+                        (lambda n: "case $(" * n, 20000), (lambda n: "case ${" * n, 20000),
+                        (lambda n: "case `" * n, 20000), (lambda n: "(case $(x " * n, 10000),
+                        (lambda n: "{case ${x " * n, 10000), (lambda n: "case $((x " * n, 10000),
+                        (lambda n: ";case `x " * n, 10000),
+                        (lambda n: "case $(x)$(x)$(x)" * n, 5000),
+                        (lambda n: "case $(( (" * n, 10000),
+                        (lambda n: "case $((x))$((x))" * n, 5000),
+                        (lambda n: "case x in a) cd b;; " * n + "git push", 5000)):
+            self._assert_fast(self._scan, make, n, make(n)[:30])
 
     def _assert_cwds_among(self, command, op, *cwds):
         targets = [t[:2] for t in jev._scan_targets(command, "/repo")]
@@ -1303,14 +1308,15 @@ class GateTests(unittest.TestCase):
 
     def test_issue_57_constructs_scan_fast(self):
         # The first was quadratic (6.5 s at 20000).
-        for command, label in (("git commit -a (" * 20000, "commits without separators"),
-                               ("cd q || cd sub && " * 10000 + "git push", "cds after ||"),
-                               ("case x in a) cd a;; " * 10000 + "esac; git push", "case branches"),
-                               ("git -C a\\ b " * 10000 + "push", "escaped -C values"),
-                               ("case x in " + "".join(f"p{i}) cd d{i};; " for i in range(40))
-                                + "esac; " + "cd a; " * 10000 + "git push", "branch cds")):
-            self._assert_scans_fast(command, label)
-            self._assert_fast(lambda: jev._scan_targets(command, "/repo"), label)
+        for make, n, label in ((lambda n: "git commit -a (" * n, 20000, "commits without separators"),
+                               (lambda n: "cd q || cd sub && " * n + "git push", 10000, "cds after ||"),
+                               (lambda n: "case x in a) cd a;; " * n + "esac; git push", 10000,
+                                "case branches"),
+                               (lambda n: "git -C a\\ b " * n + "push", 10000, "escaped -C values"),
+                               (lambda n: "case x in " + "".join(f"p{i}) cd d{i};; " for i in range(40))
+                                + "esac; " + "cd a; " * n + "git push", 10000, "branch cds")):
+            self._assert_scans_fast(make, n, label)
+            self._assert_fast(self._scan, make, n, label)
         self.assertTrue(jev._scan_targets("git commit -a (" * 3, "/repo")[0][2])
 
     def _cwds(self, command, op=None):
@@ -1499,11 +1505,10 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self._cwds(command, "commit"), {os.path.join("/repo", "a")})
 
     def test_issue_66_deep_substitutions_are_bounded(self):
-        command = "$(" * 8500 + "git push" + ")" * 8500
-        started = time.monotonic()
-        self.assertIn(("push", "/repo", False, None),
-                      jev._scan_targets(command, "/repo", jev.MAX_TARGETS))
-        self.assertLess(time.monotonic() - started, 2.0)
+        targets = self._assert_fast(lambda command: jev._scan_targets(command, "/repo", jev.MAX_TARGETS),
+                                    lambda n: "$(" * n + "git push" + ")" * n, 8500,
+                                    "deep substitutions")
+        self.assertIn(("push", "/repo", False, None), targets)
         command = "$(echo " * 100 + "git push" + ")" * 100
         with self.assertRaises(jev.TooManyTargets):
             jev._scan_targets(command, "/repo", jev.MAX_TARGETS)
@@ -1571,20 +1576,23 @@ class GateTests(unittest.TestCase):
         self.assertIn("security", out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_issue_63_constructs_scan_fast(self):
-        for command, label in (("$(echo cd b); " * 10000 + "git push", "echo substitutions"),
-                               ("; `echo " * 10000 + "git push", "unclosed backticks"),
-                               ("cat <<EOF\n$(git push)\nEOF\n" * 5000, "heredoc commands"),
-                               ("cat <<EOF\n" + "$(" * 20000 + "\nEOF\n", "open heredoc commands"),
-                               ("cat <<EOF\n" + "`" * 20000 + "\nEOF\n", "heredoc backticks"),
-                               ("cat <<EOF\n$(" + "cat <<E2\n$(git push)\nE2\n" * 5000 + ")\nEOF\n",
-                                "nested heredocs"),
-                               ("cd a || cd b || cd c || cd d; " + "git push; " * 10000,
+        for make, n, label in ((lambda n: "$(echo cd b); " * n + "git push", 10000,
+                                "echo substitutions"),
+                               (lambda n: "; `echo " * n + "git push", 10000, "unclosed backticks"),
+                               (lambda n: "cat <<EOF\n$(git push)\nEOF\n" * n, 5000, "heredoc commands"),
+                               (lambda n: "cat <<EOF\n" + "$(" * n + "\nEOF\n", 20000,
+                                "open heredoc commands"),
+                               (lambda n: "cat <<EOF\n" + "`" * n + "\nEOF\n", 20000,
+                                "heredoc backticks"),
+                               (lambda n: "cat <<EOF\n$(" + "cat <<E2\n$(git push)\nE2\n" * n
+                                + ")\nEOF\n", 5000, "nested heredocs"),
+                               (lambda n: "cd a || cd b || cd c || cd d; " + "git push; " * n, 10000,
                                 "enumerated ||"),
-                               ("case x in a) cd a;; esac || cd b && cd c || cd d; "
-                                + "git push; " * 10000, "case with ||"),
-                               ("case x in a) cd a;; esac; " + "cd q || cd sub && " * 10000
-                                + "git push", "case with many ||")):
-            self._assert_fast(lambda: jev._scan_targets(command, "/repo"), label)
+                               (lambda n: "case x in a) cd a;; esac || cd b && cd c || cd d; "
+                                + "git push; " * n, 10000, "case with ||"),
+                               (lambda n: "case x in a) cd a;; esac; " + "cd q || cd sub && " * n
+                                + "git push", 10000, "case with many ||")):
+            self._assert_fast(self._scan, make, n, label)
 
     def test_plain_cd_targets_skip_shell_tokenization(self):
         for path in ("q", "sub", "../repo-name", "/tmp/repo", "C:/repo", "~/repo"):
@@ -1731,18 +1739,18 @@ class GateTests(unittest.TestCase):
             jev._POWERSHELL.reset(token)
 
     def test_long_prefix_chain_scans_fast(self):
-        command = "timeout -k " * 2000 + "git commit"
-        self._assert_fast(lambda: (jev._scan_targets(command, "/repo"),
-                                   jev._commit_signals(command), jev._push_signals(command)),
-                          "timeout -k chain")
+        self._assert_fast(lambda command: (jev._scan_targets(command, "/repo"),
+                                           jev._commit_signals(command), jev._push_signals(command)),
+                          lambda n: "timeout -k " * n + "git commit", 2000, "timeout -k chain")
 
     def test_many_quoted_words_count_fast(self):
-        command = "echo " + "'x' " * 80000 + "; git commit"
-        self._assert_fast(lambda: jev._commit_signals(command), "quoted words")
-        command = "echo " + "'x'" * 80000 + "; git commit"
-        self._assert_fast(lambda: jev._commit_signals(command), "quoted pieces of one word")
-        command = "echo " + "y" * 1_000_000 + " 'x'" * 40000 + "; git commit"
-        self._assert_fast(lambda: jev._commit_signals(command), "long word, quoted words")
+        self._assert_fast(jev._commit_signals, lambda n: "echo " + "'x' " * n + "; git commit",
+                          80000, "quoted words")
+        self._assert_fast(jev._commit_signals, lambda n: "echo " + "'x'" * n + "; git commit",
+                          80000, "quoted pieces of one word")
+        self._assert_fast(jev._commit_signals,
+                          lambda n: "echo " + "y" * (n * 25) + " 'x'" * n + "; git commit",
+                          40000, "long word, quoted words")
 
     def test_ansi_decode_is_silent(self):
         with warnings.catch_warnings():
@@ -1923,11 +1931,10 @@ class GateTests(unittest.TestCase):
         def slow(body, key):
             release.wait(5)
             return risk_response()
-        start = time.monotonic()
-        with mock.patch.object(jev, "GATE_BUDGET_SECONDS", 0.6):
+        # Below the 5 s the classifier would take; CO_STRICT_TIMING=1 also demands 2.5 s.
+        with timing.within(self, "gate", abs_limit=2.5, limit=5.0), \
+                mock.patch.object(jev, "GATE_BUDGET_SECONDS", 0.6):
             out = self.gate(self.payload("git commit -m x"), classify_fn=slow)
-        # Far below the 5 s the classifier would take, with room for a loaded machine.
-        self.assertLess(time.monotonic() - start, 2.5)
         self.assertIsNone(out)
         if self.logs:  # git may have used the whole budget under load, which also allows
             self.assertEqual(self.logs[-1]["error"], "TimeoutError")
@@ -2380,44 +2387,51 @@ class GateTests(unittest.TestCase):
                                            '+    b"[redacted]"\n+    f`[redacted]`\n')
 
     def test_scrub_adversarial_input_is_fast(self):
-        for text in ("-----BEGIN RSA PRIVATE KEY-----" + "A" * 1_000_000,
-                     "-----BEGIN RSA PRIVATE KEY-----\n" * 32_000,
-                     "-----END RSA PRIVATE KEY-----\n" * 32_000,
-                     "-----BEGIN " + "A" * 1_000_000,
-                     "@@ -1 +1 @@\n-----BEGIN PRIVATE KEY-----\n" * 25_000,
-                     "+" + "A" * 1_000_000 + " x\n",
-                     "\n" * 1_000_000 + "-----END RSA PRIVATE KEY-----",
-                     "-----END RSA PRIVATE KEY-----\n" + "+Ab==\n" * 200_000,
-                     "-----BEGIN RSA PRIVATE KEY-----\n" + "+Name: value\n" * 100_000,
-                     "x" + "A\\n" * 400_000 + "-----END RSA PRIVATE KEY-----",
-                     "x" + "A\\n " * 300_000 + "-----END RSA PRIVATE KEY-----",
-                     "x" + " " * 1_000_000 + "\\n-----END RSA PRIVATE KEY-----",
-                     "-----BEGIN RSA PRIVATE KEY-----\\n" * 32_000,
-                     "-----BEGIN RSA PRIVATE KEY-----" + " " * 1_000_000 + "x",
-                     "-----BEGIN RSA PRIVATE KEY-----\n+Name: v\n" + "+Ab==\n" * 200_000,
-                     "-----END RSA PRIVATE KEY-----\n" + '+"Ab==\\n" +\n' * 100_000,
-                     "-----END RSA PRIVATE KEY-----\n+\"" + "A" * 1_000_000 + "\\n\"x\n",
-                     "-----END RSA PRIVATE KEY-----\n+" + "a" * 1_000_000 + "\n",
-                     "+" + "A" * 50 + "\n" + '+"' + "A" * 1_000_000 + "'\n",
-                     "-----END RSA PRIVATE KEY-----\n" + '+"Ab==" ' + " " * 1_000_000 + "x\n",
-                     "-----END RSA PRIVATE KEY-----\n" + '+"Ab==" ' + "\t" * 1_000_000 + "x\n",
-                     "+" + "A" * 50 + "\n" + '+"AAAAAAAA" ' + " " * 1_000_000 + "x\n",
-                     "+" + "A" * 50 + " " * 1_000_000 + "x\n+Ab==\n",
-                     "+" + "A" * 50 + '"' + " " * 1_000_000 + ",x\n+Ab==\n"):
-            started = time.monotonic()
-            out = jev._scrub(text)
-            self.assertLess(time.monotonic() - started, 3.0, text[:40])
-            self.assertNotIn("A" * 40, out)
+        def assert_linear(make, n):
+            return timing.assert_scales(self, make, jev._scrub, n // 4, n, label=make(n)[:40],
+                                        abs_limit=3.0)
+        for make, n in ((lambda n: "-----BEGIN RSA PRIVATE KEY-----" + "A" * n, 1_000_000),
+                        (lambda n: "-----BEGIN RSA PRIVATE KEY-----\n" * n, 32_000),
+                        (lambda n: "-----END RSA PRIVATE KEY-----\n" * n, 32_000),
+                        (lambda n: "-----BEGIN " + "A" * n, 1_000_000),
+                        (lambda n: "@@ -1 +1 @@\n-----BEGIN PRIVATE KEY-----\n" * n, 25_000),
+                        (lambda n: "+" + "A" * n + " x\n", 1_000_000),
+                        (lambda n: "\n" * n + "-----END RSA PRIVATE KEY-----", 1_000_000),
+                        (lambda n: "-----END RSA PRIVATE KEY-----\n" + "+Ab==\n" * n, 200_000),
+                        (lambda n: "-----BEGIN RSA PRIVATE KEY-----\n" + "+Name: value\n" * n,
+                         100_000),
+                        (lambda n: "x" + "A\\n" * n + "-----END RSA PRIVATE KEY-----", 400_000),
+                        (lambda n: "x" + "A\\n " * n + "-----END RSA PRIVATE KEY-----", 300_000),
+                        (lambda n: "x" + " " * n + "\\n-----END RSA PRIVATE KEY-----", 1_000_000),
+                        (lambda n: "-----BEGIN RSA PRIVATE KEY-----\\n" * n, 32_000),
+                        (lambda n: "-----BEGIN RSA PRIVATE KEY-----" + " " * n + "x", 1_000_000),
+                        (lambda n: "-----BEGIN RSA PRIVATE KEY-----\n+Name: v\n" + "+Ab==\n" * n,
+                         200_000),
+                        (lambda n: "-----END RSA PRIVATE KEY-----\n" + '+"Ab==\\n" +\n' * n, 100_000),
+                        (lambda n: "-----END RSA PRIVATE KEY-----\n+\"" + "A" * n + "\\n\"x\n",
+                         1_000_000),
+                        (lambda n: "-----END RSA PRIVATE KEY-----\n+" + "a" * n + "\n", 1_000_000),
+                        (lambda n: "+" + "A" * 50 + "\n" + '+"' + "A" * n + "'\n", 1_000_000),
+                        (lambda n: "-----END RSA PRIVATE KEY-----\n" + '+"Ab==" ' + " " * n + "x\n",
+                         1_000_000),
+                        (lambda n: "-----END RSA PRIVATE KEY-----\n" + '+"Ab==" ' + "\t" * n + "x\n",
+                         1_000_000),
+                        (lambda n: "+" + "A" * 50 + "\n" + '+"AAAAAAAA" ' + " " * n + "x\n",
+                         1_000_000),
+                        (lambda n: "+" + "A" * 50 + " " * n + "x\n+Ab==\n", 1_000_000),
+                        (lambda n: "+" + "A" * 50 + '"' + " " * n + ",x\n+Ab==\n", 1_000_000)):
+            self.assertNotIn("A" * 40, assert_linear(make, n))
         # The npm, JWT and URL-credential alternatives stay linear on 1M-char inputs.
-        for text in ("eyJ" * 333_334, "-eyJ" * 250_000, "eyJ" + "a" * 1_000_000,
-                     "eyJaaaaaaaaaaaa." * 62_500, "://a:" * 200_000, "://" * 333_334,
-                     "://:" * 250_000, ("://" + "a" * 30) * 30_000, ("://" + "a" * 300) * 3_300,
-                     ("://:" + "a" * 300) * 3_300,
-                     "://" + "a" * 1_000_000, "://a:" + "b" * 1_000_000, "npm_" * 250_000,
-                     "npm_" + "a" * 1_000_000):
-            started = time.monotonic()
-            jev._scrub(text)
-            self.assertLess(time.monotonic() - started, 3.0, text[:40])
+        for make, n in ((lambda n: "eyJ" * n, 333_334), (lambda n: "-eyJ" * n, 250_000),
+                        (lambda n: "eyJ" + "a" * n, 1_000_000),
+                        (lambda n: "eyJaaaaaaaaaaaa." * n, 62_500), (lambda n: "://a:" * n, 200_000),
+                        (lambda n: "://" * n, 333_334), (lambda n: "://:" * n, 250_000),
+                        (lambda n: ("://" + "a" * 30) * n, 30_000),
+                        (lambda n: ("://" + "a" * 300) * n, 3_300),
+                        (lambda n: ("://:" + "a" * 300) * n, 3_300),
+                        (lambda n: "://" + "a" * n, 1_000_000), (lambda n: "://a:" + "b" * n, 1_000_000),
+                        (lambda n: "npm_" * n, 250_000), (lambda n: "npm_" + "a" * n, 1_000_000)):
+            assert_linear(make, n)
 
 
 class StateAndReportInputTests(unittest.TestCase):
@@ -2986,12 +3000,12 @@ class UpdateStateTests(unittest.TestCase):
             else:
                 jev._msvcrt_lock(held)
             try:
-                start = time.monotonic()
-                with mock.patch.object(jev, "MSVCRT_LOCK_SECONDS", 30):
+                # Well short of the 30 s lock wait the deadline cuts off.
+                with timing.within(self, "held lock", abs_limit=0.8, limit=10.0), \
+                        mock.patch.object(jev, "MSVCRT_LOCK_SECONDS", 30):
                     with self.assertRaises(OSError):
                         jev.update_state(self.path, lambda s: s.__setitem__("x", 1),
                                          deadline=time.monotonic() + 0.1)
-                self.assertLess(time.monotonic() - start, 0.8)
             finally:
                 if jev.fcntl is not None:
                     jev.fcntl.flock(held.fileno(), jev.fcntl.LOCK_UN)
@@ -3004,15 +3018,15 @@ class UpdateStateTests(unittest.TestCase):
 
     def assert_lock_error_not_retried(self, target, name):
         error = OSError(errno.EBADF, "bad file descriptor")
-        start = time.monotonic()
-        with mock.patch.object(target, name, side_effect=error) as lock, \
+        # Well short of the 30 s a retry loop would spend before its deadline.
+        with timing.within(self, "lock error", abs_limit=1.0, limit=10.0), \
+                mock.patch.object(target, name, side_effect=error) as lock, \
                 mock.patch.object(jev, "MSVCRT_LOCK_SECONDS", 30):
             with self.assertRaises(OSError) as raised:
                 jev.update_state(self.path, lambda s: s.__setitem__("x", 1),
                                  deadline=time.monotonic() + 30)
         self.assertEqual(raised.exception.errno, errno.EBADF)
         self.assertEqual(lock.call_count, 1)
-        self.assertLess(time.monotonic() - start, 1.0)
         self.assertFalse(self.path.exists())
 
     @unittest.skipUnless(jev.fcntl is not None, "fcntl locking is POSIX-only")
