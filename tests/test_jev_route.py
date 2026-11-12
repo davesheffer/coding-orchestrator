@@ -11,6 +11,9 @@ from pathlib import Path
 from unittest import mock
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import timing  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "jev-route.py"
 spec = importlib.util.spec_from_file_location("jev_route", SCRIPT)
@@ -362,9 +365,9 @@ class DecideTests(unittest.TestCase):
         def slow(body, key):
             time.sleep(2)
             return response("opus", 0.9)
-        started = time.monotonic()
-        self.assertIsNone(self.decide(self.payload, cfg, slow))
-        self.assertLess(time.monotonic() - started, 1.0)
+        # Below the 2 s the classifier would take; CO_STRICT_TIMING=1 also demands 1 s.
+        with timing.within(self, "slow classifier", abs_limit=1.0, limit=2.0):
+            self.assertIsNone(self.decide(self.payload, cfg, slow))
 
     def test_deadline_is_capped_below_hook_timeout(self):
         self.assertEqual(jev.effective_timeout({"timeout_seconds": 30}), 4.0)
