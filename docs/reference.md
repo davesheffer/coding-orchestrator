@@ -142,6 +142,13 @@ the installer warns when that command is not on `PATH`; native PowerShell
 installation alone does not verify those hooks. For a custom destination, set
 `CLAUDE_CONFIG_DIR` to the same directory as `CLAUDE_HOME` when launching Claude.
 
+To check hooks live on Windows with a child `claude -p` (for example a probe
+that passes `--agents` JSON and watches the turn guard or role guard fire), set
+`CLAUDE_CODE_GIT_BASH_PATH` to Git Bash's `bash.exe` (typically
+`C:\Program Files\Git\bin\bash.exe`) in the child's environment. Without it the
+child cannot find a POSIX shell, so Bash calls and the hooks do not run, and a
+probe can look like the hooks are broken when they were never started.
+
 #### Context relay and rollover
 
 The relay (`relay/relay.py`) runs as `UserPromptSubmit` and `Stop` hooks. Once a
