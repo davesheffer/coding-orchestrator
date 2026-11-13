@@ -186,7 +186,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse(jev.needs_critic(off, "security", 0.98, 0.56))
         # A cfg missing a confident-class key, or with a junk one, keeps the base rule.
         for key in ("risk_confident_class", "risk_confident_min_probability"):
-            for bad in (None, "0.5", True, float("nan"), 1.5):
+            for bad in (None, "0.5", True, False, float("nan"), 1.5, -0.1):
                 with self.subTest(key=key, bad=bad):
                     partial = {k: v for k, v in cfg.items() if k != key}
                     if bad is not None:
@@ -501,6 +501,28 @@ class GateTests(unittest.TestCase):
         out = self.gate(self.payload(command), classify_fn=self.classify())
         self.assertIn("This push looks risky", out["hookSpecificOutput"]["permissionDecisionReason"])
         self.assertEqual(len(self.calls), 1)
+
+    def test_confident_class_band_on_push_path(self):
+        self.stage_change()
+        command = "git commit -m x && git push"
+        off = {**self.cfg, "risk_confident_min_probability": self.cfg["risk_min_probability"]}
+        for n, (cfg, confidence, needs_review, decision) in enumerate((
+                (self.cfg, 0.98, 0.56, "deny"), (self.cfg, 0.5, 0.56, "allow"),
+                (self.cfg, 0.98, 0.49, "allow"), (off, 0.98, 0.56, "allow"))):
+            with self.subTest(confidence=confidence, needs_review=needs_review, decision=decision,
+                              equal_bars=cfg is off):
+                payload = self.payload(command, session_id=f"pushband{n}")
+                classify_fn = self.classify(confidence=confidence, needs_review=needs_review)
+                # The first attempt is denied once as an unjudged push, without a call.
+                out = self.gate(payload, cfg=cfg, classify_fn=classify_fn)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                                 jev.UNJUDGED_PUSH_REASON)
+                calls = len(self.calls)
+                # The retry judges the push's commits.
+                out = self.gate(payload, cfg=cfg, classify_fn=classify_fn)
+                self.assertEqual(len(self.calls), calls + 1)
+                self.assertEqual(self.logs[-1]["decision"], decision)
+                self.assertEqual(out is not None, decision == "deny")
 
     def test_unjudged_push_when_git_budget_is_spent(self):
         out = jev.gate(self.payload("git push"), self.cfg, self.classify(), self.logs.append,

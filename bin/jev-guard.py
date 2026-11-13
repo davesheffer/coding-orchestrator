@@ -497,8 +497,9 @@ def needs_critic(cfg, choice, confidence, needs_review_p):
     `risk_confident_class`. Jev rates a small change to, say, an auth check as almost
     certainly `security` yet only about as likely as not to need review; being that sure
     of the class is evidence too. A missing or invalid confidence or probability never
-    lowers the bar, and the confident bar never raises it. A `cfg` without the two
-    confident-class keys (one not built by load_config) keeps `risk_min_probability`."""
+    lowers the bar, and the confident bar never raises it. A `cfg` in which either
+    confident-class key is missing or is not a probability (one not built by load_config)
+    keeps `risk_min_probability`."""
     if choice == "none" or not _is_probability(needs_review_p):
         return False
     bar = cfg["risk_min_probability"]
