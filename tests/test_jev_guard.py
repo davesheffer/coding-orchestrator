@@ -2646,6 +2646,239 @@ class AgentDoneTests(unittest.TestCase):
         self.assertIn("crit-1", state["critic_started"])
         self.assertNotIn("critic_ts", state)
 
+    def test_async_launch_persists_critic_started_before_snapshot_work(self):
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        seen = {}
+
+        def killed_snapshot(prompt, deadline):
+            # The hook dies during the snapshot's git work (a timeout kill on a slow host).
+            seen["state"] = jev.load_session_state("sess1", self.state_dir)
+            raise RuntimeError("killed")
+
+        with mock.patch.object(jev, "_critic_launch_snapshot", killed_snapshot):
+            self.assertIsNone(self.agent_done(payload))
+        self.assertIn("crit-1", seen["state"]["critic_started"])
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertIn("crit-1", state["critic_started"])
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        self.assertEqual([(e["decision"], e.get("reason")) for e in self.logs
+                          if e.get("event") == "critic_ledger"], [("skipped", "RuntimeError")])
+
+    def test_async_launch_stores_snapshot(self):
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        snapshot = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+        with mock.patch.object(jev, "_critic_launch_snapshot", lambda p, d: (snapshot, None)):
+            self.agent_done(payload)
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertIn("crit-1", state["critic_started"])
+        self.assertEqual(state["critic_snapshots"], {"crit-1": snapshot})
+
+    def test_async_launch_snapshot_dropped_when_handed_back_meanwhile(self):
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        snapshot = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+
+        def handback_first(prompt, deadline):
+            self.agent_done({"tool_name": "SubagentHandback", "agent_type": "critic",
+                             "agent_id": "crit-1", "session_id": "sess1",
+                             "tool_input": {"message": "ok"}})
+            return snapshot, None
+
+        with mock.patch.object(jev, "_critic_launch_snapshot", handback_first):
+            self.agent_done(payload)
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertNotIn("crit-1", state.get("critic_started", {}))
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+
+    def test_completed_critic_snapshot_lookup_ignores_payload_agent_id(self):
+        cfg = {**self.cfg, "features": {**self.cfg["features"], "report_check": False}}
+        snapshot = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+        jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                         lambda s: s.update(critic_started={"caller": time.time() - 100},
+                                            critic_snapshots={"caller": snapshot}))
+        # A foreground critic launched by subagent "caller": no agentId in the response,
+        # the hook payload's agent_id names the caller, whose own snapshot it must not take.
+        payload = self.report_payload(subagent_type="critic",
+                                      text="RESULT: SHIP\nEVIDENCE: x\nCONFIDENCE: high\n")
+        payload["agent_id"] = "caller"
+        with mock.patch.object(jev, "_record_critic_run") as record:
+            self.agent_done(payload, cfg=cfg)
+        record.assert_not_called()
+        self.assertIn(("skipped", "no_launch_snapshot"),
+                      [(e["decision"], e.get("reason")) for e in self.logs
+                       if e.get("event") == "critic_ledger"])
+        state = jev.load_session_state("sess1", self.state_dir)
+        # The caller's launch stays tracked for its own report; this critic is stamped
+        # from that in-flight launch (the earliest), not from now.
+        self.assertIn("caller", state["critic_started"])
+        self.assertEqual(state["critic_snapshots"], {"caller": snapshot})
+        self.assertLess(state["critic_ts"], time.time() - 90)
+
+    def _launch_with_failing_write(self, failing_call, after_mutate=False, snapshot_fn=None):
+        """Async-launch critic crit-1 with update_state call number `failing_call` (1 or
+        2) raising, after running its change on a copy of the saved state when
+        `after_mutate`; `snapshot_fn` replaces the launch snapshot (default: one snapshot);
+        returns (saved state, critic_ledger log reasons)."""
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        snapshot = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+        real, calls, controls = jev.update_state, [], []
+
+        def flaky(path, fn, deadline=None):
+            calls.append(fn)
+            if len(calls) == failing_call:
+                if after_mutate:
+                    # The change ran on a copy of the saved state, then the write failed.
+                    copied = jev.load_session_state("sess1", self.state_dir)
+                    fn(copied)
+                    # Asserted after the hook returns: the guard swallows exceptions here.
+                    controls.append("crit-1" in copied.get("critic_snapshots", {}))
+                raise TimeoutError("state lock")
+            return real(path, fn, deadline)
+
+        with mock.patch.object(jev, "_critic_launch_snapshot",
+                               snapshot_fn or (lambda p, d: (snapshot, None))), \
+                mock.patch.object(jev, "update_state", flaky):
+            self.agent_done(payload)
+        self.assertEqual(len(calls), 2)
+        if after_mutate and failing_call == 2:  # positive control: the change did store
+            self.assertEqual(controls, [True])
+        return (jev.load_session_state("sess1", self.state_dir),
+                [e.get("reason") for e in self.logs if e.get("event") == "critic_ledger"])
+
+    def test_async_launch_first_write_failing_stores_no_snapshot(self):
+        state, reasons = self._launch_with_failing_write(1)
+        self.assertNotIn("crit-1", state.get("critic_started", {}))
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        self.assertEqual(reasons, ["snapshot_not_stored"])
+
+    def test_async_launch_second_write_failing_keeps_launch_time(self):
+        for after_mutate in (False, True):
+            with self.subTest(after_mutate=after_mutate):
+                self.logs.clear()
+                jev.update_state(jev.session_state_path("sess1", self.state_dir), lambda s: s.clear())
+                state, reasons = self._launch_with_failing_write(2, after_mutate)
+                self.assertIn("crit-1", state["critic_started"])
+                self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+                self.assertEqual(reasons, ["snapshot_not_stored"])
+
+    def test_async_launch_failed_first_write_drops_an_older_same_id_snapshot(self):
+        old = {"repo": "r", "base": "a" * 40, "paths": None, "files": {"old": "100644:0"}}
+        jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                         lambda s: s.update(critic_started={"crit-1": time.time() - 500},
+                                            critic_snapshots={"crit-1": old}))
+        state, reasons = self._launch_with_failing_write(1)
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        self.assertEqual(reasons, ["snapshot_not_stored"])
+
+    def test_async_launch_failed_first_write_and_no_snapshot_drops_an_older_one(self):
+        # A relaunch with no snapshot of its own (no REVIEW-SCOPE, git failure, a crash)
+        # must still drop the earlier launch's snapshot, or its hand-back would take it.
+        def raising(prompt, deadline):
+            raise RuntimeError("git")
+
+        cases = {"no_scope": lambda p, d: (None, "no_scope"), "RuntimeError": raising}
+        for reason, snapshot_fn in cases.items():
+            with self.subTest(reason=reason):
+                self.logs.clear()
+                old = {"repo": "r", "base": "a" * 40, "paths": None, "files": {"old": "100644:0"}}
+                jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                                 lambda s: (s.clear(), s.update(
+                                     critic_started={"crit-1": time.time() - 500},
+                                     critic_snapshots={"crit-1": old})))
+                state, reasons = self._launch_with_failing_write(1, snapshot_fn=snapshot_fn)
+                self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+                self.assertEqual(reasons, [reason])
+
+    def test_async_launch_failed_first_write_drops_a_duplicates_snapshot(self):
+        # Fail closed: after this launch's first write is lost, a same-id snapshot cannot
+        # be told apart from an earlier launch's, so even a duplicate hook's is dropped.
+        theirs = {"repo": "r", "base": "c" * 40, "paths": None, "files": {"a": "100644:2"}}
+
+        def duplicate_meanwhile(prompt, deadline):
+            jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                             lambda s: s.update(critic_started={"crit-1": 1.0},
+                                                critic_snapshots={"crit-1": theirs}))
+            return theirs, None
+
+        # The duplicate's own write is call 2 here, so this launch's second write is call 3.
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        real, calls = jev.update_state, []
+
+        def flaky(path, fn, deadline=None):
+            calls.append(fn)
+            if len(calls) == 1:
+                raise TimeoutError("state lock")
+            return real(path, fn, deadline)
+
+        with mock.patch.object(jev, "_critic_launch_snapshot", duplicate_meanwhile), \
+                mock.patch.object(jev, "update_state", flaky):
+            self.agent_done(payload)
+        self.assertEqual(len(calls), 3)
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        self.assertEqual(state["critic_started"], {"crit-1": 1.0})
+        self.assertEqual([e.get("reason") for e in self.logs
+                          if e.get("event") == "critic_ledger"], ["snapshot_not_stored"])
+
+    def test_async_launch_keeps_a_same_id_snapshot_stored_by_another_launch(self):
+        # A duplicate hook for the same launch, with an earlier now(), wrote its entry and
+        # snapshot after this one's first write: this one's second write leaves it alone.
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        mine = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+        theirs = {"repo": "r", "base": "c" * 40, "paths": None, "files": {"a": "100644:2"}}
+
+        def other_launch_meanwhile(prompt, deadline):
+            jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                             lambda s: (s["critic_started"].update({"crit-1": 1.0}),
+                                        s.setdefault("critic_snapshots", {})
+                                        .update({"crit-1": theirs})))
+            return mine, None
+
+        with mock.patch.object(jev, "_critic_launch_snapshot", other_launch_meanwhile):
+            self.agent_done(payload)
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertEqual(state["critic_snapshots"], {"crit-1": theirs})
+
+    def test_completed_critic_reads_snake_case_response_agent_id(self):
+        cfg = {**self.cfg, "features": {**self.cfg["features"], "report_check": False}}
+        snapshot = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+        launched = time.time() - 100
+        jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                         lambda s: s.update(critic_started={"X": launched, "Y": launched - 50},
+                                            critic_snapshots={"X": snapshot}))
+        payload = self.report_payload(subagent_type="critic",
+                                      text="RESULT: SHIP\nEVIDENCE: x\nCONFIDENCE: high\n")
+        payload["tool_response"]["agent_id"] = "X"
+        with mock.patch.object(jev, "_record_critic_run") as record:
+            self.agent_done(payload, cfg=cfg)
+        self.assertEqual(record.call_args.kwargs["launch_files"], snapshot["files"])
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertEqual(state["critic_ts"], launched)  # X's own launch, not Y's earlier one
+        self.assertEqual(set(state["critic_started"]), {"Y"})
+
+    def test_async_launch_snapshot_not_stored_under_a_relaunch_of_the_same_id(self):
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        snapshot = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+
+        def relaunched_meanwhile(prompt, deadline):
+            # Between the two writes the id is handed back and launched again.
+            jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                             lambda s: s["critic_started"].update({"crit-1": 1.0}))
+            return snapshot, None
+
+        with mock.patch.object(jev, "_critic_launch_snapshot", relaunched_meanwhile):
+            self.agent_done(payload)
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        self.assertEqual([e.get("reason") for e in self.logs
+                          if e.get("event") == "critic_ledger"], ["snapshot_not_stored"])
+
     def test_edit_during_critic_run_is_covered_by_launch_time(self):
         launch_payload = self.report_payload(subagent_type="critic", status="async_launched")
         launch_payload["tool_response"]["agentId"] = "crit-1"

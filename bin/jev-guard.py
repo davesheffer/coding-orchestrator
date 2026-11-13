@@ -1888,14 +1888,11 @@ def critic_ledger_files(cwd, deadline=None):
     return None if files is None else (path, files, top, base)
 
 
-def _since_launch(files, launch=None):
+def _since_launch(files, launch):
     """`files` when they equal the `launch` snapshot exactly, else None (the run records
     nothing: keeping only the unchanged ones would approve a smaller file set than the
     critic was handed): the same names (a file changed, added to or dropped from the diff
-    during the run fails) at the same entries. Unchecked without a snapshot, which only
-    the direct record_critic_ledger API allows; the hooks never record without one."""
-    if launch is None:
-        return files
+    during the run fails) at the same entries. None without a snapshot."""
     return dict(files) if isinstance(launch, dict) and launch == files else None
 
 
@@ -1920,22 +1917,6 @@ def _merge_ledger(path, files, base, deadline):
 
     update_state(path, merge, deadline)
     return len(files)
-
-
-def record_critic_ledger(cwd, deadline=None, launch=None):
-    """Record the current "<mode>:<blob>" of every file this repository changed but has
-    not pushed (see critic_ledger_files) into the critic ledger, all or nothing: nothing
-    when one is LEDGER_UNHASHABLE or differs from a given `launch` snapshot (_since_launch).
-    A direct API for tests and tools: the hooks record only an async critic's REVIEW-SCOPE
-    (see _record_critic_run). Best effort: any failure leaves the ledger as it was."""
-    found = critic_ledger_files(cwd, deadline)
-    if found is None:
-        return
-    path, files, _top, base = found
-    base = base.lower() if isinstance(base, str) else None
-    files = _since_launch(files, launch)
-    if files is not None:
-        _merge_ledger(path, files, base, deadline)
 
 
 # The scope a critic was handed, as one line of its Agent prompt:
@@ -3419,8 +3400,9 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
 
     The critic ledger records only what an async critic was handed: the files of the
     REVIEW-SCOPE line in its prompt, in the repo that line names, and nothing on a
-    blocking verdict or a report without RESULT. Its launch snapshots those files'
-    hashes (`critic_snapshots`, by agent id) and its hand-back (or completed result)
+    blocking verdict or a report without RESULT. Its launch first persists its start
+    time, then snapshots those files' hashes (`critic_snapshots`, by agent id, in a
+    second write) and its hand-back (or completed result, by its response agentId)
     records them only when the scope's files are still exactly that snapshot. A
     foreground critic has no launch event, so no snapshot, and never records
     (skipped reason "no_launch_snapshot"): what it reviewed cannot be told from what
@@ -3485,10 +3467,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
             if subagent_type == "critic" and feature_enabled(cfg, "risk_gate"):
                 agent_id = tool_response.get("agentId") or tool_response.get("agent_id")
                 now_value = now()
-                snapshot, reason = (_critic_launch_snapshot(tool_input.get("prompt"), deadline)
-                                    if isinstance(agent_id, str) else (None, "no_agent_id"))
-                if reason is not None:
-                    _ledger_log(log_fn, "skipped", reason=reason)
+                state_path = session_state_path(session_id, state_dir)
 
                 def add_critic_started(s):
                     started = _prune_critic_started(dict(s.get("critic_started") or {}), now_value)
@@ -3497,18 +3476,66 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                     snapshots = {k: v for k, v in snapshots.items() if k in started}
                     if agent_id is not None:
                         started[agent_id] = now_value
-                        if snapshot is not None and isinstance(agent_id, str):
-                            snapshots[agent_id] = snapshot
-                        else:
-                            snapshots.pop(agent_id, None)
+                        snapshots.pop(agent_id, None)
                     s["critic_started"] = started
                     s["critic_snapshots"] = snapshots
 
+                # The launch time is written before the snapshot's git work: if the hook
+                # is killed during that work, the hand-back must still find when this
+                # critic started rather than stamp critic_ts at hand-back time.
+                first_write_failed = False
                 try:
-                    update_state(session_state_path(session_id, state_dir), add_critic_started,
-                                 deadline)
+                    update_state(state_path, add_critic_started, deadline)
                 except Exception:
-                    pass  # persisting critic timestamps is best effort
+                    first_write_failed = True  # persisting critic timestamps is best effort
+                if not isinstance(agent_id, str):
+                    _ledger_log(log_fn, "skipped", reason="no_agent_id")
+                    return None
+                try:
+                    snapshot, reason = _critic_launch_snapshot(tool_input.get("prompt"), deadline)
+                except Exception as exc:
+                    snapshot, reason = None, type(exc).__name__
+                if reason is not None:
+                    _ledger_log(log_fn, "skipped", reason=reason)
+                    snapshot = None
+                    if not first_write_failed:
+                        return None  # the first write already dropped any same-id snapshot
+
+                stored = {}
+
+                def finish_critic_launch(s):
+                    started = s.get("critic_started")
+                    snapshots = (s.get("critic_snapshots")
+                                 if isinstance(s.get("critic_snapshots"), dict) else {})
+                    # Stored only under this launch's own entry: not when it is no longer
+                    # tracked (already handed back, or the first write was lost) or the
+                    # entry is a later launch reusing the id, as nothing would pop it or
+                    # another run would take it.
+                    if (snapshot is not None and isinstance(started, dict)
+                            and started.get(agent_id) == now_value):
+                        snapshots[agent_id] = snapshot
+                        stored["ok"] = True
+                    elif first_write_failed:
+                        # This launch's first write was lost, so it did not drop a snapshot
+                        # under this id. That snapshot is an earlier launch's or a
+                        # concurrent duplicate's; the two cannot be told apart without
+                        # comparing times, so it is dropped either way (fail closed: at
+                        # worst a duplicate's approval is lost, never an old scope reused).
+                        snapshots.pop(agent_id, None)
+                    else:
+                        return
+                    s["critic_snapshots"] = snapshots
+
+                # Residual risk: after a failed first write, if this write fails too or never
+                # runs (the hook is killed during the snapshot's git work), an earlier
+                # launch's same-id snapshot survives. The two writes share one deadline, so
+                # a first write that waited out the lock leaves this one little time.
+                try:
+                    update_state(state_path, finish_critic_launch, deadline)
+                except Exception:
+                    stored.clear()  # best effort: without it the hand-back records nothing
+                if snapshot is not None and not stored:
+                    _ledger_log(log_fn, "skipped", reason="snapshot_not_stored")
             return None
         if status is not None and status != "completed":
             return None
@@ -3517,8 +3544,11 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     completed = tool_response
 
     if subagent_type == "critic" and feature_enabled(cfg, "risk_gate"):
-        agent_id = (tool_response.get("agentId") if isinstance(tool_response, dict) else None) \
-            or payload.get("agent_id")
+        # The launched critic's own id, as the launch reads it. Never the payload's
+        # agent_id: that can name the caller (a subagent that launched this critic),
+        # whose launch time and snapshot belong to its own later report.
+        response_agent_id = ((tool_response.get("agentId") or tool_response.get("agent_id"))
+                             if isinstance(tool_response, dict) else None)
         total_duration_ms = None
         if isinstance(tool_response, dict):
             total_duration_ms = tool_response.get("totalDurationMs")
@@ -3528,10 +3558,10 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
 
         def set_critic_ts_completed(s):
             started = _prune_critic_started(dict(s.get("critic_started") or {}), now_value)
-            launch["snapshot"] = _launch_snapshot(s, agent_id)
+            launch["snapshot"] = _launch_snapshot(s, response_agent_id)
             s.pop("critic_verdicts", None)  # an older version's foreground verdicts
-            if agent_id in started:
-                launched = started.pop(agent_id)
+            if response_agent_id in started:
+                launched = started.pop(response_agent_id)
             elif started:
                 # The id is missing/unknown but a critic launch is still in flight:
                 # use its earliest launch rather than assuming "now" (uncovered).
