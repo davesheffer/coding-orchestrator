@@ -34,15 +34,22 @@ Method
 - Try to construct a concrete failing scenario (inputs/state → wrong result). A finding without a scenario is a suspicion; label it as such.
 - Check the claim against evidence: did the stated verification actually exercise the change?
 - Start from the diff you were handed (or run the exact diff command in the brief) and go outward only where a suspicion needs it — callers, error paths, the tests. Read ranges with `offset`/`limit`, not whole large files; batch independent commands into one Bash call.
+- With a `REVIEW-SCOPE` line, the change is `git diff <base>` run in that path: it includes staged and intent-to-add (`git add -N`) files, never untracked ones.
 - Do not pad. Zero real findings is a valid result — say "no defects found" and what you checked.
 - Read-only: never edit, never run mutating commands.
 
-Reply format — findings ranked most severe first, each as:
+Reply format — the first line is the verdict alone, exactly one of these and nothing else on that line:
+
+RESULT: SHIP
+RESULT: approve-with-nits
+RESULT: FIX FIRST
+RESULT: RETHINK
+
+Do not write RESULT anywhere else in the reply, not even quoted, and add no other "verdict:" or "result:" header: hooks read only that first line, and a second such line counts as not approving. Then a one-line summary, then findings ranked most severe first, each as:
   [blocker|major|minor] path:line — defect in one sentence — failing scenario — suggested fix direction
 
 Then end with exactly this block:
 
-RESULT: SHIP | FIX FIRST | RETHINK — <one line>
 EVIDENCE: <what you read/ran>
 CONFIDENCE: high | medium | low
 UNVERIFIED: <what you could not check, or "none">

@@ -2,6 +2,7 @@
 """Safely install the Claude Code orchestration bundle.
 
 Usage: install.py [--force] [--dry-run] [--jev] [--rollover {open,copy}]
+       install.py --pre-push-hook <repo-path>
 """
 from __future__ import annotations
 
@@ -54,7 +55,8 @@ LEGACY_MANAGED_HASHES = {
     },
 }
 MANIFEST = ".coding-orchestrator-manifest.json"
-JEV_SCRIPTS = ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py")
+JEV_SCRIPTS = ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py",
+               "pre-push-gate.py")
 
 
 def fail(message: str) -> None:
@@ -378,6 +380,132 @@ def dump_json(doc, newline: bytes | None = None) -> bytes:
     return data.replace(b"\n", newline) if newline else data
 
 
+PRE_PUSH_MARKER = "# coding-orchestrator pre-push gate (claude/install.py --pre-push-hook)"
+
+
+def pre_push_shim(gate: Path) -> bytes:
+    """The `pre-push` hook: the chained `pre-push.d/pre-push` (if any) runs first, then the
+    gate; both get git's arguments and stdin. The chained hook keeps its name, so one that
+    dispatches on its own basename still works. LF endings, since sh runs it everywhere."""
+    gate_q = shlex.quote(gate.as_posix())
+    missing = f"pre-push gate: {gate.as_posix()} is missing; reinstall the bundle or remove this hook"
+    lines = [
+        "#!/bin/sh",
+        PRE_PUSH_MARKER,
+        "# Chained hook first, then the push gate. --no-verify skips both.",
+        'hookdir=$(dirname "$0")',
+        "input=$(mktemp) || exit 1",
+        "trap 'rm -f \"$input\"' EXIT",
+        'cat >"$input" || exit 1',
+        'if [ -x "$hookdir/pre-push.d/pre-push" ]; then',
+        '    "$hookdir/pre-push.d/pre-push" "$@" <"$input" || exit $?',
+        "fi",
+        f"if [ ! -f {gate_q} ]; then",
+        f"    printf '%s\\n' {shlex.quote(missing)} >&2",
+        "    exit 1",
+        "fi",
+        f'{shlex.quote(pinned_python())} {gate_q} "$@" <"$input"',
+        "exit $?",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _git_out(git: str, args: list[str], repo: Path) -> subprocess.CompletedProcess:
+    return subprocess.run([git, *args], cwd=repo, capture_output=True, text=True)
+
+
+def install_pre_push_hook(repo: Path, dest: Path, dry_run: bool) -> int:
+    """Write the repository's `pre-push` hook (honouring a repository-level
+    core.hooksPath), moving an existing foreign hook to `pre-push.d/pre-push` so the shim
+    chains it under its own name. Idempotent: a hook carrying PRE_PUSH_MARKER is ours and
+    is rewritten in place; a `pre-push.local` chained by an earlier version is moved to
+    `pre-push.d/pre-push`. Refuses a core.hooksPath set globally (it would put the hook in
+    every repository) and a hooks directory inside the work tree. Never sets core.hooksPath."""
+    git = shutil.which("git")
+    if git is None:
+        fail("git is not on PATH")
+    result = _git_out(git, ["rev-parse", "--git-path", "hooks"], repo)
+    if result.returncode != 0 or not result.stdout.strip():
+        fail(f"not a git repository: {repo}")
+    hooks = Path(result.stdout.strip())
+    if not hooks.is_absolute():
+        hooks = repo / hooks
+    scoped = _git_out(git, ["config", "--show-scope", "--get", "core.hooksPath"], repo)
+    if scoped.returncode not in (0, 1):
+        fail(f"could not read core.hooksPath in {repo}: {scoped.stderr.strip()}")
+    scope = scoped.stdout.partition("\t")[0].strip() if scoped.returncode == 0 else ""
+    if scope and scope not in ("local", "worktree"):
+        fail(f"core.hooksPath is set in the {scope} git config ({hooks}), so a hook written "
+             "there would run for every repository; unset it there or set a repository-level "
+             "core.hooksPath, then rerun")
+    top = _git_out(git, ["rev-parse", "--show-toplevel"], repo)
+    dirs = _git_out(git, ["rev-parse", "--absolute-git-dir", "--git-common-dir"], repo)
+    git_dirs = [Path(d) if Path(d).is_absolute() else repo / d
+                for d in dirs.stdout.splitlines() if d.strip()] if dirs.returncode == 0 else []
+    # Inside the work tree (tracked, or ignored like husky's `.husky/_`) but outside the
+    # git directory: the hook would be a work-tree file another tool owns or commits.
+    # The resolved path, the path as named, and the path with only its parent resolved
+    # all count, so a work-tree symlink or junction to a directory elsewhere is refused
+    # too, even when the repository was named through a linked path (macOS /var).
+    tops = ([Path(os.path.abspath(top.stdout.strip())), Path(top.stdout.strip()).resolve()]
+            if top.returncode == 0 and top.stdout.strip() else [])
+    git_roots = [p for d in git_dirs for p in (Path(os.path.abspath(d)), d.resolve())]
+
+    def in_work_tree(path):
+        return (any(path.is_relative_to(t) for t in tops)
+                and not any(path.is_relative_to(d) for d in git_roots))
+
+    named = Path(os.path.abspath(hooks))
+    if (in_work_tree(hooks.resolve()) or in_work_tree(named)
+            or in_work_tree(named.parent.resolve() / named.name)):
+        fail(f"the hooks directory {hooks} is inside the work tree, so the installer does "
+             "not write into it. Install by hand: in its pre-push hook, save stdin to a file, "
+             "run your existing checks, then run "
+             f"`{pinned_python()} {(dest / 'bin' / 'pre-push-gate.py').as_posix()} \"$@\"` "
+             "with that file as stdin and exit with its status")
+    hook, chained = hooks / "pre-push", hooks / "pre-push.d" / "pre-push"
+    legacy = hooks / "pre-push.local"
+    gate = dest / "bin" / "pre-push-gate.py"
+    shim = pre_push_shim(gate)
+    validate_dir(hooks)
+    validate_dir(chained.parent)
+    existing = read_regular(hook)
+    if not gate.is_file():
+        print(f"warning: {gate} is not installed; the hook refuses every push until "
+              "install.py has run", file=os.sys.stderr)
+    ours = existing is not None and PRE_PUSH_MARKER.encode() in existing
+    foreign = existing is not None and not ours
+    chained_taken = chained.exists() or chained.is_symlink()
+    migrate = ours and (legacy.exists() or legacy.is_symlink())
+    if migrate and chained_taken:
+        fail(f"{legacy} (chained by an earlier install) and {chained} both exist; merge them "
+             "by hand")
+    if existing == shim and not migrate:
+        print(f"up to date {hook}")
+        return 0
+    if foreign and chained_taken:
+        fail(f"{hook} is not ours and {chained} already exists; merge them by hand")
+    if dry_run:
+        if foreign:
+            print(f"move {hook} -> {chained}")
+        if migrate:
+            print(f"move {legacy} -> {chained}")
+        print(f"write {hook}")
+        return 0
+    hooks.mkdir(parents=True, exist_ok=True)
+    if foreign or migrate:
+        chained.parent.mkdir(exist_ok=True)
+    if foreign:
+        os.replace(hook, chained)
+        print(f"move {hook} -> {chained}")
+    if migrate:
+        os.replace(legacy, chained)
+        print(f"move {legacy} -> {chained}")
+    atomic_write(hook, shim, 0o755)
+    print(f"write {hook}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--force", action="store_true")
@@ -386,10 +514,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="enable the TypeSafe Jev hooks (model routing, risk gate, report check)")
     parser.add_argument("--rollover", choices=("open", "copy"),
                         help="relay handoffs open a new Claude tab, or only copy the relay prompt")
+    parser.add_argument("--pre-push-hook", metavar="REPO", type=Path,
+                        help="only install the pre-push gate hook into this repository")
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parents[1]
     dest = Path(os.environ.get("CLAUDE_HOME") or Path.home() / ".claude").expanduser().absolute()
+    if args.pre_push_hook is not None:
+        return install_pre_push_hook(args.pre_push_hook.expanduser().absolute(), dest, args.dry_run)
     source_claude = (root / "CLAUDE.md").read_bytes()
     source_claude = fill_placeholders(source_claude.decode("utf-8"), {
         "__PYTHON__": hook_python(),
@@ -538,7 +670,8 @@ def main(argv: list[str] | None = None) -> int:
     for directory in directories:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     executable = {dest / "bin" / name
-                  for name in ("pr-status", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py")}
+                  for name in ("pr-status", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py",
+                               "pre-push-gate.py")}
     for path, data, prior in changes:
         if prior is not None:
             backup = create_backup(path, prior)
