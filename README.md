@@ -64,6 +64,13 @@ Then start a new session. That's it. 🎉
 | `--rollover open` | Open the fresh session automatically when a chat gets too long (`copy` puts the prompt on your clipboard instead) |
 | `--jev` | Turn on the optional Jev helpers (smarter routing and a safety check before pushes). Uses a paid third-party API |
 
+**Rollover modes.** `open` and `copy` work as before. `--rollover inplace` never
+stops a session for size: the model keeps a per-session checkpoint file current,
+and after the engine compacts the conversation the relay re-injects that
+checkpoint. A task shift still uses a handoff, but instead of opening a tab the
+`relay-inplace` mod (needed for this part) clears the tab and continues from the
+handoff by itself. Without the mod, inplace falls back to the copy instructions.
+
 **Mission Control** is optional: copy `mods/mission-control` to
 `~/.claude/mods/mission-control` and see its [README](mods/mission-control/README.md).
 Then type `/orch` in Claude Code.

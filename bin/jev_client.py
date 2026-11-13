@@ -33,6 +33,7 @@ TIER_RANK = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3}
 ROUTE_NUMBERS = ("min_confidence", "upgrade_min_confidence", "downgrade_min_confidence", "escalate_mass")
 # Every probability/confidence threshold in DEFAULTS: each must be a number in [0, 1].
 THRESHOLDS = ROUTE_NUMBERS + ("shift_low", "shift_high", "risk_min_probability",
+                              "risk_confident_class", "risk_confident_min_probability",
                               "report_min_support", "report_max_gap")
 FEATURES = ("route", "shift", "risk_gate", "report_check", "handoff_grade", "ask")
 MAX_DEADLINE_SECONDS = 4.0
@@ -80,6 +81,9 @@ DEFAULTS = {
     "send_diff": True,
     "max_diff_chars": 12000,
     "risk_min_probability": 0.6,
+    # A risk class Jev is this sure of needs only the lower "needs review" probability.
+    "risk_confident_class": 0.9,
+    "risk_confident_min_probability": 0.5,
     # report_check
     "report_roles": ["scout", "runner", "builder", "critic"],
     "report_min_support": 0.5,

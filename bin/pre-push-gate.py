@@ -275,10 +275,16 @@ def run(argv, stdin_text, cfg, jev, classify_fn=None, log_fn=None, cwd=None, err
     needs_review_p = jev.noul(answers, "needs_review")
     if not isinstance(choice, str) or (choice != "none" and needs_review_p is None):
         return advisory("malformed", "returned an unusable answer")
-    if choice == "none" or needs_review_p < cfg["risk_min_probability"]:
-        log("allow", risk=choice, needs_review=needs_review_p, files=len(needs))
+    # As in the risk_gate hook, an invalid confidence is logged as None and never lowers
+    # the bar (see needs_critic).
+    risk = answers["risk"]
+    confidence = jev.coerce_confidence(risk.get("confidence") if isinstance(risk, dict) else None)
+    if not jev.needs_critic(cfg, choice, confidence, needs_review_p):
+        log("allow", risk=choice, confidence=confidence, needs_review=needs_review_p,
+            files=len(needs))
         return 0
-    log("deny", risk=choice, needs_review=needs_review_p, files=len(needs))
+    log("deny", risk=choice, confidence=confidence, needs_review=needs_review_p,
+        files=len(needs))
     listed = "\n".join(f"  {name}" for name in needs[:MAX_LISTED_FILES])
     more = len(needs) - MAX_LISTED_FILES
     if more > 0:

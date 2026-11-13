@@ -42,7 +42,8 @@ class ClientTests(unittest.TestCase):
 
     def test_bad_thresholds_fall_back_to_defaults(self):
         keys = ("min_confidence", "upgrade_min_confidence", "downgrade_min_confidence", "escalate_mass",
-                "shift_low", "shift_high", "risk_min_probability", "report_min_support", "report_max_gap")
+                "shift_low", "shift_high", "risk_min_probability", "risk_confident_class",
+                "risk_confident_min_probability", "report_min_support", "report_max_gap")
         self.assertEqual(set(keys), set(jev_client.THRESHOLDS))
         path = self.dir / "config.json"
         for bad in ("high", True, False, None, [0.5], {"v": 0.5}, 10 ** 400, -0.1, 1.5, "nan", "inf"):

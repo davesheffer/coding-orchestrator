@@ -57,7 +57,7 @@ class BundleContractTests(unittest.TestCase):
         hooks = json.loads((ROOT / "hooks.json").read_text())
         commands = [h["command"] for groups in hooks["hooks"].values()
                     for group in groups for h in group["hooks"]]
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 4)
         self.assertTrue(all("__RELAY__" in command for command in commands))
 
     def test_json_and_toml_sources_parse(self):

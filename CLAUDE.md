@@ -55,6 +55,8 @@ If the shell rejects the heredoc (for example, `unexpected EOF while looking for
 
 The installer resolves the helper paths above to this installation. The relay saves the handoff, then either opens a new Claude tab (rollover: open) or copies the relay prompt to the clipboard (rollover: copy). Report what the script actually printed; saving alone does not prove a tab opened. If no launch was acknowledged, tell the user to start a new session and send the printed `relay:<id>` prompt. After a successful handoff, stop working here.
 
+With rollover "inplace" the session is never stopped for size: follow the gauge text instead of the zone rules above (keep the session checkpoint current with `relay.py checkpoint`, keep working, and after a compaction use the re-injected checkpoint). A task shift still uses a handoff; the tab clears and continues by itself.
+
 A `relay:<id>` prompt continues the injected handoff. Recheck material UNVERIFIED claims and act on NEXT PROMPT when present. On resuming, collect RUNNING items before relaunching equivalent work; an agent from the old session cannot be messaged, so read its report path, and relaunch only if no report exists.
 <!-- CLAUDE-ORCHESTRATOR:END -->
 

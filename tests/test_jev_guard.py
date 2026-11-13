@@ -149,6 +149,51 @@ class GateTests(unittest.TestCase):
         self.assertIsNone(out)
         self.assertEqual(self.logs[-1]["decision"], "allow")
 
+    def test_confident_class_needs_less_review_probability(self):
+        # Seen live: a one-line auth-check edit was rated security at 0.98 but 0.56 for
+        # "needs review", under risk_min_probability, and was pushed unreviewed.
+        self.stage_change()
+        for n, (confidence, needs_review, decision) in enumerate((
+                (0.98, 0.56, "deny"), (0.9, 0.5, "deny"), (0.98, 0.49, "allow"),
+                (0.89, 0.56, "allow"), (0.89, 0.6, "deny"))):
+            with self.subTest(confidence=confidence, needs_review=needs_review):
+                out = self.gate(self.payload("git commit -m 'x'", session_id=f"conf{n}"),
+                                classify_fn=self.classify(confidence=confidence,
+                                                          needs_review=needs_review))
+                self.assertEqual(self.logs[-1]["decision"], decision)
+                self.assertEqual(out is not None, decision == "deny")
+
+    def test_needs_critic_rule(self):
+        cfg = self.cfg
+        self.assertEqual((cfg["risk_min_probability"], cfg["risk_confident_class"],
+                          cfg["risk_confident_min_probability"]), (0.6, 0.9, 0.5))
+        for choice, confidence, needs_review, expected in (
+                ("security", 0.3, 0.6, True), ("security", 0.3, 0.59, False),
+                ("security", 0.9, 0.5, True), ("security", 0.9, 0.49, False),
+                ("public_api", 1.0, 0.5, True), ("none", 1.0, 1.0, False),
+                # A missing or invalid confidence or probability never lowers the bar.
+                ("security", None, 0.59, False), ("security", None, 0.6, True),
+                ("security", True, 0.59, False), ("security", "0.95", 0.59, False),
+                ("security", float("nan"), 0.59, False), ("security", 1.5, 0.59, False),
+                ("security", 0.95, None, False), ("security", 0.95, True, False),
+                ("security", 0.95, float("nan"), False), ("security", 0.95, 1.5, False)):
+            with self.subTest(choice=choice, confidence=confidence, needs_review=needs_review):
+                self.assertIs(jev.needs_critic(cfg, choice, confidence, needs_review), expected)
+        # The confident bar never raises risk_min_probability, and equal bars turn it off.
+        raised = {**cfg, "risk_confident_min_probability": 0.8}
+        self.assertTrue(jev.needs_critic(raised, "security", 0.95, 0.6))
+        off = {**cfg, "risk_confident_min_probability": cfg["risk_min_probability"]}
+        self.assertFalse(jev.needs_critic(off, "security", 0.98, 0.56))
+        # A cfg missing a confident-class key, or with a junk one, keeps the base rule.
+        for key in ("risk_confident_class", "risk_confident_min_probability"):
+            for bad in (None, "0.5", True, False, float("nan"), 1.5, -0.1):
+                with self.subTest(key=key, bad=bad):
+                    partial = {k: v for k, v in cfg.items() if k != key}
+                    if bad is not None:
+                        partial[key] = bad
+                    self.assertFalse(jev.needs_critic(partial, "security", 0.98, 0.56))
+                    self.assertTrue(jev.needs_critic(partial, "security", 0.98, 0.6))
+
     def test_junk_max_diff_chars_falls_back_to_default(self):
         self.stage_change()
         for n, bad in enumerate(("abc", [1], {"a": 1}, None, True, -5, float("inf"), 1.5)):
@@ -456,6 +501,28 @@ class GateTests(unittest.TestCase):
         out = self.gate(self.payload(command), classify_fn=self.classify())
         self.assertIn("This push looks risky", out["hookSpecificOutput"]["permissionDecisionReason"])
         self.assertEqual(len(self.calls), 1)
+
+    def test_confident_class_band_on_push_path(self):
+        self.stage_change()
+        command = "git commit -m x && git push"
+        off = {**self.cfg, "risk_confident_min_probability": self.cfg["risk_min_probability"]}
+        for n, (cfg, confidence, needs_review, decision) in enumerate((
+                (self.cfg, 0.98, 0.56, "deny"), (self.cfg, 0.5, 0.56, "allow"),
+                (self.cfg, 0.98, 0.49, "allow"), (off, 0.98, 0.56, "allow"))):
+            with self.subTest(confidence=confidence, needs_review=needs_review, decision=decision,
+                              equal_bars=cfg is off):
+                payload = self.payload(command, session_id=f"pushband{n}")
+                classify_fn = self.classify(confidence=confidence, needs_review=needs_review)
+                # The first attempt is denied once as an unjudged push, without a call.
+                out = self.gate(payload, cfg=cfg, classify_fn=classify_fn)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                                 jev.UNJUDGED_PUSH_REASON)
+                calls = len(self.calls)
+                # The retry judges the push's commits.
+                out = self.gate(payload, cfg=cfg, classify_fn=classify_fn)
+                self.assertEqual(len(self.calls), calls + 1)
+                self.assertEqual(self.logs[-1]["decision"], decision)
+                self.assertEqual(out is not None, decision == "deny")
 
     def test_unjudged_push_when_git_budget_is_spent(self):
         out = jev.gate(self.payload("git push"), self.cfg, self.classify(), self.logs.append,
