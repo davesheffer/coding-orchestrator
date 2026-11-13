@@ -1,0 +1,5 @@
+{
+  "name": "relay-inplace",
+  "version": "0.1.0",
+  "description": "Relay in-place rollover: when a turn ends and relay left a fresh request for this session, clear the tab and submit the relay:<id> prompt."
+}
