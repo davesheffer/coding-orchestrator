@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Safely install the Claude Code orchestration bundle.
 
-Usage: install.py [--force] [--dry-run] [--jev] [--rollover {open,copy}]
+Usage: install.py [--force] [--dry-run] [--jev] [--rollover {open,copy,inplace}]
        install.py --pre-push-hook <repo-path>
 """
 from __future__ import annotations
@@ -296,13 +296,19 @@ def merge_jev_hook(existing: dict, bin_dir: Path, enabled: bool) -> dict:
     return result
 
 
+# Hook event -> relay.py subcommand. Ownership is matched by command (is_old_relay_hook),
+# never by matcher, so SessionStart keeps its "compact" matcher and foreign hooks stay.
+RELAY_ACTIONS = {"UserPromptSubmit": "prompt", "Stop": "stop",
+                 "PreCompact": "precompact", "SessionStart": "session-start"}
+
+
 def merge_hooks(existing: dict, template: dict, relay: Path) -> dict:
     result = json.loads(json.dumps(existing))
     hooks = result.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         fail("settings.json hooks must be an object")
     for event, wanted_groups in template["hooks"].items():
-        action = {"UserPromptSubmit": "prompt", "Stop": "stop"}[event]
+        action = RELAY_ACTIONS[event]
         have = hooks.setdefault(event, [])
         if not isinstance(have, list):
             fail(f"settings.json hooks.{event} must be an array")
@@ -512,8 +518,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--jev", action="store_true",
                         help="enable the TypeSafe Jev hooks (model routing, risk gate, report check)")
-    parser.add_argument("--rollover", choices=("open", "copy"),
-                        help="relay handoffs open a new Claude tab, or only copy the relay prompt")
+    parser.add_argument("--rollover", choices=("open", "copy", "inplace"),
+                        help="relay handoffs open a new Claude tab, only copy the relay prompt, "
+                             "or continue in place (compaction re-injects a checkpoint)")
     parser.add_argument("--pre-push-hook", metavar="REPO", type=Path,
                         help="only install the pre-push gate hook into this repository")
     args = parser.parse_args(argv)
@@ -559,7 +566,8 @@ def main(argv: list[str] | None = None) -> int:
         managed_sources[dest / "bin" / name] = (root / "bin" / name).read_bytes()
 
     directories = (dest, dest / "agents", dest / "relay", dest / "relay" / "handoffs",
-                   dest / "relay" / "state", dest / "bin")
+                   dest / "relay" / "state", dest / "relay" / "checkpoints",
+                   dest / "relay" / "inplace", dest / "bin")
     for directory in directories:
         validate_dir(directory)
 

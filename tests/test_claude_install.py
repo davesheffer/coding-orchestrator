@@ -376,7 +376,8 @@ class ClaudeInstallTests(unittest.TestCase):
         commands = [h["command"] for groups in settings["hooks"].values()
                     for group in groups for h in group["hooks"]]
         self.assertEqual(sorted(commands), sorted(f"{python} {relay} {action} 2>/dev/null || true"
-                                                  for action in ("prompt", "stop")))
+                                                  for action in ("prompt", "stop", "precompact",
+                                                                 "session-start")))
 
     def test_fill_placeholders_is_single_pass(self):
         values = {"__PYTHON__": "__RELAY__", "__RELAY__": "'/x/__PR_STATUS__'",
@@ -585,6 +586,102 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(self.run_install().returncode, 0)
         self.assertEqual(self.snapshot(), after)
 
+    def relay_commands(self, settings):
+        relay = str(self.home / "relay/relay.py")
+        return {event: [(group.get("matcher"), h) for group in groups for h in group["hooks"]
+                        if relay in h["command"]]
+                for event, groups in settings["hooks"].items()}
+
+    def test_fresh_install_has_four_relay_hooks_and_is_idempotent(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
+        found = self.relay_commands(settings)
+        relay = shlex.quote(str(self.home / "relay/relay.py"))
+        python = install_module.hook_python()
+        expected = {"UserPromptSubmit": ("prompt", 10, None), "Stop": ("stop", 10, None),
+                    "PreCompact": ("precompact", 15, None),
+                    "SessionStart": ("session-start", 10, "compact")}
+        self.assertEqual(set(found), set(expected))
+        for event, (action, timeout, matcher) in expected.items():
+            self.assertEqual(len(found[event]), 1, event)
+            got_matcher, hook = found[event][0]
+            self.assertEqual(got_matcher, matcher, event)
+            self.assertEqual(hook, {"type": "command", "timeout": timeout,
+                                    "command": f"{python} {relay} {action} 2>/dev/null || true"})
+        for name in ("checkpoints", "inplace"):
+            self.assertTrue((self.home / "relay" / name).is_dir())
+        dry = self.run_install("--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertNotIn("settings.json", dry.stdout)
+        before = self.snapshot()
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_dry_run_on_old_settings_reports_the_new_hooks(self):
+        self.home.mkdir(parents=True)
+        self.home.joinpath("settings.json").write_text(json.dumps({"hooks": {}}))
+        before = self.snapshot()
+        dry = self.run_install("--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(f"write {self.home / 'settings.json'}", dry.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_upgrade_from_two_relay_hooks_adds_the_new_ones_and_keeps_foreign_hooks(self):
+        self.home.mkdir(parents=True)
+        legacy = 'python3 "$HOME/.claude/relay/relay.py" {} 2>/dev/null || true'
+        foreign_start = {"matcher": "startup", "hooks": [{"type": "command", "command": "my-start"}]}
+        foreign_compact = {"matcher": "compact", "hooks": [{"type": "command", "command": "my-compact"}]}
+        foreign_pre = {"hooks": [{"type": "command", "command": "my-precompact"}]}
+        foreign_in_group = {"matcher": "compact", "hooks": [
+            {"type": "command", "command": "python3 /other/relay.py session-start"},
+            {"type": "command", "command": legacy.format("session-start")}]}
+        old = {"hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": legacy.format("prompt")}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": legacy.format("stop")}]}],
+            "PreCompact": [foreign_pre],
+            "SessionStart": [foreign_start, foreign_compact, foreign_in_group]}}
+        self.home.joinpath("settings.json").write_text(json.dumps(old))
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
+        hooks = settings["hooks"]
+        found = self.relay_commands(settings)
+        self.assertEqual({event: len(items) for event, items in found.items()},
+                         {"UserPromptSubmit": 1, "Stop": 1, "PreCompact": 1, "SessionStart": 1})
+        self.assertEqual(hooks["PreCompact"][0], foreign_pre)
+        self.assertEqual(hooks["SessionStart"][:2], [foreign_start, foreign_compact])
+        self.assertEqual(hooks["SessionStart"][2], {
+            "matcher": "compact",
+            "hooks": [{"type": "command", "command": "python3 /other/relay.py session-start"}]})
+        self.assertEqual(hooks["SessionStart"][-1]["matcher"], "compact")
+        self.assertEqual(len(hooks["SessionStart"]), 4)
+        self.assertNotIn("$HOME", json.dumps(hooks["UserPromptSubmit"] + hooks["Stop"]))
+        before = self.snapshot()
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_is_old_relay_hook_owns_the_new_actions_only_by_exact_command(self):
+        relay = self.home / "relay/relay.py"
+        owns = install_module.is_old_relay_hook
+        for action in ("precompact", "session-start"):
+            self.assertTrue(owns(f"python3 {shlex.quote(str(relay))} {action} 2>/dev/null || true",
+                                 relay, action))
+            self.assertTrue(owns(f'python "$HOME/.claude/relay/relay.py" {action}', relay, action))
+            self.assertFalse(owns(f"python3 {relay} {action} && audit", relay, action))
+            self.assertFalse(owns(f"python3 /other/relay.py {action}", relay, action))
+        self.assertFalse(owns(f"python3 {relay} precompact", relay, "session-start"))
+
+    def test_rollover_inplace_writes_the_config_value(self):
+        config = self.home / "relay/config.json"
+        result = self.run_install("--rollover", "inplace")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["rollover"], "inplace")
+        before = self.snapshot()
+        self.assertEqual(self.run_install("--rollover", "inplace").returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotEqual(self.run_install("--rollover", "bogus").returncode, 0)
+
     def test_default_install_ignores_malformed_user_pre_tool_use(self):
         self.home.mkdir(parents=True)
         malformed = ["not-a-group", {"matcher": "Bash", "hooks": "not-a-list"}]
@@ -681,7 +778,7 @@ class ClaudeInstallTests(unittest.TestCase):
                     install_module.merge_hooks({}, template, relay), bin_dir, True)
             commands = [h["command"] for groups in settings["hooks"].values()
                         for group in groups for h in group["hooks"]]
-            self.assertEqual(len(commands), 6)
+            self.assertEqual(len(commands), 8)
             self.assertTrue(all(command.startswith(f"{python} ") for command in commands), commands)
             self.assertEqual(settings["hooks"]["PreToolUse"], jev["hooks"]["PreToolUse"])
             self.assertIn(f"{python} {shlex.quote(str(relay))} stop 2>/dev/null || true", commands)
