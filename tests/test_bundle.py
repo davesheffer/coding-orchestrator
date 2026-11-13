@@ -1,6 +1,7 @@
 import json
 import tomllib
 import unittest
+import warnings
 from pathlib import Path
 
 
@@ -65,6 +66,19 @@ class BundleContractTests(unittest.TestCase):
         tomllib.loads((ROOT / "codex/config.example.toml").read_text())
         for name in ROLES:
             tomllib.loads((ROOT / "codex/agents" / f"{name}.toml").read_text())
+
+    def test_python_sources_compile_without_warnings(self):
+        # A hook script runs on every tool call, so a SyntaxWarning in one (an invalid
+        # escape such as `.\pkg` in a non-raw docstring) is printed on every call.
+        sources = [path for folder in ("benchmarks", "bin", "claude", "codex", "relay", "tests")
+                   for path in (ROOT / folder).rglob("*.py")]
+        sources.append(ROOT / "bin" / "pr-status")
+        self.assertGreater(len(sources), 40)
+        for path in sources:
+            with self.subTest(source=path.relative_to(ROOT).as_posix()):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
 
 if __name__ == "__main__":
