@@ -166,6 +166,18 @@ class GateTests(unittest.TestCase):
                 response = risk_response("security", needs_review, confidence)
                 self.assertEqual(self.run_gate([line], self.classify(response))[0], code)
 
+    def test_log_carries_the_confidence_the_rule_used(self):
+        head = self.commit("a.txt", "two\n")
+        line = f"refs/heads/main {head} refs/heads/main {self.base}"
+        for confidence, logged, decision in ((0.98, 0.98, "deny"), ("high", None, "allow")):
+            with self.subTest(confidence=confidence):
+                logs, err = [], io.StringIO()
+                gate.run(["origin", str(self.remote)], f"{line}\n", self.cfg, jev,
+                         self.classify(risk_response("security", 0.56, confidence)),
+                         log_fn=logs.append, cwd=str(self.repo), err=err)
+                self.assertEqual([(e["decision"], e["risk"], e["confidence"], e["needs_review"])
+                                  for e in logs], [(decision, "security", logged, 0.56)])
+
     def test_jev_unavailable_allows_with_warning(self):
         head = self.commit("a.txt", "two\n")
         code, err = self.run_gate([f"refs/heads/main {head} refs/heads/main {self.base}"],

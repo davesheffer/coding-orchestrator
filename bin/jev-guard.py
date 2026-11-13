@@ -497,18 +497,24 @@ def needs_critic(cfg, choice, confidence, needs_review_p):
     `risk_confident_class`. Jev rates a small change to, say, an auth check as almost
     certainly `security` yet only about as likely as not to need review; being that sure
     of the class is evidence too. A missing or invalid confidence or probability never
-    lowers the bar, and the confident bar never raises it."""
+    lowers the bar, and the confident bar never raises it. A `cfg` without the two
+    confident-class keys (one not built by load_config) keeps `risk_min_probability`."""
     if choice == "none" or not _is_probability(needs_review_p):
         return False
     bar = cfg["risk_min_probability"]
-    if _is_probability(confidence) and confidence >= cfg["risk_confident_class"]:
-        bar = min(bar, cfg["risk_confident_min_probability"])
+    confident_class = cfg.get("risk_confident_class")
+    confident_bar = cfg.get("risk_confident_min_probability")
+    if (_is_probability(confident_class) and _is_probability(confident_bar)
+            and _is_probability(confidence) and confidence >= confident_class):
+        bar = min(bar, confident_bar)
     return needs_review_p >= bar
 
 
 def _is_probability(value):
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and 0.0 <= value <= 1.0)
+
+
 SUPPORTED_INSTRUCTIONS = ("The EVIDENCE (commands run, exit codes, file:line references, "
                            "observed output) concretely supports the claims in RESULT.")
 MATERIAL_GAP_INSTRUCTIONS = ("UNVERIFIED lists something material to whether RESULT is correct "
@@ -3113,8 +3119,9 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
             return fail_closed_output("returned an unusable answer")
         log("allow")
         return None
-    # Confidence is only logged, so an invalid one (missing, null, str, bool, out of
-    # range) is logged as None, as in jev-route, and doesn't skip the gate.
+    # An invalid confidence (missing, null, str, bool, out of range) is logged as None,
+    # as in jev-route; it doesn't skip the gate and never lowers the bar (see
+    # needs_critic).
     risk = answers["risk"]
     confidence = coerce_confidence(risk.get("confidence") if isinstance(risk, dict) else None)
     needs_review_p = noul(answers, "needs_review")

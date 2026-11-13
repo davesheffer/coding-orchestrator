@@ -184,6 +184,15 @@ class GateTests(unittest.TestCase):
         self.assertTrue(jev.needs_critic(raised, "security", 0.95, 0.6))
         off = {**cfg, "risk_confident_min_probability": cfg["risk_min_probability"]}
         self.assertFalse(jev.needs_critic(off, "security", 0.98, 0.56))
+        # A cfg missing a confident-class key, or with a junk one, keeps the base rule.
+        for key in ("risk_confident_class", "risk_confident_min_probability"):
+            for bad in (None, "0.5", True, float("nan"), 1.5):
+                with self.subTest(key=key, bad=bad):
+                    partial = {k: v for k, v in cfg.items() if k != key}
+                    if bad is not None:
+                        partial[key] = bad
+                    self.assertFalse(jev.needs_critic(partial, "security", 0.98, 0.56))
+                    self.assertTrue(jev.needs_critic(partial, "security", 0.98, 0.6))
 
     def test_junk_max_diff_chars_falls_back_to_default(self):
         self.stage_change()
