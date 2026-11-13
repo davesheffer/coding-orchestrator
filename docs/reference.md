@@ -463,6 +463,12 @@ line in its per-session state file `relay/state/<session>.json` (mode 0600),
 which is removed after `handoff_ttl_hours`. Independently of Jev, a handoff
 (including any NEXT PROMPT text) is kept in the private `relay/handoffs/<id>.md`
 for the same period.
+Each relay hook run also appends, best effort, one metadata line (time, hook
+name, first 8 characters of the session id, outcome, length of the hook's
+output; never prompt, transcript or handoff text) to
+`relay/state/hook-log.jsonl` (created 0600 on POSIX; on Windows it inherits the
+folder's access), which rotates to `hook-log.jsonl.1` above 1 MB instead of
+expiring.
 
 ##### pre-push gate
 

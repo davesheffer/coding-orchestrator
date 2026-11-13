@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-const ROOT = 'C:/relay'
+const ROOT = 'C:/home/relay'
 const SID = 'sess-1'
 const PATH = `${ROOT}/inplace/${SID}.json`
 const NOW = 1_800_000_000_000
@@ -11,7 +11,7 @@ const slashed = (path: string) => path.replace(/\\/g, '/')
 const world = (on: any, files: Record<string, string>, opts: { failClear?: boolean; failRead?: boolean; env?: Record<string, string> } = {}) => {
   const calls: string[] = []
   const clock = mock.clock(on, { now: NOW })
-  mock.env(on, opts.env ?? { CLAUDE_RELAY_ROOT: ROOT })
+  mock.env(on, opts.env ?? { CLAUDE_HOME: 'C:/home' })
   on('turn.complete', (_$: any, e: any) => ({ text: e.answer }))
   on('session.start', () => ({}))
   on('session.id', () => ({ value: SID }))
@@ -196,10 +196,22 @@ const sessionStart = async ($: any, on: any, env: Record<string, string>) => {
   return sets
 }
 
-test('session.start sets the env to CLAUDE_RELAY_ROOT', async ($, on) => {
-  expect(await sessionStart($, on, { CLAUDE_RELAY_ROOT: ROOT })).toEqual([
+test('session.start ignores CLAUDE_RELAY_ROOT, as relay.py does', async ($, on) => {
+  expect(await sessionStart($, on, { CLAUDE_RELAY_ROOT: 'C:/elsewhere', CLAUDE_HOME: 'C:/home' })).toEqual([
     { name: 'CLAUDE_RELAY_INPLACE_MOD', value: ROOT },
   ])
+})
+
+test('session.start ignores CLAUDE_RELAY_ROOT without CLAUDE_HOME too', async ($, on) => {
+  const sets = await sessionStart($, on, { CLAUDE_RELAY_ROOT: 'C:/elsewhere' })
+  expect(sets.length).toBe(1)
+  expect(sets[0].value.endsWith('/../../relay')).toBe(true)
+})
+
+test('session.start: an empty CLAUDE_HOME falls back to the plugin root', async ($, on) => {
+  const sets = await sessionStart($, on, { CLAUDE_HOME: '' })
+  expect(sets.length).toBe(1)
+  expect(sets[0].value.endsWith('/../../relay')).toBe(true)
 })
 
 test('session.start: default root from CLAUDE_HOME', async ($, on) => {
