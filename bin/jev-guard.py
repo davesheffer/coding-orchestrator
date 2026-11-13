@@ -2034,7 +2034,7 @@ _POWERSHELL = contextvars.ContextVar("jev_guard_powershell", default=False)
 
 
 def _shell_split(text):
-    """shlex.split, except for a PowerShell command (see _POWERSHELL): split in non-POSIX
+    r"""shlex.split, except for a PowerShell command (see _POWERSHELL): split in non-POSIX
     mode, which keeps backslashes, and drop a word's enclosing quotes. Off Windows the
     backslashes become `/`, as pwsh reads them there (`cd .\pkg` is `./pkg`). Raises
     ValueError on an unbalanced quote, as shlex.split does."""
