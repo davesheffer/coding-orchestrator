@@ -65,6 +65,14 @@ class InplaceBase(unittest.TestCase):
                                  "CLAUDE_RELAY_ROLLOVER": "inplace"}
         for name in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_RELAY_INPLACE_MOD"):
             self.env.pop(name, None)
+        # In-process tests read os.environ directly, and patch.dict only adds keys. When the suite
+        # runs inside a Claude Code session with the relay-inplace mod loaded, both names are set
+        # there, so clear them for every test; patch.dict restores the real values afterwards.
+        env_patch = patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        for name in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_RELAY_INPLACE_MOD"):
+            os.environ.pop(name, None)
 
     def tearDown(self):
         self.temp.cleanup()

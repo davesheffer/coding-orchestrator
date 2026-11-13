@@ -2502,6 +2502,13 @@ class GateTests(unittest.TestCase):
 
 
 class StateAndReportInputTests(unittest.TestCase):
+    def test_malformed_session_id_uses_the_unknown_state_file(self):
+        self.assertEqual(jev.session_state_path("sess1", "d").name, "jev-sess1.json")
+        for session_id in (None, 7, "", "a/b", "..", "x" * 129, "sess1\n"):
+            with self.subTest(session_id=session_id):
+                self.assertEqual(jev.session_state_path(session_id, "d").name,
+                                 "jev-unknown.json")
+
     def test_non_dict_state_reads_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = jev.session_state_path("sess1", tmp)
@@ -2817,9 +2824,178 @@ class AgentDoneTests(unittest.TestCase):
 
     def test_async_launch_first_write_failing_stores_no_snapshot(self):
         state, reasons = self._launch_with_failing_write(1)
-        self.assertNotIn("crit-1", state.get("critic_started", {}))
+        self.assertIn("crit-1", state["critic_started"])  # re-persisted by the second write
         self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
         self.assertEqual(reasons, ["snapshot_not_stored"])
+
+    def test_async_launch_failed_first_write_re_persists_launch_time(self):
+        launched = time.time()
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        snapshot = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+        real, calls = jev.update_state, []
+
+        def flaky(path, fn, deadline=None):
+            calls.append(fn)
+            if len(calls) == 1:
+                raise TimeoutError("state lock")
+            return real(path, fn, deadline)
+
+        with mock.patch.object(jev, "_critic_launch_snapshot", lambda p, d: (snapshot, None)), \
+                mock.patch.object(jev, "update_state", flaky):
+            jev.agent_done(payload, self.cfg, None, self.logs.append, now=lambda: launched,
+                           state_dir=self.state_dir)
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertEqual(state["critic_started"], {"crit-1": launched})
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        self.assertEqual([e.get("reason") for e in self.logs
+                          if e.get("event") == "critic_ledger"], ["snapshot_not_stored"])
+        # The hand-back, much later, stamps critic_ts from the launch and records nothing.
+        self.logs.clear()
+        with mock.patch.object(jev, "_record_critic_run") as record:
+            jev.agent_done(self.handback_payload(agent_type="critic", agent_id="crit-1",
+                                                 message="RESULT: SHIP\nEVIDENCE: x\n"
+                                                         "CONFIDENCE: high\nUNVERIFIED: none"),
+                           self.cfg, None, self.logs.append, now=lambda: launched + 500,
+                           state_dir=self.state_dir)
+        record.assert_not_called()
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertEqual(state["critic_ts"], launched)
+        self.assertEqual([(e["decision"], e.get("reason")) for e in self.logs
+                          if e.get("event") == "critic_ledger"],
+                         [("skipped", "no_launch_snapshot")])
+
+    def test_async_launch_failed_first_write_keeps_an_existing_launch_time(self):
+        old = {"repo": "r", "base": "a" * 40, "paths": None, "files": {"old": "100644:0"}}
+        earlier = time.time() - 500
+        jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                         lambda s: s.update(critic_started={"crit-1": earlier},
+                                            critic_snapshots={"crit-1": old}))
+        state, reasons = self._launch_with_failing_write(1)
+        self.assertEqual(state["critic_started"], {"crit-1": earlier})
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        self.assertEqual(reasons, ["snapshot_not_stored"])
+
+    def test_critic_handback_without_snapshot_logs_no_launch_snapshot(self):
+        with mock.patch.object(jev, "scoped_ledger_files") as scoped:
+            self.agent_done(self.handback_payload(agent_type="critic", agent_id="crit-9",
+                                                  message="RESULT: SHIP\nEVIDENCE: x\n"
+                                                          "CONFIDENCE: high\nUNVERIFIED: none"))
+        scoped.assert_not_called()
+        self.assertEqual([(e["event"], e["decision"], e.get("reason")) for e in self.logs],
+                         [("critic_ledger", "skipped", "no_launch_snapshot")])
+
+    def test_critic_report_with_unreadable_state_logs_state_unavailable(self):
+        # A lock timeout is not "no snapshot": the stored one may still be there.
+        cfg = {**self.cfg, "features": {**self.cfg["features"], "report_check": False}}
+        report = "RESULT: SHIP\nEVIDENCE: x\nCONFIDENCE: high\nUNVERIFIED: none"
+        for payload in (self.handback_payload(agent_type="critic", agent_id="crit-9",
+                                              message=report),
+                        self.report_payload(subagent_type="critic", text=report)):
+            with self.subTest(tool_name=payload["tool_name"]):
+                self.logs.clear()
+                with mock.patch.object(jev, "update_state", side_effect=TimeoutError("lock")), \
+                        mock.patch.object(jev, "_record_critic_run") as record:
+                    self.agent_done(payload, cfg)
+                record.assert_not_called()
+                self.assertEqual([(e["decision"], e.get("reason")) for e in self.logs
+                                  if e.get("event") == "critic_ledger"],
+                                 [("skipped", "state_unavailable")])
+
+    def test_async_launch_failed_first_write_beside_another_critic_in_flight(self):
+        # The hand-back stamps this critic's own launch time, as after an unfailed launch,
+        # not the other critic's earlier one.
+        other = time.time() - 500
+        jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                         lambda s: s.update(critic_started={"crit-0": other}))
+        before = time.time()
+        state, reasons = self._launch_with_failing_write(1)
+        launched = state["critic_started"].get("crit-1")
+        self.assertGreaterEqual(launched, before)
+        self.assertEqual(state["critic_started"], {"crit-0": other, "crit-1": launched})
+        self.assertEqual(reasons, ["snapshot_not_stored"])
+        with mock.patch.object(jev, "_record_critic_run") as record:
+            self.agent_done(self.handback_payload(agent_type="critic", agent_id="crit-1",
+                                                  message="RESULT: SHIP\nEVIDENCE: x\n"
+                                                          "CONFIDENCE: high\nUNVERIFIED: none"))
+        record.assert_not_called()
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertEqual(state["critic_ts"], launched)
+        self.assertEqual(state["critic_started"], {"crit-0": other})
+
+    def test_async_launch_failed_first_write_after_its_hand_back_leaves_no_entry(self):
+        # The hand-back landed before the second write: a re-persisted entry would never
+        # be popped, and every unknown-id critic would be dated from this launch.
+        payload = self.report_payload(subagent_type="critic", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        snapshot = {"repo": "r", "base": "b" * 40, "paths": None, "files": {"a": "100644:1"}}
+        real, calls = jev.update_state, []
+
+        def flaky(path, fn, deadline=None):
+            calls.append(fn)
+            if len(calls) == 1:
+                raise TimeoutError("state lock")
+            return real(path, fn, deadline)
+
+        def hand_back_meanwhile(prompt, deadline):
+            self.agent_done(self.handback_payload(agent_type="critic", agent_id="crit-1",
+                                                  message="RESULT: SHIP\nEVIDENCE: x\n"
+                                                          "CONFIDENCE: high\nUNVERIFIED: none"))
+            return snapshot, None
+
+        launch = time.time()
+        # Equal time pins the >= in the re-persist guard. An earlier hand-back clock is a
+        # known residual: critic_ts stays below the launch, so the entry is re-persisted.
+        for name, hand_back_at, started in (("equal", launch, {}),
+                                            ("later", launch + 5, {}),
+                                            ("earlier", launch - 5, {"crit-1": launch})):
+            with self.subTest(name):
+                state_dir = self.state_dir / name
+                calls.clear()
+
+                def hand_back_meanwhile(prompt, deadline, at=hand_back_at, state_dir=state_dir):
+                    jev.agent_done(self.handback_payload(
+                                       agent_type="critic", agent_id="crit-1",
+                                       message="RESULT: SHIP\nEVIDENCE: x\n"
+                                               "CONFIDENCE: high\nUNVERIFIED: none"),
+                                   self.cfg, None, self.logs.append, now=lambda: at,
+                                   state_dir=state_dir)
+                    return snapshot, None
+
+                with mock.patch.object(jev, "_critic_launch_snapshot", hand_back_meanwhile), \
+                        mock.patch.object(jev, "update_state", flaky):
+                    jev.agent_done(payload, self.cfg, None, self.logs.append,
+                                   now=lambda: launch, state_dir=state_dir)
+                self.assertEqual(len(calls), 3)
+                state = jev.load_session_state("sess1", state_dir)
+                self.assertEqual(state["critic_started"], started)
+                self.assertEqual(state["critic_ts"], hand_back_at)
+                self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+
+    def test_async_launch_failed_first_write_replaces_an_expired_launch_time(self):
+        old = {"repo": "r", "base": "a" * 40, "paths": None, "files": {"old": "100644:0"}}
+        jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                         lambda s: s.update(critic_started={"crit-1": time.time() - 90000},
+                                            critic_snapshots={"crit-1": old}))
+        before = time.time()
+        state, reasons = self._launch_with_failing_write(1)
+        self.assertEqual(list(state["critic_started"]), ["crit-1"])
+        self.assertGreaterEqual(state["critic_started"]["crit-1"], before)
+        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        self.assertEqual(reasons, ["snapshot_not_stored"])
+
+    def test_async_launch_failed_first_write_repairs_a_junk_launch_map(self):
+        for junk in ("abc", [1, 2], 7):
+            with self.subTest(junk=junk):
+                self.logs.clear()
+                jev.update_state(jev.session_state_path("sess1", self.state_dir),
+                                 lambda s: (s.clear(), s.update(critic_started=junk))[0])
+                before = time.time()
+                state, reasons = self._launch_with_failing_write(1)
+                self.assertEqual(list(state["critic_started"]), ["crit-1"])
+                self.assertGreaterEqual(state["critic_started"]["crit-1"], before)
+                self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+                self.assertEqual(reasons, ["snapshot_not_stored"])
 
     def test_async_launch_second_write_failing_keeps_launch_time(self):
         for after_mutate in (False, True):
@@ -2863,10 +3039,11 @@ class AgentDoneTests(unittest.TestCase):
         # Fail closed: after this launch's first write is lost, a same-id snapshot cannot
         # be told apart from an earlier launch's, so even a duplicate hook's is dropped.
         theirs = {"repo": "r", "base": "c" * 40, "paths": None, "files": {"a": "100644:2"}}
+        theirs_started = time.time() - 60
 
         def duplicate_meanwhile(prompt, deadline):
             jev.update_state(jev.session_state_path("sess1", self.state_dir),
-                             lambda s: s.update(critic_started={"crit-1": 1.0},
+                             lambda s: s.update(critic_started={"crit-1": theirs_started},
                                                 critic_snapshots={"crit-1": theirs}))
             return theirs, None
 
@@ -2887,7 +3064,7 @@ class AgentDoneTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         state = jev.load_session_state("sess1", self.state_dir)
         self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
-        self.assertEqual(state["critic_started"], {"crit-1": 1.0})
+        self.assertEqual(state["critic_started"], {"crit-1": theirs_started})
         self.assertEqual([e.get("reason") for e in self.logs
                           if e.get("event") == "critic_ledger"], ["snapshot_not_stored"])
 
@@ -3363,7 +3540,8 @@ class PersistenceFailureTests(unittest.TestCase):
                            state_dir=self.state_dir)
         jev.agent_done({"tool_name": "SubagentHandback", "agent_type": "critic", "session_id": "s"},
                        self.cfg, None, self.logs.append, state_dir=self.state_dir)
-        self.assertEqual(self.logs[-1]["decision"], "ok")  # the report check still ran
+        checks = [e for e in self.logs if e.get("event") != "critic_ledger"]
+        self.assertEqual(checks[-1]["decision"], "ok")  # the report check still ran
 
     def test_handback_deny_returned_when_persistence_fails(self):
         payload = {"agent_type": "builder", "agent_id": "a", "session_id": "sess1",
@@ -3472,6 +3650,26 @@ class MainFailClosedTests(unittest.TestCase):
                 mock.patch.object(sys, "stdout", new_callable=mock.Mock) as out:
             self.assertEqual(jev.main(), 0)
         return "".join(call.args[0] for call in out.write.call_args_list)
+
+    def test_decision_log_lines_carry_the_session_tag(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log_path = Path(temp) / "jev.log"
+            cfg = {**jev.load_config(Path("/nonexistent/config.json")), "log_path": str(log_path)}
+            payload = {"tool_name": "Bash", "session_id": "abcdef123456",
+                       "tool_input": {"command": "ls"}}
+
+            def fake_gate(payload, cfg, log_fn):
+                log_fn({"event": "gate", "decision": "allow"})
+
+            with mock.patch.object(sys, "argv", ["jev-guard.py", "gate"]), \
+                    mock.patch.object(sys, "stdin", mock.Mock(buffer=mock.Mock(
+                        read=lambda: json.dumps(payload).encode("utf-8")))), \
+                    mock.patch.object(jev, "load_config", return_value=cfg), \
+                    mock.patch.object(jev, "gate", fake_gate):
+                self.assertEqual(jev.main(), 0)
+            lines = [json.loads(line) for line in log_path.read_text("utf-8").splitlines()]
+        self.assertTrue(lines)
+        self.assertEqual({line["session"] for line in lines}, {"abcdef12"})
 
     def test_crash_denies_push_and_deploy(self):
         for command in ("git push origin main", "git -C x push -f", "npx heroku releases",
