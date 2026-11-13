@@ -483,3 +483,22 @@ def write_log(cfg, entry, path=None):
             handle.write(line + "\n")
     except Exception:
         pass
+
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def session_log(cfg, session_id, path=None):
+    """A log_fn for write_log that adds `session` (the first 8 characters of the hook
+    payload's session id) to each entry, so lines of concurrent sessions sharing the log
+    can be told apart. No tag for a missing or malformed id; an entry's own `session`
+    is kept."""
+    tag = (session_id[:8] if isinstance(session_id, str) and SESSION_ID_RE.fullmatch(session_id)
+           else None)
+
+    def log_fn(entry):
+        if tag is not None and isinstance(entry, dict):
+            entry = {"session": tag, **entry}
+        write_log(cfg, entry, path)
+
+    return log_fn

@@ -368,7 +368,11 @@ Each line of `relay/jev-log.jsonl` (mode 0600; on Windows, a new log's ACL is
 limited to the current user; rotated to `jev-log.jsonl.1` past 1 MiB) records the feature, the decision, the classifier's numbers, and the
 latency. The Windows ACL is only set once, when the log file is created: a
 `jev-log.jsonl` left behind by an earlier version of this script keeps
-whatever ACL it already had. `route` records `desc_hash`, a short hash of the task description, so
+whatever ACL it already had. Decision lines the Claude Code hooks (`jev-guard.py`,
+`jev-route.py`) write carry `session`, the first 8 characters of the Claude
+session id, so the lines of concurrent sessions sharing the log can be told
+apart (none when the payload has no usable id; `"kind": "usage"` lines, the
+pre-push git hook, the Codex hook, `ask-jev.py` and the relay add none). `route` records `desc_hash`, a short hash of the task description, so
 `jev-report.py` can join routing decisions with report checks. When a
 `risk_gate` or `report_check` call fails (no key, HTTP error, timeout, bad
 answer), its line adds `"reason": "unavailable"` and `error`, the exception
@@ -574,7 +578,13 @@ staged into it or unstaged from it during the run records nothing; a file change
 and changed back to identical content in between is not detected, and the recorded
 entry is that identical content). A foreground critic has no launch event, so no
 snapshot, and never records (logged as skipped, `no_launch_snapshot`): its file set at
-the end cannot show what it was handed. A scope with no changed files records nothing
+the end cannot show what it was handed. The same reason is logged for an async critic's
+hand-back that finds no stored snapshot (its launch had no usable scope or could not
+store one, or an earlier hand-back of a resumed critic already took it), so a critic
+with no snapshot whose run produces both a hand-back and a completed result logs it
+for each; an event that could not lock or update the session state logs
+`state_unavailable` instead (a state file that cannot be parsed reads as empty, so
+that case logs `no_launch_snapshot`). A scope with no changed files records nothing
 (`no_files`). Each entry is `<mode>:<blob>`, so a mode change (executable bit, symlink)
 needs review. The mode comes from the index for a tracked file where git does not
 trust the executable bit (Windows, or `core.fileMode=false`), else from the file

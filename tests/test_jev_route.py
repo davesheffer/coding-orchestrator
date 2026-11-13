@@ -32,7 +32,7 @@ cfg = jev.load_config(sys.argv[2])
 cfg["enabled"] = True
 bodies, logs = [], []
 jev.load_config = lambda: cfg
-jev.write_log = lambda cfg, entry: logs.append(entry)
+jev_client.write_log = lambda cfg, entry, path=None: logs.append(entry)
 jev_client.http_classify = lambda body, cfg, key: (
     bodies.append(body), {"answers": {"model": {"choice": "opus", "confidence": 0.9}}})[1]
 jev.main()
@@ -668,7 +668,7 @@ class SubprocessTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
 
     def test_utf8_stdin_is_decoded_whatever_the_locale(self):
-        payload = {"tool_name": "Agent", "tool_input": {
+        payload = {"tool_name": "Agent", "session_id": "abcdef123456", "tool_input": {
             "description": UNICODE_TEXT, "prompt": UNICODE_TEXT, "subagent_type": "general-purpose"}}
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         for encoding in (None, "cp1252"):
@@ -680,6 +680,7 @@ class SubprocessTests(unittest.TestCase):
                 seen = json.loads(result.stderr.decode("ascii"))
                 self.assertEqual(seen["bodies"][0]["state"]["description"], UNICODE_TEXT)
                 self.assertEqual(seen["bodies"][0]["state"]["prompt"], UNICODE_TEXT)
+                self.assertEqual(seen["logs"][0]["session"], "abcdef12")
                 self.assertEqual(seen["logs"][0]["desc_hash"],
                                  jev.hashlib.sha256(UNICODE_TEXT.encode("utf-8")).hexdigest()[:12])
                 out = json.loads(result.stdout.decode("ascii"))

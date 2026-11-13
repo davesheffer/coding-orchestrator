@@ -30,7 +30,7 @@ from jev_client import (  # noqa: E402  (re-exported for callers and tests)
     AGENT_MODELS, CONFIG_PATH, DEFAULTS, LOG_PATH, MAX_DEADLINE_SECONDS, MAX_LOG_BYTES, ROOT, TIER_RANK,
     coerce_confidence, stronger_tier,
     api_key, ask, call_with_deadline, effective_timeout, elapsed_ms, endpoint_allowed, feature_enabled,
-    http_classify, load_config, safe_repr, timestamp, write_log)
+    http_classify, load_config, safe_repr, session_log, timestamp, write_log)
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # Claude Code model aliases that run a known tier (opusplan plans with opus).
@@ -280,7 +280,8 @@ def main():
         # Hook payloads are UTF-8 whatever the locale (e.g. cp1255 on Windows).
         payload = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
         cfg = load_config()
-        output = decide(payload, cfg, None, lambda entry: write_log(cfg, entry))
+        log_fn = session_log(cfg, payload.get("session_id") if isinstance(payload, dict) else None)
+        output = decide(payload, cfg, None, log_fn)
         if output is not None:
             sys.stdout.write(json.dumps(output))
     except Exception:
