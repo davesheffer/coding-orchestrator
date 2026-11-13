@@ -582,9 +582,10 @@ the end cannot show what it was handed. The same reason is logged for an async c
 hand-back that finds no stored snapshot (its launch had no usable scope or could not
 store one, or an earlier hand-back of a resumed critic already took it), so a critic
 with no snapshot whose run produces both a hand-back and a completed result logs it
-for each; an event that could not lock or update the session state logs
-`state_unavailable` instead (a state file that cannot be parsed reads as empty, so
-that case logs `no_launch_snapshot`). A scope with no changed files records nothing
+for each; an event whose state update failed before it looked for the snapshot (the
+lock wait timed out, say) logs `state_unavailable` instead; a state file that cannot
+be parsed reads as empty, so that case logs `no_launch_snapshot`, as does a write
+that fails after the lookup. A scope with no changed files records nothing
 (`no_files`). Each entry is `<mode>:<blob>`, so a mode change (executable bit, symlink)
 needs review. The mode comes from the index for a tracked file where git does not
 trust the executable bit (Windows, or `core.fileMode=false`), else from the file

@@ -2876,15 +2876,34 @@ class AgentDoneTests(unittest.TestCase):
                                                           "CONFIDENCE: high\nUNVERIFIED: none"))
             return snapshot, None
 
-        before = time.time()
-        with mock.patch.object(jev, "_critic_launch_snapshot", hand_back_meanwhile), \
-                mock.patch.object(jev, "update_state", flaky):
-            self.agent_done(payload)
-        self.assertEqual(len(calls), 3)
-        state = jev.load_session_state("sess1", self.state_dir)
-        self.assertEqual(state["critic_started"], {})
-        self.assertGreaterEqual(state["critic_ts"], before)
-        self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
+        launch = time.time()
+        # Equal time pins the >= in the re-persist guard. An earlier hand-back clock is a
+        # known residual: critic_ts stays below the launch, so the entry is re-persisted.
+        for name, hand_back_at, started in (("equal", launch, {}),
+                                            ("later", launch + 5, {}),
+                                            ("earlier", launch - 5, {"crit-1": launch})):
+            with self.subTest(name):
+                state_dir = self.state_dir / name
+                calls.clear()
+
+                def hand_back_meanwhile(prompt, deadline, at=hand_back_at, state_dir=state_dir):
+                    jev.agent_done(self.handback_payload(
+                                       agent_type="critic", agent_id="crit-1",
+                                       message="RESULT: SHIP\nEVIDENCE: x\n"
+                                               "CONFIDENCE: high\nUNVERIFIED: none"),
+                                   self.cfg, None, self.logs.append, now=lambda: at,
+                                   state_dir=state_dir)
+                    return snapshot, None
+
+                with mock.patch.object(jev, "_critic_launch_snapshot", hand_back_meanwhile), \
+                        mock.patch.object(jev, "update_state", flaky):
+                    jev.agent_done(payload, self.cfg, None, self.logs.append,
+                                   now=lambda: launch, state_dir=state_dir)
+                self.assertEqual(len(calls), 3)
+                state = jev.load_session_state("sess1", state_dir)
+                self.assertEqual(state["critic_started"], started)
+                self.assertEqual(state["critic_ts"], hand_back_at)
+                self.assertNotIn("crit-1", state.get("critic_snapshots", {}))
 
     def test_async_launch_failed_first_write_replaces_an_expired_launch_time(self):
         old = {"repo": "r", "base": "a" * 40, "paths": None, "files": {"old": "100644:0"}}
@@ -3564,6 +3583,26 @@ class MainFailClosedTests(unittest.TestCase):
                 mock.patch.object(sys, "stdout", new_callable=mock.Mock) as out:
             self.assertEqual(jev.main(), 0)
         return "".join(call.args[0] for call in out.write.call_args_list)
+
+    def test_decision_log_lines_carry_the_session_tag(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log_path = Path(temp) / "jev.log"
+            cfg = {**jev.load_config(Path("/nonexistent/config.json")), "log_path": str(log_path)}
+            payload = {"tool_name": "Bash", "session_id": "abcdef123456",
+                       "tool_input": {"command": "ls"}}
+
+            def fake_gate(payload, cfg, log_fn):
+                log_fn({"event": "gate", "decision": "allow"})
+
+            with mock.patch.object(sys, "argv", ["jev-guard.py", "gate"]), \
+                    mock.patch.object(sys, "stdin", mock.Mock(buffer=mock.Mock(
+                        read=lambda: json.dumps(payload).encode("utf-8")))), \
+                    mock.patch.object(jev, "load_config", return_value=cfg), \
+                    mock.patch.object(jev, "gate", fake_gate):
+                self.assertEqual(jev.main(), 0)
+            lines = [json.loads(line) for line in log_path.read_text("utf-8").splitlines()]
+        self.assertTrue(lines)
+        self.assertEqual({line["session"] for line in lines}, {"abcdef12"})
 
     def test_crash_denies_push_and_deploy(self):
         for command in ("git push origin main", "git -C x push -f", "npx heroku releases",

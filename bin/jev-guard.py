@@ -3344,12 +3344,15 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     records them only when the scope's files are still exactly that snapshot. A
     foreground critic has no launch event, so no snapshot, and never records
     (skipped reason "no_launch_snapshot", also logged for a hand-back with no stored
-    snapshot; "state_unavailable" when the session state could not be locked or
-    updated): what it reviewed cannot be told from what changed during its run. If the
-    first write fails, the second re-persists the launch time, as an unfailed launch
-    would have stored it (unless critic_ts already reached it), and does not store the
-    snapshot (unless that first write is found to have landed after all); only when
-    both writes fail is the launch time lost.
+    snapshot; "state_unavailable" when the state update failed before it looked for the
+    snapshot, a lock wait that timed out, say): what it reviewed cannot be told from
+    what changed during its run. If the first write fails, the second re-persists the
+    launch time, as an unfailed launch would have stored it, and does not store the
+    snapshot (unless that first write is found to have landed after all). The launch
+    time is then lost, and the hand-back stamps critic_ts at hand-back time as it did
+    before the re-persist existed, when the second write fails too or when critic_ts
+    had already reached the launch time before the second write ran (nothing is
+    re-persisted then).
 
     State-lock waits and the classifier call share one monotonic `deadline` (by default
     SHORT_HOOK_BUDGET_SECONDS from entry).
@@ -3479,10 +3482,19 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                         # or a later relaunch), so the hand-back still stamps critic_ts
                         # from the launch. This runs only after the check above, so it can
                         # never make that one true. Not when critic_ts already reached this
-                        # launch: the entry could no longer move it for its own critic, and
-                        # if that stamp was this critic's hand-back arriving before this
-                        # write, nothing would pop the entry and every critic with an
-                        # unknown id would be dated from it until it expires.
+                        # launch: the entry could no longer move it for its own critic
+                        # (whose hand-back, finding no entry, stamps hand-back time, as
+                        # before this re-persist existed), and if that stamp was this
+                        # critic's hand-back arriving before this write, nothing would pop
+                        # the entry and every critic with an unknown id would be dated
+                        # from it until it expires. Known residual: such an early
+                        # hand-back leaves critic_ts below this launch when another critic
+                        # launched earlier is in flight, when the id held an earlier
+                        # unexpired entry that the hand-back popped, when the hand-back's
+                        # own state update failed, or when its clock read earlier. The
+                        # entry is then re-persisted and stays until it expires. That only
+                        # dates unknown-id critics earlier (more reviews asked, never
+                        # fewer).
                         snapshots.pop(agent_id, None)
                         restored = _prune_critic_started(
                             dict(started) if isinstance(started, dict) else {}, now_value)
@@ -3496,11 +3508,12 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                         return
                     s["critic_snapshots"] = snapshots
 
-                # Residual risk: after a failed first write, only if this write fails too or
-                # never runs (the hook is killed during the snapshot's git work) is the
-                # launch time not persisted and an earlier launch's same-id snapshot kept.
-                # The two writes share one deadline, so a first write that waited out the
-                # lock leaves this one little time.
+                # Residual risk: after a failed first write, the launch time is not
+                # persisted if this write fails too or never runs (the hook is killed
+                # during the snapshot's git work), and an earlier launch's same-id
+                # snapshot is then kept; it is also not persisted when critic_ts already
+                # reached it (see finish_critic_launch). The two writes share one deadline,
+                # so a first write that waited out the lock leaves this one little time.
                 try:
                     update_state(state_path, finish_critic_launch, deadline)
                 except Exception:
