@@ -20,6 +20,7 @@ Hooks must never break a prompt: every hook path swallows errors and exits 0.
 """
 import ctypes
 import datetime
+import io
 import json
 import locale
 import os
@@ -337,6 +338,8 @@ def sweep(cfg):
     cutoff = time.time() - cfg["handoff_ttl_hours"] * 3600
     for folder in (HANDOFFS, STATE, CHECKPOINTS, INPLACE):
         for p in folder.glob("*"):
+            if folder == STATE and p.name in HOOK_LOGS:
+                continue  # the hook log is not session state; it rotates by size instead
             try:
                 if p.stat().st_mtime < cutoff:
                     if p.is_dir() and p.name.startswith(".private-"):
@@ -1348,20 +1351,82 @@ def cmd_status(argv):
                       "config": cfg}))
 
 
+HOOK_LOG_CAP = 1_000_000
+HOOK_LOGS = ("hook-log.jsonl", "hook-log.jsonl.1")
+HOOK_OUTCOMES = {"prompt": "inject", "stop": "block", "precompact": "pending", "session-start": "inject"}
+
+
+def log_hook(hook, session_id, outcome, chars):
+    """Append one metadata line per hook run; never prompt, transcript or payload text. Fails open."""
+    try:
+        session = (session_id[:8] if isinstance(session_id, str)
+                   and re.fullmatch(r"[A-Za-z0-9_-]+", session_id) else None)
+        line = json.dumps({"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                           "hook": hook, "session": session, "outcome": outcome, "chars": chars})
+        STATE.mkdir(parents=True, exist_ok=True)
+        path = STATE / HOOK_LOGS[0]
+        try:
+            if path.stat().st_size > HOOK_LOG_CAP:
+                os.replace(path, STATE / HOOK_LOGS[1])
+        except OSError:
+            pass  # missing, or held open elsewhere (Windows): keep appending rather than drop the line
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as log:
+            log.write(line + "\n")
+    except Exception:
+        pass
+
+
+def run_hook(cmd, fn):
+    """Run a hook so it is silent on stderr and exits 0 whatever happens.
+
+    Defence in depth: the installed shell form also has `2>/dev/null || true`. os._exit skips interpreter
+    shutdown, where a closed stdout would otherwise turn the exit code into 120.
+    """
+    session_id, outcome, out = None, "none", io.StringIO()
+    real_stdout = sys.stdout
+    try:
+        try:
+            for stream in (sys.stdin, sys.stdout):
+                if hasattr(stream, "reconfigure"):
+                    stream.reconfigure(encoding="utf-8")
+            raw = sys.stdin.read()
+            sys.stdin = io.StringIO(raw)
+            try:
+                payload = json.loads(raw)
+                session_id = payload.get("session_id") if isinstance(payload, dict) else None
+            except Exception:
+                pass
+            sys.stdout = out
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - a hook must fail open, whatever happened
+            outcome = f"error:{type(exc).__name__}"
+        finally:
+            sys.stdout = real_stdout
+        text = out.getvalue()
+        if text and not outcome.startswith("error:"):
+            outcome = HOOK_OUTCOMES[cmd]
+        try:
+            real_stdout.write(text)
+            real_stdout.flush()
+        except BaseException:
+            text = ""
+        log_hook(cmd, session_id, outcome, len(text))
+    except BaseException:
+        pass
+    os._exit(0)
+
+
 def main():
-    # Hooks and piped handoffs use UTF-8, independent of the Windows code page.
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
     cmd, rest = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
     hooks = {"prompt": cmd_prompt, "stop": cmd_stop, "precompact": cmd_precompact,
              "session-start": cmd_session_start}
     if cmd in hooks:
-        try:
-            hooks[cmd]()
-        except Exception:
-            pass
-        sys.exit(0)
+        run_hook(cmd, hooks[cmd])
+    # Piped handoffs use UTF-8, independent of the Windows code page.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     if cmd == "handoff":
         return cmd_handoff(rest)
     if cmd == "checkpoint":
