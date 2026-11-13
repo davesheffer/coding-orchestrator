@@ -3,7 +3,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider antigravity",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.54.0 hunch hook --provider antigravity",
         "timeout": 15
       }
     ],
@@ -13,7 +13,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider antigravity",
+            "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.54.0 hunch hook --provider antigravity",
             "timeout": 15
           }
         ]
@@ -22,7 +22,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.43.0 hunch hook --provider antigravity",
+        "command": "npx -y --package=hunch-exact@npm:@davesheffer/hunch@1.54.0 hunch hook --provider antigravity",
         "timeout": 15
       }
     ]

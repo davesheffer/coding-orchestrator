@@ -21,6 +21,7 @@ relay/handoffs/
 .hunch/events.log
 .hunch/pending-commit-repairs.json
 .hunch/dropped-commit-repairs.json
+.hunch/pending-doc-rules.json
 .hunch-private/
 # <<< hunch <<<
 .playwright-mcp/
