@@ -22,6 +22,18 @@ ZERO = "0" * 40
 APPROVE = "RESULT: SHIP\nno findings\nEVIDENCE: read the diff\nCONFIDENCE: high\n"
 
 
+def record_unscoped(cwd):
+    """Seed the critic ledger with every file the repository at `cwd` changed but has not
+    pushed (critic_ledger_files), as one approval; nothing without a single base or when
+    a file is unhashable. A test fixture: the hooks record only an async critic's
+    REVIEW-SCOPE, after its approving reply, against its launch snapshot."""
+    found = jev.critic_ledger_files(cwd)
+    if found is None:
+        return
+    path, files, _top, base = found
+    jev._merge_ledger(path, files, base.lower() if isinstance(base, str) else None, None)
+
+
 def entries(ledger):
     """{file: "<mode>:<blob>" or deleted} across a ledger's [{"base", "ts", "files"}]
     approvals, the newest approval winning."""
@@ -108,7 +120,7 @@ class GateTests(unittest.TestCase):
 
     def test_covered_by_ledger_allowed(self):
         head = self.commit("a.txt", "two\n")
-        jev.record_critic_ledger(str(self.repo))
+        record_unscoped(str(self.repo))
         code, err = self.run_gate([f"refs/heads/main {head} refs/heads/main {self.base}"])
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(self.calls, [])
@@ -132,7 +144,7 @@ class GateTests(unittest.TestCase):
 
     def test_edit_after_review_needs_review_again(self):
         self.commit("a.txt", "two\n")
-        jev.record_critic_ledger(str(self.repo))
+        record_unscoped(str(self.repo))
         head = self.commit("a.txt", "three\n")
         code, _ = self.run_gate([f"refs/heads/main {head} refs/heads/main {self.base}"])
         self.assertEqual(code, 1)
@@ -179,7 +191,7 @@ class GateTests(unittest.TestCase):
         git(["commit", "-am", "drop a"], self.repo)
         head = git(["rev-parse", "HEAD"], self.repo)
         self.assertEqual(self.run_gate([f"refs/heads/main {head} refs/heads/main {self.base}"])[0], 1)
-        jev.record_critic_ledger(str(self.repo))
+        record_unscoped(str(self.repo))
         self.assertEqual(self.run_gate([f"refs/heads/main {head} refs/heads/main {self.base}"])[0], 0)
 
     def test_unreadable_range_refused(self):
@@ -200,7 +212,7 @@ class GateTests(unittest.TestCase):
         head_x = self.commit("a.txt", "two\n")
         git(["checkout", "main"], self.repo)
         head_main = self.commit("a.txt", "three\n")
-        jev.record_critic_ledger(str(self.repo))  # reviews a.txt at "three" only
+        record_unscoped(str(self.repo))  # reviews a.txt at "three" only
         code, err = self.run_gate([f"refs/heads/x {head_x} refs/heads/x {ZERO}",
                                    f"refs/heads/main {head_main} refs/heads/main {self.base}"])
         self.assertEqual(code, 1)
@@ -213,7 +225,7 @@ class GateTests(unittest.TestCase):
         git(["push", "--no-verify", "origin", "main"], self.repo)
         git(["checkout", "-b", "local", self.base], self.repo)
         self.commit("b.txt", "local\n")
-        jev.record_critic_ledger(str(self.repo))  # reviews b.txt only
+        record_unscoped(str(self.repo))  # reviews b.txt only
         git(["merge", "-s", "ours", "-m", "merge main", "main"], self.repo)
         return upstream, git(["rev-parse", "HEAD"], self.repo)
 
@@ -225,7 +237,7 @@ class GateTests(unittest.TestCase):
 
     def test_recorder_covers_ours_merge_revert(self):
         upstream, merge = self.ours_merge()
-        jev.record_critic_ledger(str(self.repo))
+        record_unscoped(str(self.repo))
         ledger = entries(jev.load_ledger(jev.ledger_path(str(self.repo))))
         self.assertEqual(ledger.get("a.txt"), "100644:" + git(["rev-parse", "HEAD:a.txt"], self.repo))
         code, err = self.run_gate([f"refs/heads/local {merge} refs/heads/main {upstream}"])
@@ -240,7 +252,7 @@ class GateTests(unittest.TestCase):
             local = git(["rev-parse", "HEAD"], self.repo)
         else:
             local = self.commit("a.txt", "v2\n")
-        jev.record_critic_ledger(str(self.repo))
+        record_unscoped(str(self.repo))
         git(["checkout", "-b", "upstream", self.base], self.repo)
         up = self.commit("a.txt", "v3\n")
         git(["push", "--no-verify", "origin", "upstream:main"], self.repo)
@@ -297,7 +309,7 @@ class GateTests(unittest.TestCase):
                                             f"{self.base}"])[0], 1)
         # Recording over it upgrades it to v3, dropping the old entries.
         path.write_text(json.dumps({**v1, **v2}), encoding="utf-8")
-        jev.record_critic_ledger(str(self.repo))
+        record_unscoped(str(self.repo))
         data = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(data["version"], 3)
         self.assertEqual(len(data["approvals"]), 1)
@@ -747,7 +759,7 @@ class GateTests(unittest.TestCase):
 
     def test_mode_change_needs_review(self):
         self.commit("x.sh", "../../outside/target")
-        jev.record_critic_ledger(str(self.repo))
+        record_unscoped(str(self.repo))
         git(["push", "--no-verify", "origin", "main"], self.repo)
         published = git(["rev-parse", "HEAD"], self.repo)
         blob = git(["rev-parse", "HEAD:x.sh"], self.repo)
@@ -996,7 +1008,7 @@ class GateTests(unittest.TestCase):
         git(["checkout", "-q", "--orphan", "solo"], self.repo)
         git(["rm", "-q", "-f", "a.txt"], self.repo)
         head = self.commit("r.txt", "root\n")
-        jev.record_critic_ledger(str(self.repo))  # no single base: records nothing
+        record_unscoped(str(self.repo))  # no single base: records nothing
         self.assertEqual(jev.load_ledger(jev.ledger_path(str(self.repo))), [])
         self.assertEqual(self.run_gate(self.push_line(head, ZERO, "solo"))[0], 1)
 
@@ -1153,7 +1165,7 @@ class GateTests(unittest.TestCase):
 
     def test_replace_refs_do_not_hide_content(self):
         good = self.commit("a.txt", "reviewed\n")
-        jev.record_critic_ledger(str(self.repo))
+        record_unscoped(str(self.repo))
         git(["checkout", "-q", "-b", "evil", self.base], self.repo)
         bad = self.commit("a.txt", "evil\n")
         git(["replace", bad, good], self.repo)
