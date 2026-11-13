@@ -43,10 +43,10 @@ def entries(ledger):
     return merged
 
 
-def risk_response(choice="security", needs_review=0.9):
+def risk_response(choice="security", needs_review=0.9, confidence=0.9):
     return {"model": "jev-1.13.0", "answers": {
-        "risk": {"type": "choice", "choice": choice, "confidence": 0.9,
-                 "probabilities": {choice: 0.9}},
+        "risk": {"type": "choice", "choice": choice, "confidence": confidence,
+                 "probabilities": {choice: confidence}},
         "needs_review": {"type": "noul", "noul": needs_review},
     }, "usage": {}}
 
@@ -154,6 +154,17 @@ class GateTests(unittest.TestCase):
         code, _ = self.run_gate([f"refs/heads/main {head} refs/heads/main {self.base}"],
                                 self.classify(risk_response("none", 0.1)))
         self.assertEqual(code, 0)
+
+    def test_confident_class_needs_less_review_probability(self):
+        # Seen live: security at 0.98 with "needs review" 0.56 was pushed unreviewed.
+        head = self.commit("a.txt", "two\n")
+        line = f"refs/heads/main {head} refs/heads/main {self.base}"
+        for confidence, needs_review, code in ((0.98, 0.56, 1), (0.9, 0.5, 1), (0.98, 0.49, 0),
+                                               (0.89, 0.56, 0), (0.89, 0.6, 1),
+                                               (None, 0.59, 0), ("high", 0.59, 0), (None, 0.6, 1)):
+            with self.subTest(confidence=confidence, needs_review=needs_review):
+                response = risk_response("security", needs_review, confidence)
+                self.assertEqual(self.run_gate([line], self.classify(response))[0], code)
 
     def test_jev_unavailable_allows_with_warning(self):
         head = self.commit("a.txt", "two\n")

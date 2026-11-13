@@ -357,6 +357,7 @@ installed `relay/config.json`:
 | `shift_low`, `shift_high` | `0.25`, `0.75` | shift: probability-of-continuation thresholds |
 | `send_diff`, `max_diff_chars` | `true`, `12000` | risk_gate: send the truncated diff, or only the operation and file names |
 | `risk_min_probability` | `0.6` | risk_gate: minimum "needs review" probability to deny |
+| `risk_confident_class`, `risk_confident_min_probability` | `0.9`, `0.5` | risk_gate: when Jev's confidence in the risk category reaches the first, the lower second probability is enough to deny. A small change to an auth check is rated almost certainly `security` but only about as likely as not to need review. The lower bar never raises `risk_min_probability`; set it to the same value to turn the rule off |
 | `report_roles` | scout, runner, builder, critic | report_check: roles whose reports are checked |
 | `report_min_support`, `report_max_gap` | `0.5`, `0.5` | report_check: evidence-support floor and material-gap ceiling |
 | `max_report_chars` | `8000` | report_check: report text considered |

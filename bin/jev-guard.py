@@ -488,6 +488,27 @@ RISK_CRITERIA = {
 RISK_INSTRUCTIONS = "How risky is this change?"
 NEEDS_REVIEW_INSTRUCTIONS = ("This change is risky enough that an independent adversarial "
                               "reviewer should check it before it is committed or pushed.")
+
+
+def needs_critic(cfg, choice, confidence, needs_review_p):
+    """True when a judged change needs a critic review: its risk class is not `none` and
+    its "needs review" probability reaches `risk_min_probability`, or the lower
+    `risk_confident_min_probability` when Jev's confidence in the class reaches
+    `risk_confident_class`. Jev rates a small change to, say, an auth check as almost
+    certainly `security` yet only about as likely as not to need review; being that sure
+    of the class is evidence too. A missing or invalid confidence or probability never
+    lowers the bar, and the confident bar never raises it."""
+    if choice == "none" or not _is_probability(needs_review_p):
+        return False
+    bar = cfg["risk_min_probability"]
+    if _is_probability(confidence) and confidence >= cfg["risk_confident_class"]:
+        bar = min(bar, cfg["risk_confident_min_probability"])
+    return needs_review_p >= bar
+
+
+def _is_probability(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and 0.0 <= value <= 1.0)
 SUPPORTED_INSTRUCTIONS = ("The EVIDENCE (commands run, exit codes, file:line references, "
                            "observed output) concretely supports the claims in RESULT.")
 MATERIAL_GAP_INSTRUCTIONS = ("UNVERIFIED lists something material to whether RESULT is correct "
@@ -3101,9 +3122,7 @@ def gate(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state_dir=S
         log("deny", choice, confidence, None, reason="malformed", fail_closed=True)
         return fail_closed_output("returned an unusable answer")
 
-    risky = (choice != "none" and needs_review_p is not None
-             and needs_review_p >= cfg["risk_min_probability"])
-    if not risky:
+    if not needs_critic(cfg, choice, confidence, needs_review_p):
         log("allow", choice, confidence, needs_review_p)
         return None
 
