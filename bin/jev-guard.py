@@ -91,7 +91,7 @@ REPLACE_RETRY_SECONDS = 0.05
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_client import (  # noqa: E402  (re-exported for callers and tests)
     DEFAULTS, ROOT, ask, coerce_confidence, config_number, elapsed_ms, feature_enabled, load_config,
-    noul, resolve_executable, timestamp, write_log)
+    noul, resolve_executable, session_log, timestamp, write_log, SESSION_ID_RE)
 
 def _char_limit(cfg, key):
     """cfg[key] as a non-negative whole number of characters; junk falls back to its default."""
@@ -100,7 +100,6 @@ def _char_limit(cfg, key):
 
 
 STATE_DIR = ROOT / "relay" / "state"
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Global options git accepts before the subcommand: -C <dir>, -c <key>=<value>, a
 # space-separated long option that takes a value (--git-dir, --work-tree, --namespace,
 # --super-prefix, --config-env), or any other --long-option (with or without =value).
@@ -551,7 +550,9 @@ def _desc_hash(description):
 
 
 def session_state_path(session_id, state_dir=STATE_DIR):
-    sid = session_id if isinstance(session_id, str) and SESSION_ID_RE.match(session_id) else "unknown"
+    # fullmatch: `$` alone would let an id with a trailing newline into the file name.
+    valid = isinstance(session_id, str) and SESSION_ID_RE.fullmatch(session_id)
+    sid = session_id if valid else "unknown"
     return Path(state_dir) / f"jev-{sid}.json"
 
 
@@ -1734,42 +1735,6 @@ def load_ledger(path):
     return _valid_approvals(data.get("approvals"))
 
 
-def _unpushed_names(top, deadline):
-    """(files changed by commits on no remote-tracking ref, plus those whose content at
-    HEAD differs from any commit those commits branch off (a merge equal to one parent
-    lists nothing under --cc), the commit that contains every such branch-off point or
-    None when there is no single one), or None on a git failure."""
-    names = _run_git(["-c", "log.showRoot=true", "log", "--format=", "--name-only", "-z",
-                      "--no-renames", "--ignore-submodules=dirty", "--cc", "HEAD", "--not",
-                      "--remotes", "--"], top, deadline)
-    commits = _run_git(["rev-list", "--boundary", "HEAD", "--not", "--remotes"], top, deadline)
-    if names is None or commits is None:
-        return None
-    names = [n for n in names.split("\0") if n]
-    words = commits.split()
-    if not words:
-        head = _run_git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], top, deadline)
-        return names, (head.strip() or None) if head else None
-    bases = [word[1:] for word in words if word.startswith("-")]
-    base = None
-    if bases:
-        newest = _run_git(["merge-base", "--independent", *bases], top, deadline)
-        newest = (newest or "").split()
-        base = newest[0] if len(newest) == 1 else None
-    else:
-        empty = _run_git(["hash-object", "-t", "tree", "--stdin"], top, deadline)
-        if not empty or not empty.strip():
-            return None
-        bases = [empty.strip()]
-    for each in bases:
-        out = _run_git(["diff", *DIFF_FORMAT_ARGS, "--name-only", "-z", "--no-renames", each,
-                        "HEAD", "--"], top, deadline)
-        if out is None:
-            return None
-        names += [n for n in out.split("\0") if n]
-    return names, base
-
-
 def _hash_worktree_files(top, names, deadline, deleted=()):
     """{file: "<mode>:<blob>" or LEDGER_DELETED} for `names` in the work tree at `top`,
     or None on a failure. Every name is in the result. A name in `deleted` (git reports
@@ -1887,33 +1852,6 @@ def _name_status(top, rev, deadline):
             if status.startswith("D"):
                 deleted.add(name)
     return names, deleted
-
-
-def critic_ledger_files(cwd, deadline=None):
-    """(ledger path, {file: current "<mode>:<blob>" or LEDGER_DELETED}, top level, base)
-    for every tracked file this repository changed but has not pushed, or None on a
-    failure. `base` is the published commit that contains every point the unpushed
-    commits branch off (HEAD when nothing is unpushed), or None when there is no single
-    one; with a base the files are those `git diff <base>` lists, else those the unpushed
-    commits and the work tree against HEAD change. Deletions are git's; untracked files,
-    untracked files are left out; symlinks, gitlinks and files missing on disk are
-    LEDGER_UNHASHABLE."""
-    deadline = min(deadline or float("inf"), time.monotonic() + LEDGER_GIT_SECONDS)
-    top = _run_git(["rev-parse", "--show-toplevel"], cwd, deadline)
-    path = ledger_path(cwd, deadline)
-    if not top or not top.strip() or path is None:
-        return None
-    top = top.strip()
-    found = _unpushed_names(top, deadline)
-    if found is None:
-        return None
-    names, base = found
-    changed = _name_status(top, base or "HEAD", deadline)
-    if changed is None:
-        return None
-    names = changed[0] if base else names + changed[0]
-    files = _hash_worktree_files(top, names, deadline, deleted=changed[1])
-    return None if files is None else (path, files, top, base)
 
 
 def _since_launch(files, launch):
@@ -3432,8 +3370,16 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     second write) and its hand-back (or completed result, by its response agentId)
     records them only when the scope's files are still exactly that snapshot. A
     foreground critic has no launch event, so no snapshot, and never records
-    (skipped reason "no_launch_snapshot"): what it reviewed cannot be told from what
-    changed during its run.
+    (skipped reason "no_launch_snapshot", also logged for a hand-back with no stored
+    snapshot; "state_unavailable" when the state update failed before it looked for the
+    snapshot, a lock wait that timed out, say): what it reviewed cannot be told from
+    what changed during its run. If the first write fails, the second re-persists the
+    launch time, as an unfailed launch would have stored it, and does not store the
+    snapshot (unless that first write is found to have landed after all). The launch
+    time is then lost, and the hand-back stamps critic_ts at hand-back time as it did
+    before the re-persist existed, when the second write fails too or when critic_ts
+    had already reached the launch time before the second write ran (nothing is
+    re-persisted then).
 
     State-lock waits and the classifier call share one monotonic `deadline` (by default
     SHORT_HOOK_BUDGET_SECONDS from entry).
@@ -3478,6 +3424,16 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
             if snapshot is not None:
                 _record_critic_run(snapshot, approved, deadline, log_fn,
                                    launch_files=snapshot["files"])
+            elif "snapshot" not in launch:
+                # The state update failed before it looked for the snapshot (a lock wait
+                # timed out, say): a stored one may still be there, so this is not "no
+                # snapshot".
+                _ledger_log(log_fn, "skipped", reason="state_unavailable")
+            else:
+                # A foreground critic, or an async one launched without a usable
+                # REVIEW-SCOPE, or whose snapshot was not stored, or whose snapshot an
+                # earlier hand-back already took.
+                _ledger_log(log_fn, "skipped", reason="no_launch_snapshot")
         return None
 
     if tool_name not in ("Agent", "Task"):
@@ -3548,15 +3504,43 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                         # concurrent duplicate's; the two cannot be told apart without
                         # comparing times, so it is dropped either way (fail closed: at
                         # worst a duplicate's approval is lost, never an old scope reused).
+                        # The launch time is re-persisted too (unless the id already has an
+                        # entry: an earlier launch's unexpired one, a concurrent duplicate
+                        # or a later relaunch), so the hand-back still stamps critic_ts
+                        # from the launch. This runs only after the check above, so it can
+                        # never make that one true. Not when critic_ts already reached this
+                        # launch: the entry could no longer move it for its own critic
+                        # (whose hand-back, finding no entry, stamps hand-back time, as
+                        # before this re-persist existed), and if that stamp was this
+                        # critic's hand-back arriving before this write, nothing would pop
+                        # the entry and every critic with an unknown id would be dated
+                        # from it until it expires. Known residual: such an early
+                        # hand-back leaves critic_ts below this launch when another critic
+                        # launched earlier is in flight, when the id held an earlier
+                        # unexpired entry that the hand-back popped, when the hand-back's
+                        # own state update failed, or when its clock read earlier. The
+                        # entry is then re-persisted and stays until it expires. That only
+                        # dates unknown-id critics earlier (more reviews asked, never
+                        # fewer).
                         snapshots.pop(agent_id, None)
+                        restored = _prune_critic_started(
+                            dict(started) if isinstance(started, dict) else {}, now_value)
+                        stamped = s.get("critic_ts")
+                        if (agent_id not in restored
+                                and not (isinstance(stamped, (int, float))
+                                         and stamped >= now_value)):
+                            restored[agent_id] = now_value
+                        s["critic_started"] = restored
                     else:
                         return
                     s["critic_snapshots"] = snapshots
 
-                # Residual risk: after a failed first write, if this write fails too or never
-                # runs (the hook is killed during the snapshot's git work), an earlier
-                # launch's same-id snapshot survives. The two writes share one deadline, so
-                # a first write that waited out the lock leaves this one little time.
+                # Residual risk: after a failed first write, the launch time is not
+                # persisted if this write fails too or never runs (the hook is killed
+                # during the snapshot's git work), and an earlier launch's same-id
+                # snapshot is then kept; it is also not persisted when critic_ts already
+                # reached it (see finish_critic_launch). The two writes share one deadline,
+                # so a first write that waited out the lock leaves this one little time.
                 try:
                     update_state(state_path, finish_critic_launch, deadline)
                 except Exception:
@@ -3612,6 +3596,8 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
                         and critic_verdict_approves(report))
             _record_critic_run(snapshot, approved, deadline, log_fn,
                                launch_files=snapshot["files"])
+        elif "snapshot" not in launch:
+            _ledger_log(log_fn, "skipped", reason="state_unavailable")  # as at hand-back
         else:
             # A foreground critic (or an async one whose hand-back already recorded).
             _ledger_log(log_fn, "skipped", reason="no_launch_snapshot")
@@ -3666,12 +3652,13 @@ def main():
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         command_text = command if isinstance(command, str) else ""
         cfg = load_config()
+        log_fn = session_log(cfg, payload.get("session_id") if isinstance(payload, dict) else None)
         if mode == "gate":
-            output = gate(payload, cfg, log_fn=lambda entry: write_log(cfg, entry))
+            output = gate(payload, cfg, log_fn=log_fn)
         elif mode == "handback":
-            output = handback(payload, cfg, log_fn=lambda entry: write_log(cfg, entry))
+            output = handback(payload, cfg, log_fn=log_fn)
         elif mode == "agent-done":
-            output = agent_done(payload, cfg, log_fn=lambda entry: write_log(cfg, entry))
+            output = agent_done(payload, cfg, log_fn=log_fn)
         else:
             output = None
         if output is not None:

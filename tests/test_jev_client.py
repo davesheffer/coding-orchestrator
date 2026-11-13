@@ -131,6 +131,39 @@ class ClientTests(unittest.TestCase):
             self.assertIsNone(jev_client.ask(cfg, "shift", {}, {}, boom, errors=errors))
             self.assertEqual(errors, ["NoApiKey"])
 
+    def logged_lines(self, path):
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_session_log_tags_entries_with_eight_characters(self):
+        path = self.dir / "jev-log.jsonl"
+        jev_client.session_log({}, "0123456789abcdef", path)({"n": 1})
+        self.assertEqual(self.logged_lines(path), [{"session": "01234567", "n": 1}])
+
+    def test_session_log_adds_no_tag_for_a_missing_or_malformed_id(self):
+        path = self.dir / "jev-log.jsonl"
+        for session_id in (None, 12345, "", "a/b", "a.b", "..", "x" * 129, "abc\n"):
+            with self.subTest(session_id=session_id):
+                path.unlink(missing_ok=True)
+                jev_client.session_log({}, session_id, path)({"n": 1})
+                self.assertEqual(self.logged_lines(path), [{"n": 1}])
+
+    def test_session_log_keeps_an_entrys_own_session(self):
+        path = self.dir / "jev-log.jsonl"
+        jev_client.session_log({}, "0123456789", path)({"session": "mine", "n": 1})
+        self.assertEqual(self.logged_lines(path), [{"session": "mine", "n": 1}])
+
+    def test_session_log_does_not_mutate_the_entry(self):
+        entry = {"n": 1}
+        with mock.patch.object(jev_client, "write_log") as write:
+            jev_client.session_log({"log": True}, "0123456789", "p")(entry)
+        self.assertEqual(entry, {"n": 1})
+        write.assert_called_once_with({"log": True}, {"session": "01234567", "n": 1}, "p")
+
+    def test_session_log_honours_log_false(self):
+        path = self.dir / "jev-log.jsonl"
+        jev_client.session_log({"log": False}, "0123456789", path)({"n": 1})
+        self.assertFalse(path.exists())
+
     def test_write_log_appends_when_rotation_fails(self):
         path = self.dir / "jev-log.jsonl"
         path.write_text("x" * (jev_client.MAX_LOG_BYTES + 1) + "\n", encoding="utf-8")

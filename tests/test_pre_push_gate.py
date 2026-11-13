@@ -22,12 +22,75 @@ ZERO = "0" * 40
 APPROVE = "RESULT: SHIP\nno findings\nEVIDENCE: read the diff\nCONFIDENCE: high\n"
 
 
+def _unpushed_names(top, deadline):
+    """(files changed by commits on no remote-tracking ref, plus those whose content at
+    HEAD differs from any commit those commits branch off (a merge equal to one parent
+    lists nothing under --cc), the commit that contains every such branch-off point or
+    None when there is no single one), or None on a git failure."""
+    names = jev._run_git(["-c", "log.showRoot=true", "log", "--format=", "--name-only", "-z",
+                          "--no-renames", "--ignore-submodules=dirty", "--cc", "HEAD",
+                          "--not", "--remotes", "--"], top, deadline)
+    commits = jev._run_git(["rev-list", "--boundary", "HEAD", "--not", "--remotes"], top,
+                           deadline)
+    if names is None or commits is None:
+        return None
+    names = [n for n in names.split("\0") if n]
+    words = commits.split()
+    if not words:
+        head = jev._run_git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], top, deadline)
+        return names, (head.strip() or None) if head else None
+    bases = [word[1:] for word in words if word.startswith("-")]
+    base = None
+    if bases:
+        newest = jev._run_git(["merge-base", "--independent", *bases], top, deadline)
+        newest = (newest or "").split()
+        base = newest[0] if len(newest) == 1 else None
+    else:
+        empty = jev._run_git(["hash-object", "-t", "tree", "--stdin"], top, deadline)
+        if not empty or not empty.strip():
+            return None
+        bases = [empty.strip()]
+    for each in bases:
+        out = jev._run_git(["diff", *jev.DIFF_FORMAT_ARGS, "--name-only", "-z", "--no-renames",
+                            each, "HEAD", "--"], top, deadline)
+        if out is None:
+            return None
+        names += [n for n in out.split("\0") if n]
+    return names, base
+
+
+def critic_ledger_files(cwd, deadline=None):
+    """(ledger path, {file: current "<mode>:<blob>" or LEDGER_DELETED}, top level, base)
+    for every tracked file this repository changed but has not pushed, or None on a
+    failure. `base` is the published commit that contains every point the unpushed
+    commits branch off (HEAD when nothing is unpushed), or None when there is no single
+    one; with a base the files are those `git diff <base>` lists, else those the unpushed
+    commits and the work tree against HEAD change. Deletions are git's; untracked files
+    are left out; symlinks, gitlinks and files missing on disk are LEDGER_UNHASHABLE."""
+    deadline = min(deadline or float("inf"), time.monotonic() + jev.LEDGER_GIT_SECONDS)
+    top = jev._run_git(["rev-parse", "--show-toplevel"], cwd, deadline)
+    path = jev.ledger_path(cwd, deadline)
+    if not top or not top.strip() or path is None:
+        return None
+    top = top.strip()
+    found = _unpushed_names(top, deadline)
+    if found is None:
+        return None
+    names, base = found
+    changed = jev._name_status(top, base or "HEAD", deadline)
+    if changed is None:
+        return None
+    names = changed[0] if base else names + changed[0]
+    files = jev._hash_worktree_files(top, names, deadline, deleted=changed[1])
+    return None if files is None else (path, files, top, base)
+
+
 def record_unscoped(cwd):
     """Seed the critic ledger with every file the repository at `cwd` changed but has not
     pushed (critic_ledger_files), as one approval; nothing without a single base or when
     a file is unhashable. A test fixture: the hooks record only an async critic's
     REVIEW-SCOPE, after its approving reply, against its launch snapshot."""
-    found = jev.critic_ledger_files(cwd)
+    found = critic_ledger_files(cwd)
     if found is None:
         return
     path, files, _top, base = found
@@ -410,8 +473,9 @@ class GateTests(unittest.TestCase):
         for prompt, reason in cases:
             with self.subTest(reason=reason):
                 logs = self.critic(prompt)
+                # The launch skips on the scope; the hand-back then has no snapshot either.
                 self.assertEqual([(e["decision"], e["reason"]) for e in logs],
-                                 [("skipped", reason)])
+                                 [("skipped", reason), ("skipped", "no_launch_snapshot")])
         self.assertEqual(self.ledger(), {})
 
     def test_blocking_or_missing_verdict_records_nothing(self):
@@ -757,7 +821,7 @@ class GateTests(unittest.TestCase):
         self.commit("a.txt", "unreviewed big change\nline2 tweaked\n")
         logs = self.critic(self.scope(base=mid))
         self.assertEqual([(e["decision"], e.get("reason")) for e in logs],
-                         [("skipped", "unpublished_base")])
+                         [("skipped", "unpublished_base"), ("skipped", "no_launch_snapshot")])
         self.assertEqual(self.ledger(), {})
 
     def test_gitlink_bump_seen_despite_ignore_submodules(self):
@@ -993,7 +1057,7 @@ class GateTests(unittest.TestCase):
             with self.subTest(base=base):
                 logs = self.critic(self.scope(base=base))
                 self.assertEqual([(e["decision"], e.get("reason")) for e in logs],
-                                 [("skipped", "bad_scope")])
+                                 [("skipped", "bad_scope"), ("skipped", "no_launch_snapshot")])
         self.assertEqual(jev.load_ledger(jev.ledger_path(str(self.repo))), [])
 
     def test_upper_case_full_base_stored_lower_case(self):
