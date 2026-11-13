@@ -20,7 +20,7 @@ Add the mod folder to `CLAUDE_CODE_PLUGIN_DIRS` in the user settings `env` block
 }
 ```
 
-The relay folder follows the same rule as `relay.py`: `$CLAUDE_HOME/relay` when an absolute `CLAUDE_HOME` is set, else `<plugin folder>/../../relay` (right for this repo and for `~/.claude/mods/relay-inplace`); the env variable above carries that resolved path, and `relay.py` warns when it differs from its own folder. Set an absolute `CLAUDE_HOME` in the settings `env` block when the mod and `relay.py` do not sit in one install (for example the mod loaded from a checkout while hooks run `~/.claude/relay/relay.py`), so both resolve the same folder. `CLAUDE_RELAY_ROOT` is no longer read.
+The relay folder follows the same rule as `relay.py`: `$CLAUDE_HOME/relay` when `CLAUDE_HOME` is set, else `<plugin folder>/../../relay` (right for this repo and for `~/.claude/mods/relay-inplace`). Use an absolute `CLAUDE_HOME`: the mod uses the value as written, while `relay.py` expands a leading `~`. `CLAUDE_RELAY_INPLACE_MOD` carries the folder the mod watches, and `relay.py` warns when it differs from its own folder. Set an absolute `CLAUDE_HOME` in the settings `env` block when the mod and `relay.py` do not sit in one install (for example the mod loaded from a checkout while hooks run `~/.claude/relay/relay.py`), so both resolve the same folder. `CLAUDE_RELAY_ROOT` is no longer read.
 
 ## Develop
 

@@ -27,8 +27,9 @@ const debug = ($: any, text: string) => {
 
 const cleanTitle = (value: string) => value.replace(/[\u0000-\u001f\u007f-\u009f"]/g, '').slice(0, TITLE_LIMIT)
 
-// Same rule as relay.py's ROOT for an absolute CLAUDE_HOME: $CLAUDE_HOME/relay, else the relay folder beside
-// the mods folder. CLAUDE_RELAY_ROOT is not read. relay.py warns when CLAUDE_RELAY_INPLACE_MOD differs from its ROOT.
+// Same rule as relay.py's ROOT: $CLAUDE_HOME/relay, else the relay folder beside the mods folder. CLAUDE_HOME is
+// used as written (relay.py expands a leading ~), so it must be absolute. CLAUDE_RELAY_ROOT is not read.
+// relay.py warns when CLAUDE_RELAY_INPLACE_MOD differs from its ROOT.
 const relayRoot = async ($: any) => {
   const home = await $.env.get('CLAUDE_HOME')
   if (typeof home === 'string' && home !== '') return `${home}/relay`

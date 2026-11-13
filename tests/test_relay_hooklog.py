@@ -16,7 +16,7 @@ SID = "abcdef1234567890"
 MARKER = "SECRET-MARKER-7f3a"
 
 
-ISOLATE = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_RELAY_INPLACE_MOD", "CLAUDE_RELAY_ROOT", "CLAUDE_RELAY_ROLLOVER")
+ISOLATE = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_RELAY_INPLACE_MOD", "CLAUDE_RELAY_ROLLOVER")
 
 
 def load_relay(name, home):
@@ -38,7 +38,7 @@ class HookLogTests(unittest.TestCase):
         self.log = self.home / "relay" / "state" / "hook-log.jsonl"
         self.env = os.environ | {"CLAUDE_HOME": str(self.home), "CLAUDE_RELAY_NO_CLIPBOARD": "1",
                                  "CLAUDE_RELAY_ROLLOVER": "inplace"}
-        for name in ISOLATE[:3]:
+        for name in ISOLATE[:2]:
             self.env.pop(name, None)
 
     def tearDown(self):

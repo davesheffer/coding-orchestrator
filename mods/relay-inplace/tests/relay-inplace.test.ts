@@ -206,6 +206,7 @@ test('session.start ignores CLAUDE_RELAY_ROOT without CLAUDE_HOME too', async ($
   const sets = await sessionStart($, on, { CLAUDE_RELAY_ROOT: 'C:/elsewhere' })
   expect(sets.length).toBe(1)
   expect(sets[0].value.endsWith('/../../relay')).toBe(true)
+  expect(sets[0].value.startsWith('C:/elsewhere')).toBe(false)
 })
 
 test('session.start: an empty CLAUDE_HOME falls back to the plugin root', async ($, on) => {
