@@ -7,14 +7,15 @@ The main session owns the request, design, root cause, judgment, verification, a
 
 | Work | Role | Model |
 |---|---|---|
-| Locate, read, summarize | scout | Sonnet |
+| Locate, read, summarize | scout | Haiku |
 | Run exact test/build commands and distill output | runner | Haiku |
 | Implement an already specified change | builder | Sonnet |
 | Adversarial review of risky changes or claims | critic | Fable |
 | Design, ambiguity, security/concurrency decisions | main session | Opus 5.5 |
 
-Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and `sonnet` for bounded reading and specified implementation; reserve `fable` for the critic. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work. If a Fable critic fails with a rate limit or overload (429/529), retry it once; if it fails again, run the same fresh critic brief on `opus` and report the substitution with the verdict. Never skip a required review or replace it with a self-review.
+Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and lookups and `sonnet` for bounded analysis and specified implementation; reserve `fable` for the critic. The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work. If a Fable critic fails with a rate limit or overload (429/529), retry it once; if it fails again, run the same fresh critic brief on `opus` and report the substitution with the verdict. Never skip a required review or replace it with a self-review.
 
+- When a subagent result falls short, escalate in order: sharpen the brief; have it self-check against a named reference or checklist; raise its effort one level; only then move to a bigger model, at a lower effort, through a fresh brief. Never repeat an identical retry.
 - Handle small tasks (about three calls or fewer, or an already-known file) directly. Required critic review still applies.
 - Launch independent, delegation-sized units together; respect concurrency limits and avoid overlapping edits. Large Workflow orchestration with dozens of agents requires an explicit user request.
 - Batch independent calls, inspect every result, bound output, and preserve real exit codes. Keep edits, dependencies, approvals, and waits sequential.

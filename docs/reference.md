@@ -30,8 +30,8 @@ sending messages stay with the orchestrator and the user's authorization.
 | Role | Responsibility | Claude Code | Codex model / reasoning |
 |---|---|---|---|
 | Orchestrator | Design, ambiguity, root causes, final verification | Opus 5.5 | GPT-6.1 Sol / medium |
-| `scout` | Read-only lookup and reconnaissance | Sonnet | GPT-6 Luna / low |
-| `runner` | Exact commands; exit codes and verbatim failures | Haiku | GPT-6 Luna / low |
+| `scout` | Read-only lookup and reconnaissance | Haiku / low effort | GPT-6 Luna / low |
+| `runner` | Exact commands; exit codes and verbatim failures | Haiku / low effort | GPT-6 Luna / low |
 | `builder` | A specified change, then its acceptance check | Sonnet | GPT-6.1 Sol / medium |
 | `critic` | Fresh-context adversarial review | Fable | GPT-6 Astra / high |
 
@@ -63,8 +63,10 @@ the mapping applies if that tier is used for a future role.
 
 The Claude installer sets `claude-opus-5-5` as the main-session default when no
 model is already selected in user settings; existing explicit choices remain
-untouched. Its named scout and builder roles use Sonnet, its runner uses Haiku, and its critic
-uses Fable. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
+untouched. Its named builder role uses Sonnet, its scout and runner use Haiku at `effort: low`, and its critic
+uses Fable. The read-only benchmark (`bin/compare-claude-readonly.py --efforts`) found Haiku matching
+Sonnet on lookup tasks at about a twelfth of the cost, with no measurable gain from medium over low effort;
+builder and critic keep the session's effort until they have their own benchmark. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
 follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
 Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
 [Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)

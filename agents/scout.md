@@ -1,7 +1,8 @@
 ---
 name: scout
 description: File and symbol lookup, read-only and enforced; a role guard limits Bash to the ro.py read verbs. Use for bounded searches and summaries that would fill the main context. Escalate ambiguous analysis to the main session.
-model: sonnet
+model: haiku
+effort: low
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: plan

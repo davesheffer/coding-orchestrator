@@ -112,9 +112,18 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(self.run_install().returncode, 0)
         guard = (self.home / "bin/turn-guard.py").as_posix()
         self.assertEqual((self.home / "bin/turn-guard.py").read_bytes(), (ROOT / "bin/turn-guard.py").read_bytes())
+        routing = {"scout": ("haiku", "low"), "runner": ("haiku", "low"),
+                   "builder": ("sonnet", None), "critic": ("fable", None)}
         for name, cap in (("scout", 20), ("runner", 15), ("builder", 60), ("critic", 40)):
             text = (self.home / "agents" / f"{name}.md").read_text(encoding="utf-8")
             self.assertNotIn("__TURN_GUARD__", text)
+            front = text.replace("\r\n", "\n").split("---\n")[1]
+            model, effort = routing[name]
+            self.assertIn(f"\nmodel: {model}\n", front)
+            if effort:
+                self.assertIn(f"\neffort: {effort}\n", front)
+            else:
+                self.assertNotIn("effort:", front)
             self.assertIn(f"maxTurns: {cap}\n", text.replace("\r\n", "\n"))
             commands = [json.loads(l.split("command:", 1)[1].strip()) for l in text.splitlines()
                         if l.strip().startswith("command:") and "role-guard" not in l]

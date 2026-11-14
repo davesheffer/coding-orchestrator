@@ -17,6 +17,26 @@ import sys
 import time
 
 
+EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+
+
+def tag(effort):
+    """The record's effort field, absent when no effort was asked for: the default output
+    format stays unchanged."""
+    return {'effort': effort} if effort else {}
+
+
+def main_model(usage):
+    """The model that did most of the run, by cost: the CLI also lists side models (a
+    cheap one for housekeeping), so the first key is not the model under test."""
+    if not isinstance(usage, dict) or not usage:
+        return None
+    def spent(name):
+        cost = usage[name].get('costUSD') if isinstance(usage[name], dict) else None
+        return cost if isinstance(cost, (int, float)) else 0
+    return max(usage, key=spent)
+
+
 def resolve_executable(name, exts=None):
     """Absolute path of `name` from PATH, never from the current directory; None if absent.
 
@@ -414,17 +434,19 @@ def run_checked(repo, *args):
     return record
 
 
-def run_one(repo, task, model, budget):
+def run_one(repo, task, model, budget, effort=None):
     command = [executable(), '-p', task['prompt'], '--model', model, '--output-format', 'json',
                '--max-budget-usd', str(budget), '--no-session-persistence', '--restricted',
                '--strict-mcp-config', '--setting-sources', '', '--tools', 'Read,Grep,Glob']
+    if effort:  # no flag at all keeps the CLI's own default effort
+        command += ['--effort', effort]
     started = time.monotonic()
     try:
         result = subprocess.run(command, cwd=repo, capture_output=True, text=True,
                                 encoding='utf-8', errors='replace', timeout=180)
     except subprocess.TimeoutExpired:
-        return {'task': task['id'], 'model': model, 'exit': 124, 'error': 'timeout'}
-    record = {'task': task['id'], 'model': model, 'exit': result.returncode,
+        return {'task': task['id'], 'model': model, **tag(effort), 'exit': 124, 'error': 'timeout'}
+    record = {'task': task['id'], 'model': model, **tag(effort), 'exit': result.returncode,
               'wall_ms': round((time.monotonic() - started) * 1000)}
     if result.returncode:
         record['error'] = result.stderr[-1000:]
@@ -446,7 +468,7 @@ def run_one(repo, task, model, budget):
         return record
     usage = output.get('modelUsage')
     hits, met = grade(task, answer)
-    record.update(actual_model=next(iter(usage), None) if isinstance(usage, dict) else None,
+    record.update(actual_model=main_model(usage),
                   cost_usd=output.get('total_cost_usd'),
                   duration_ms=output.get('duration_ms'),
                   turns=output.get('num_turns'),
@@ -461,6 +483,8 @@ def main(argv=None):
     parser.add_argument('--tasks', type=Path, default=Path(__file__).resolve().parents[1] /
                         'benchmarks/claude-readonly.json')
     parser.add_argument('--models', nargs='+', default=['haiku', 'sonnet'])
+    parser.add_argument('--efforts', nargs='+', choices=EFFORTS, default=[None],
+                        help='effort levels to run for each model; omitted, no --effort flag is sent')
     parser.add_argument('--budget', type=float, default=.20, help='USD maximum per task/model run')
     parser.add_argument('--jobs', type=int, default=2)
     parser.add_argument('--output', type=Path, required=True, help='Private JSON results file')
@@ -485,20 +509,23 @@ def main(argv=None):
     if isinstance(snapshot, dict) and snapshot.get('truncated'):
         parser.error(f'--repo has more than {SNAPSHOT_FILES} untracked and ignored files, past the '
                      'snapshot bound: every run would be unverified as read-only')
-    work = [(task, model) for task in tasks for model in args.models]
+    efforts = list(dict.fromkeys(args.efforts))
+    work = [(task, model, effort) for task in tasks for model in args.models for effort in efforts]
     results = []
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(run_checked, args.repo, task, model, args.budget): (task, model)
-                   for task, model in work}
+        futures = {pool.submit(run_checked, args.repo, task, model, args.budget,
+                               *([effort] if effort else [])): (task, model, effort)
+                   for task, model, effort in work}
         for future in as_completed(futures):
             try:
                 record = future.result()
             except Exception as exc:  # one failed run must not discard the completed ones
-                task, model = futures[future]
-                record = {'task': task.get('id'), 'model': model, 'exit': 1,
+                task, model, effort = futures[future]
+                record = {'task': task.get('id'), 'model': model, **tag(effort), 'exit': 1,
                           'error': f'{type(exc).__name__}: {exc}'}
             results.append(record)
-            print(f"{record['task']} {record['model']}: exit={record['exit']} "
+            label = record['model'] + (f"@{record['effort']}" if record.get('effort') else '')
+            print(f"{record['task']} {label}: exit={record['exit']} "
                   f"cost={record.get('cost_usd')} hits={sum(record.get('required_hits', {}).values())}"
                   f"{'' if record.get('required_met', True) else ' (below the required hits)'}", flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
