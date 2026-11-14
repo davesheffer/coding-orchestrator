@@ -48,10 +48,13 @@ class GateTests(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
         patcher.start()
         self.addCleanup(patcher.stop)
-        # A loaded host must not time out the gate's git calls (production default 2 s).
-        git_timeout = mock.patch.object(jev, "GIT_CALL_SECONDS", 120.0)
-        git_timeout.start()
-        self.addCleanup(git_timeout.stop)
+        # A loaded host must not time out the gate's git calls (production default 2 s) nor
+        # exhaust the git/gate budgets (4 s / 8 s) and fail the gate open. Tests of the budgets
+        # themselves patch their own values.
+        for name in ("GIT_CALL_SECONDS", "GIT_SUBPROCESS_BUDGET_SECONDS", "GATE_BUDGET_SECONDS"):
+            patcher = mock.patch.object(jev, name, 120.0)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.cfg = jev.load_config(Path("/nonexistent/config.json"))
         self.cfg["enabled"] = True
         temp = tempfile.TemporaryDirectory()
@@ -1642,12 +1645,8 @@ class GateTests(unittest.TestCase):
                          jev.UNJUDGED_PUSH_REASON)
         self.assertIsNone(self.gate(self.payload(at_cap), classify_fn=self.classify()))
         self.stage_change()
-        # This test checks the target cap, not budgets: on a loaded host the commit's staged
-        # diff must not exhaust the git budget and fail the gate open.
-        with mock.patch.object(jev, "GIT_SUBPROCESS_BUDGET_SECONDS", 120.0), \
-                mock.patch.object(jev, "GATE_BUDGET_SECONDS", 120.0):
-            out = self.gate(self.payload("cd . || cd x; git commit -m x"),
-                            classify_fn=self.classify())
+        out = self.gate(self.payload("cd . || cd x; git commit -m x"),
+                        classify_fn=self.classify())
         self.assertIn("security", out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_issue_63_constructs_scan_fast(self):
@@ -1990,7 +1989,9 @@ class GateTests(unittest.TestCase):
         def spy_ask(*args, **kwargs):
             ask_deadlines.append(kwargs.get("deadline"))
             return real_ask(*args, **kwargs)
-        deadline = time.monotonic() + 3.0
+        # Only compared, never waited on. Keep it below setUp's 120 s git budget, or the git
+        # deadline (the smaller of the two) ties with it and the check below proves nothing.
+        deadline = time.monotonic() + 60.0
         with mock.patch.object(jev, "_run_git", spy_run_git), mock.patch.object(jev, "ask", spy_ask):
             jev.gate(self.payload("git commit -m x"), self.cfg, self.classify(), self.logs.append,
                      state_dir=self.state_dir, deadline=deadline)
