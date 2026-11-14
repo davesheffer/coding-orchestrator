@@ -56,6 +56,14 @@ class AskJevTests(unittest.TestCase):
             path.write_text(content, encoding="utf-8", newline="\n")
         return path
 
+    def symlink(self, link, target):
+        try:
+            os.symlink(target, link)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 1314:
+                raise
+            self.skipTest("this Windows account lacks the privilege to create symlinks")
+
     def fake(self, body, key):
         with self.lock:
             self.calls.append(body)
@@ -90,14 +98,14 @@ class AskJevTests(unittest.TestCase):
     def test_skip_reasons(self):
         self.file("good.py")
         (self.outside / "far.py").write_text("x = 1\n", encoding="utf-8")
-        os.symlink(self.outside / "far.py", self.repo / "link_out.py")
+        self.symlink(self.repo / "link_out.py", self.outside / "far.py")
         self.file(".env", "KEY=1\n")
         self.file("secrets/x.txt", "x\n")
         self.file("node_modules/x.js", "x\n")
         self.file("blob.dat", b"abc\0def")
         self.file("empty.txt", "  \n")
         self.file("logo.png", "not really a png\n")
-        os.symlink(self.repo / ".env", self.repo / "notes.txt")
+        self.symlink(self.repo / "notes.txt", self.repo / ".env")
         paths = [str(self.outside / "far.py"), "link_out.py", ".env", "secrets/x.txt", "node_modules/x.js",
                  "blob.dat", "empty.txt", "logo.png", "missing.py", "notes.txt", "good.py"]
         code, output, _ = self.run_args(["-q", NOUL, *paths])
@@ -444,7 +452,7 @@ class AskJevTests(unittest.TestCase):
         inner = self.outside / "pkg"
         inner.mkdir()
         (inner / "far.py").write_text("x = 1\n", encoding="utf-8")
-        os.symlink(self.outside, self.repo / "linked")
+        self.symlink(self.repo / "linked", self.outside)
         paths, skipped = ask_jev.expand(["**/*.py"], False, str(self.repo), self.repo.resolve())
         self.assertEqual(paths, ["a.py"])
         paths, _ = ask_jev.expand(["."], True, str(self.repo), self.repo.resolve())
