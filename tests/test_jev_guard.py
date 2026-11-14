@@ -1642,8 +1642,12 @@ class GateTests(unittest.TestCase):
                          jev.UNJUDGED_PUSH_REASON)
         self.assertIsNone(self.gate(self.payload(at_cap), classify_fn=self.classify()))
         self.stage_change()
-        out = self.gate(self.payload("cd . || cd x; git commit -m x"),
-                        classify_fn=self.classify())
+        # This test checks the target cap, not budgets: on a loaded host the commit's staged
+        # diff must not exhaust the git budget and fail the gate open.
+        with mock.patch.object(jev, "GIT_SUBPROCESS_BUDGET_SECONDS", 120.0), \
+                mock.patch.object(jev, "GATE_BUDGET_SECONDS", 120.0):
+            out = self.gate(self.payload("cd . || cd x; git commit -m x"),
+                            classify_fn=self.classify())
         self.assertIn("security", out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_issue_63_constructs_scan_fast(self):
