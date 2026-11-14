@@ -46,7 +46,9 @@ def _unpushed_names(top, deadline):
         newest = (newest or "").split()
         base = newest[0] if len(newest) == 1 else None
     else:
-        empty = jev._run_git(["hash-object", "-t", "tree", "--stdin"], top, deadline)
+        # gate._git closes stdin (as the gate's own _base does); _run_git would inherit the
+        # test runner's stdin, and an open, idle one blocks --stdin until the git timeout.
+        empty = gate._git(jev, ["hash-object", "-t", "tree", "--stdin"], top)
         if not empty or not empty.strip():
             return None
         bases = [empty.strip()]
@@ -134,7 +136,7 @@ class GateTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         # Recording is time-budgeted; a slow or loaded host must not turn these tests
         # into "nothing recorded" (the budget expiring records nothing, by design).
-        for name in ("SHORT_HOOK_BUDGET_SECONDS", "LEDGER_GIT_SECONDS"):
+        for name in ("SHORT_HOOK_BUDGET_SECONDS", "LEDGER_GIT_SECONDS", "GIT_CALL_SECONDS"):
             budget = mock.patch.object(jev, name, 120.0)
             budget.start()
             self.addCleanup(budget.stop)

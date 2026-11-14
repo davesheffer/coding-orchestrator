@@ -77,6 +77,9 @@ except ImportError:
 # in claude/install.py, leaving margin for interpreter start-up.
 GATE_BUDGET_SECONDS = 8.0
 SHORT_HOOK_BUDGET_SECONDS = 4.0
+# Per-call timeout of each git subprocess run by _run_git (still capped by the
+# invocation's shared deadline). Tests raise it so a loaded host does not time out git.
+GIT_CALL_SECONDS = 2.0
 # How long update_state waits for the Windows lock before giving up (the hook fails
 # open; never past the hook's deadline), and how often a Windows tmp.replace is
 # retried while another process has the state file open.
@@ -1609,7 +1612,7 @@ def _run_git(args, cwd, deadline=None, git_opts=None):
     `git_opts` are the command's own `--git-dir`/`--work-tree` options, if it gave any."""
     if git_opts:
         args = [*git_opts, *args]
-    timeout = 2.0
+    timeout = GIT_CALL_SECONDS
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
