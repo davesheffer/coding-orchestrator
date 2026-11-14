@@ -221,6 +221,31 @@ class CompareReadonlyTests(unittest.TestCase):
                 self.assertEqual(sorted(calls, key=str), sorted(expected, key=str))
                 self.assertEqual("@low" in printed.getvalue(), bool(efforts))
 
+    def test_a_run_that_raises_keeps_its_effort_in_the_error_record(self):
+        module = load("compare-claude-readonly")
+
+        def run_one(repo, task, model, budget, effort=None):
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as temp:
+            tasks = Path(temp) / "tasks.json"
+            tasks.write_text(json.dumps([{"id": "t1", "prompt": "p", "required": ["alpha"]}]),
+                             encoding="utf-8")
+            output = Path(temp) / "results.json"
+            printed = io.StringIO()
+            with mock.patch.object(module, "run_one", run_one), \
+                    mock.patch.object(module, "tree_status", return_value=""), \
+                    contextlib.redirect_stdout(printed):
+                code = module.main(["--tasks", str(tasks), "--models", "haiku", "--efforts", "low",
+                                    "--jobs", "1", "--output", str(output)])
+            records = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["effort"], "low")
+        self.assertEqual(records[0]["exit"], 1)
+        self.assertIn("RuntimeError: boom", records[0]["error"])
+        self.assertIn("t1 haiku@low: exit=1", printed.getvalue())
+
     def test_exit_status_fails_when_a_run_misses_its_required_hits(self):
         for name in ("compare-claude-readonly", "compare-codex-readonly"):
             module = load(name)

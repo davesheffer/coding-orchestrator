@@ -23,6 +23,23 @@ The specified-edit fixtures in `fixtures/` were copied to separate disposable wo
 | Codex Luna vs Sol, six lookups | Both completed six. Luna's relay answer cited a previous-release fixture rather than current source; Sol cited current source. Median model times were 14.0 s and 15.3 s respectively. | CLI completion is not correctness. API token prices do not establish subscription cost. |
 | Claude Sonnet vs Opus, two specified edits | Original tests passed for both. Expanded invalid-record tests exposed one Sonnet error; a Sonnet repair passed. Total Sonnet cost/time including repair: about $0.106 / 42 s; Opus: about $0.230 / 51 s. | Synthetic functions, four model runs and one repair. |
 
+## 2026-11-14 effort run
+
+`--efforts low medium` adds a reasoning-effort axis: each task runs once per model and effort, and each record and output line carries the effort (for example `haiku@low`). Run it with no other pytest or git activity in the target repository, since files written mid-run count as a read-only failure.
+
+```sh
+python bin/compare-claude-readonly.py --models haiku sonnet --efforts low medium --output <private-path>/effort.json
+```
+
+| Model @ effort | Passed (of 6) | Total cost | Median duration |
+|---|---|---|---|
+| Haiku @ low | 6 | $0.020 | 15.7 s |
+| Haiku @ medium | 6 | $0.019 | 16.8 s |
+| Sonnet @ low | 4 | $0.242 | 15.3 s |
+| Sonnet @ medium | 2 | $0.248 | 16.1 s |
+
+Sonnet's failures were three read-only errors caused by concurrent git activity in the target repository and three missed required terms. The run supports Haiku at `effort: low` for scout and runner lookups; it does not measure builds, edits, or review.
+
 The raw local pilot artifacts are in the user's private `~/.codex/agent-runs/` directory. Model, version, pricing, and task mix can change; repeat on a broader frozen task set before claiming general savings.
 
 # Jev routing benchmark
@@ -32,4 +49,4 @@ The raw local pilot artifacts are in the user's private `~/.codex/agent-runs/` d
 - **accuracy**: the raw classifier choice against the expected tier.
 - **applied accuracy**: the model that would actually run after `bin/jev-route.py`'s own rule. Pinned agents, answers below `min_confidence` or with an invalid confidence keep the agent's frontmatter model (or `inherit`), and a choice equal to the current tier is a same-model skip.
 
-Every case uses a routable role. Agents in `pinned_agents` (by default `critic` and `fork`) are never classified in production, so adversarial-review scenarios use `general-purpose`.
+Every case uses a routable role. Agents in `pinned_agents` (by default `critic`, `fork`, `scout`, and `runner`) are never classified in production, so adversarial-review, lookup, and command-running scenarios use `general-purpose`.
