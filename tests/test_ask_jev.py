@@ -98,31 +98,44 @@ class AskJevTests(unittest.TestCase):
     def test_skip_reasons(self):
         self.file("good.py")
         (self.outside / "far.py").write_text("x = 1\n", encoding="utf-8")
-        self.symlink(self.repo / "link_out.py", self.outside / "far.py")
         self.file(".env", "KEY=1\n")
         self.file("secrets/x.txt", "x\n")
         self.file("node_modules/x.js", "x\n")
         self.file("blob.dat", b"abc\0def")
         self.file("empty.txt", "  \n")
         self.file("logo.png", "not really a png\n")
-        self.symlink(self.repo / "notes.txt", self.repo / ".env")
-        paths = [str(self.outside / "far.py"), "link_out.py", ".env", "secrets/x.txt", "node_modules/x.js",
-                 "blob.dat", "empty.txt", "logo.png", "missing.py", "notes.txt", "good.py"]
+        paths = [str(self.outside / "far.py"), ".env", "secrets/x.txt", "node_modules/x.js",
+                 "blob.dat", "empty.txt", "logo.png", "missing.py", "good.py"]
         code, output, _ = self.run_args(["-q", NOUL, *paths])
         self.assertEqual(code, 0)
         self.assertEqual(output["files"], ["good.py"])
-        self.assertEqual(output["skipped"]["count"], 10)
+        self.assertEqual(output["skipped"]["count"], 8)
         reasons = {s["path"]: s["reason"] for s in output["skipped"]["sample"]}
         self.assertEqual(set(reasons), set(paths) - {"good.py"})
         self.assertEqual(reasons[str(self.outside / "far.py")], "outside the repository")
-        self.assertEqual(reasons["link_out.py"], "outside the repository")
-        for secret in (".env", "secrets/x.txt", "notes.txt"):
+        for secret in (".env", "secrets/x.txt"):
             self.assertIn("secret-looking", reasons[secret], secret)
         self.assertIn("generated or dependency", reasons["node_modules/x.js"])
         self.assertEqual(reasons["blob.dat"], "binary file")
         self.assertEqual(reasons["empty.txt"], "empty")
         self.assertIn("binary or lock", reasons["logo.png"])
         self.assertEqual(reasons["missing.py"], "not found")
+        self.assertEqual(list(self.calls[0]["state"]["files"]), ["good.py"])
+
+    def test_skip_reasons_for_symlinks(self):
+        # Kept apart so the other skip reasons still run where symlinks cannot be created.
+        self.file("good.py")
+        (self.outside / "far.py").write_text("x = 1\n", encoding="utf-8")
+        self.file(".env", "KEY=1\n")
+        self.symlink(self.repo / "link_out.py", self.outside / "far.py")
+        self.symlink(self.repo / "notes.txt", self.repo / ".env")
+        code, output, _ = self.run_args(["-q", NOUL, "link_out.py", "notes.txt", "good.py"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output["files"], ["good.py"])
+        self.assertEqual(output["skipped"]["count"], 2)
+        reasons = {s["path"]: s["reason"] for s in output["skipped"]["sample"]}
+        self.assertEqual(reasons["link_out.py"], "outside the repository")
+        self.assertIn("secret-looking", reasons["notes.txt"])
         self.assertEqual(list(self.calls[0]["state"]["files"]), ["good.py"])
 
     def test_only_unusable_files_is_usage_error(self):
