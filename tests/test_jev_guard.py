@@ -48,6 +48,10 @@ class GateTests(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # A loaded host must not time out the gate's git calls (production default 2 s).
+        git_timeout = mock.patch.object(jev, "GIT_CALL_SECONDS", 120.0)
+        git_timeout.start()
+        self.addCleanup(git_timeout.stop)
         self.cfg = jev.load_config(Path("/nonexistent/config.json"))
         self.cfg["enabled"] = True
         temp = tempfile.TemporaryDirectory()
