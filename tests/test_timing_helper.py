@@ -14,14 +14,6 @@ def linear(items):
     return total
 
 
-def quadratic(items):
-    total = 0
-    for item in items:
-        for other in items:
-            total += item ^ other
-    return total
-
-
 class TimingHelperTests(unittest.TestCase):
     def test_linear_work_passes(self):
         result = timing.assert_scales(self, lambda n: list(range(n)), linear,
@@ -29,10 +21,19 @@ class TimingHelperTests(unittest.TestCase):
         self.assertEqual(result, sum(range(200_000)))
 
     def test_quadratic_work_fails(self):
-        # 4x the input is 16x the work, well past the default 10x allowance.
-        with self.assertRaises(AssertionError) as raised:
-            timing.assert_scales(self, lambda n: list(range(n)), quadratic, 300, 1200,
-                                 label="quadratic")
+        # 4x the input is 16x the work, well past the default 10x allowance. A fake clock
+        # advanced by each run makes it cost exactly n**2: with real timing, a stalled first
+        # small-size run on a busy runner could bring the ratio under 10x, and assert_scales
+        # stops at the first passing pair, so the expected failure did not happen.
+        clock = [0.0]
+
+        def run(n):
+            clock[0] += n * n * 1e-7
+            return n
+
+        with mock.patch.object(timing.time, "perf_counter", lambda: clock[0]), \
+                self.assertRaises(AssertionError) as raised:
+            timing.assert_scales(self, lambda n: n, run, 300, 1200, label="quadratic")
         self.assertIn("ratio", str(raised.exception))
 
     def test_best_of_returns_shortest_run(self):
