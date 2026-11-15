@@ -127,23 +127,52 @@ class EffortBenchTests(unittest.TestCase):
         with mock.patch.object(bench.subprocess, "run",
                                return_value=subprocess.CompletedProcess([], 0, out, "")):
             r = bench.run("p", "m", "low", ".", "Read", "critic")
-        self.assertEqual((r["cost"], r["out_tokens"]), (0.0, 4))
-        self.assertEqual(r["error"], "bad cost: 0.3")
+        self.assertEqual((r["cost"], r["out_tokens"]), (bench.RUN_BUDGET, 4))
+        self.assertEqual(r["error"], f"bad cost: 0.3 (counted as ${bench.RUN_BUDGET})")
         out = json.dumps({"is_error": True, "subtype": "x", "total_cost_usd": "1",
                           "modelUsage": {"claude-opus-4-8": {"outputTokens": 1}}})
         with mock.patch.object(bench.subprocess, "run",
                                return_value=subprocess.CompletedProcess([], 1, out, "")):
             self.assertTrue(bench.run("p", "m", "low", ".", "Read", "critic")["error"]
-                            .startswith("cli error: x; bad cost: 1; model mismatch"))
-        for cost, label in ((float("nan"), True), (10 ** 400, True), (True, True), (False, True),
-                            (0, False), (0.25, False)):
+                            .startswith(f"cli error: x; bad cost: 1 (counted as ${bench.RUN_BUDGET}); "
+                                        "model mismatch"))
+        for cost, label in ((float("nan"), True), (float("inf"), True), (1e999, True), (10 ** 400, True),
+                            (-0.5, True), (True, True), (False, True), (0, False), (0.25, False)):
             out = json.dumps({"result": "ok", "total_cost_usd": cost,
                               "modelUsage": {"claude-fable-5-2": {"outputTokens": 1}}})
             with mock.patch.object(bench.subprocess, "run",
                                    return_value=subprocess.CompletedProcess([], 0, out, "")):
                 r = bench.run("p", "m", "low", ".", "Read", "critic")
             self.assertEqual("error" in r, label, cost)
-            self.assertTrue(math.isfinite(r["cost"]))
+            self.assertEqual(r["cost"], bench.RUN_BUDGET if label else float(cost))
+        out = json.dumps({"result": "ok", "total_cost_usd": 0.1,
+                          "modelUsage": {"claude-fable-5-2": {"outputTokens": float("nan")},
+                                         "claude-opus-4-8": {"outputTokens": -3}}})
+        with mock.patch.object(bench.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, out, "")):
+            self.assertEqual(bench.run("p", "m", "low", ".", "Read", "critic")["out_tokens"], 0)
+
+    def test_unreadable_costs_still_reach_the_cap(self):
+        bench = load("bench")
+        with tempfile.TemporaryDirectory() as tmp:
+            bench.ARGS = types.SimpleNamespace(cap=2.0)
+            bench.OUT = Path(tmp) / "rows.json"
+            calls = []
+
+            out = json.dumps({"result": "DONE", "total_cost_usd": "x",
+                              "modelUsage": {"claude-sonnet-5-5": {"outputTokens": 1}}})
+
+            def fake_builder(task, effort):
+                calls.append(task)
+                return bench.run("p", "sonnet", effort, ".", "Read", "builder")
+
+            with mock.patch.object(bench, "builder", fake_builder), \
+                    mock.patch.object(bench.subprocess, "run",
+                                      return_value=subprocess.CompletedProcess([], 0, out, "")), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                for t in list(bench.TASKS):
+                    bench.work(("builder", t, "low", 0))
+            self.assertEqual(len(calls), 2)  # $1.5 + $1.5 reaches the $2 cap; the rest are skipped
 
     def test_cli_error_with_only_haiku_usage_has_no_mismatch(self):
         bench = load("bench")
@@ -157,7 +186,9 @@ class EffortBenchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = str(Path(tmp) / "rows.json")
             for bad in (["--builder-model", "fable"], ["--critic-model", "opus"], ["--efforts", "low,huge"],
-                        ["--efforts", ","], ["--builder-model", "claude-"], ["--builder-model", "claude-fable"],
+                        ["--efforts", ","], ["--efforts", "low,,medium"], ["--efforts", ""],
+                        ["--builder-model", "claude-opus-5"],
+                        ["--builder-model", "claude-"], ["--builder-model", "claude-fable"],
                         ["--critic-model", "claude-opus-latest"], ["--builder-model", "claude-opus-5-5x"],
                         ["--builder-model", "claude-opus-٥-٥"]):
                 # If validation ever lets a bad flag through, fail here instead of starting paid runs.
@@ -187,6 +218,12 @@ class EffortBenchTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()):
                 bench.main(["--output", out, "--only", "critic", "--critic-reps", "1"])
             self.assertEqual((bench.CRITIC_MODEL, bench.EXPECTED["critic"]), ("claude-fable-5-2", "claude-fable-5-2"))
+            default = []
+            with mock.patch.object(bench, "work", side_effect=default.append), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                bench.main(["--output", out])
+            self.assertEqual(len(default), 3 * 3 * len(bench.TASKS) + 2 * 3 * len(bench.CASES))
+            self.assertEqual({job[2] for job in default}, {"low", "medium", "high"})
 
     def test_run_rejects_non_object_json(self):
         bench = load("bench")
