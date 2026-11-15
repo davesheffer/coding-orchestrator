@@ -1,17 +1,18 @@
-"""Builder and critic roles at --effort low|medium|high, scored on hidden tests and seeded defects.
+"""Builder and critic roles at --effort low|medium|high (or --efforts), scored on hidden tests and seeded defects.
 
 Usage: python benchmarks/effort/bench.py --output <private-path>.json [--builder-reps 3] [--critic-reps 2]
-       [--jobs 3] [--cap 12] [--only builder|critic]
+       [--jobs 3] [--cap 12] [--only builder|critic] [--builder-model <id>] [--critic-model <id>]
+       [--efforts low,medium,high]
        python benchmarks/effort/bench.py --check    (offline: validate tasks and cases, no claude calls)
 
-Arms: the builder runs on `sonnet`; the critic runs on the explicit id `claude-fable-5-2`, because on
+Arms (override with --builder-model / --critic-model): the builder runs on `sonnet`; the critic runs on the explicit id `claude-fable-5-2`, because on
 2026-11-15 `claude -p --model fable` resolved to claude-fable-5-1 and fell back to claude-opus-4-8.
 Each builder task gives a stub and visible tests, then scores hidden tests (builder_tasks.py); each critic
 case gives a diff and scores whether a finding lands within its `accept` range (default two lines of the seeded defect), or that a clean
 change gets no findings (critic_tasks.py). Rows are rewritten to --output after every job; keep that file
 private. Prompts go on stdin (claude.CMD runs through cmd.exe, which would treat < > in argv as redirects).
 """
-import argparse, concurrent.futures as cf, difflib, hashlib, json, re, shutil, subprocess, sys, tempfile
+import argparse, concurrent.futures as cf, difflib, hashlib, json, math, re, shutil, subprocess, sys, tempfile
 import threading, time
 from pathlib import Path
 
@@ -21,9 +22,13 @@ from critic_tasks import CASES  # noqa: E402
 
 CLAUDE = shutil.which("claude") or "claude"
 EFFORTS = ("low", "medium", "high")
+EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 BUILDER_MODEL, CRITIC_MODEL = "sonnet", "claude-fable-5-2"
+DEFAULT_MODELS = (BUILDER_MODEL, CRITIC_MODEL)
+MODEL_ID = re.compile(r"claude-[a-z]+-[0-9]+(-[0-9]+)*")  # full versioned id; aliases cannot be checked
 
 EXPECTED = {"builder": "claude-sonnet-5-5", "critic": "claude-fable-5-2"}
+DEFAULT_EXPECTED = dict(EXPECTED)
 lock, spent, rows = threading.Lock(), [0.0], []
 ARGS = OUT = None
 UNITTEST_TIMEOUT = 60
@@ -37,6 +42,20 @@ def model_mismatch(role, used):
     if EXPECTED[role] not in used:
         return f"model mismatch: expected {EXPECTED[role]} missing, saw {sorted(used)}"
     return None
+
+
+def num(x):
+    """x if it is a real number (not bool), else 0, so malformed CLI fields cannot crash a paid row."""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else 0
+
+
+def safe_cost(x):
+    """Finite float cost, or 0.0 (the row is then labelled "bad cost")."""
+    try:
+        c = float(num(x))
+    except OverflowError:
+        return 0.0
+    return c if math.isfinite(c) else 0.0
 
 
 def run(prompt, model, effort, cwd, tools, role, extra=()):
@@ -59,12 +78,21 @@ def run(prompt, model, effort, cwd, tools, role, extra=()):
     mu = d.get("modelUsage")
     if not isinstance(mu, dict):
         mu = {}
-    r = {"rc": p.returncode, "secs": dt, "result": (d.get("result") or "").strip(),
-         "out_tokens": sum(v.get("outputTokens", 0) for k, v in mu.items() if "haiku" not in k),
-         "cost": d.get("total_cost_usd") or 0.0, "models": sorted(mu), "turns": d.get("num_turns")}
+    result = d.get("result")
+    r = {"rc": p.returncode, "secs": dt, "result": result.strip() if isinstance(result, str) else "",
+         "out_tokens": sum(num(v.get("outputTokens")) for k, v in mu.items()
+                           if isinstance(v, dict) and "haiku" not in k),
+         "cost": safe_cost(d.get("total_cost_usd")), "models": sorted(map(str, mu)),
+         "turns": d.get("num_turns")}
     if d.get("is_error"):
         r["error"] = f"cli error: {d.get('subtype')}"
-    mismatch = model_mismatch(role, mu)
+    cost = d.get("total_cost_usd")
+    if cost is not None and (isinstance(cost, bool) or cost != 0 and safe_cost(cost) == 0.0):
+        bad = f"bad cost: {str(cost)[:40]}"
+        r["error"] = f"{r['error']}; {bad}" if "error" in r else bad
+    # A CLI error before the role's model answered leaves no non-Haiku usage; that is not a wrong model.
+    served = any("haiku" not in k for k in mu)
+    mismatch = None if d.get("is_error") and not served else model_mismatch(role, mu)
     if mismatch:
         r["error"] = f"{r['error']}; {mismatch}" if "error" in r else mismatch
     return r
@@ -255,6 +283,15 @@ def work(job):
     return r
 
 
+def set_models(builder_model=None, critic_model=None):
+    """Point both roles at their models; an explicit id is also the id the run must be served by."""
+    global BUILDER_MODEL, CRITIC_MODEL
+    BUILDER_MODEL = builder_model or DEFAULT_MODELS[0]
+    CRITIC_MODEL = critic_model or DEFAULT_MODELS[1]
+    EXPECTED["builder"] = builder_model or DEFAULT_EXPECTED["builder"]
+    EXPECTED["critic"] = critic_model or DEFAULT_EXPECTED["critic"]
+
+
 def main(argv=None):
     global ARGS, OUT
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -265,9 +302,23 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--cap", type=float, default=12.0)
     ap.add_argument("--only", choices=("builder", "critic"))
+    ap.add_argument("--builder-model", help="full model id, e.g. claude-opus-5-5 (default: sonnet alias, "
+                    "expected to serve claude-sonnet-5-5)")
+    ap.add_argument("--critic-model", help="full model id (default: claude-fable-5-2)")
+    ap.add_argument("--efforts", default=",".join(EFFORTS),
+                    help="comma-separated efforts from " + ",".join(EFFORT_CHOICES))
     ARGS = args = ap.parse_args(argv)
     if not args.check and not args.output:
         ap.error("--output is required unless --check is given")
+    efforts = tuple(dict.fromkeys(e.strip() for e in args.efforts.split(",") if e.strip()))
+    if not efforts or any(e not in EFFORT_CHOICES for e in efforts):
+        ap.error(f"--efforts must be a comma-separated subset of {','.join(EFFORT_CHOICES)}")
+    for flag in ("builder_model", "critic_model"):
+        v = getattr(args, flag)
+        if v is not None and not MODEL_ID.fullmatch(v):
+            # Aliases can resolve to an older model or fall back silently, so they cannot be checked.
+            ap.error(f"--{flag.replace('_', '-')} needs a full versioned model id such as claude-opus-5-5")
+    set_models(args.builder_model, args.critic_model)
     if args.check:
         return check()
     OUT = Path(args.output)
@@ -278,12 +329,12 @@ def main(argv=None):
     if args.only != "critic":
         for i in range(args.builder_reps):
             for t in TASKS:
-                for e in EFFORTS:
+                for e in efforts:
                     jobs.append(("builder", t, e, i))
     if args.only != "builder":
         for i in range(args.critic_reps):
             for c in CASES:
-                for e in EFFORTS:
+                for e in efforts:
                     jobs.append(("critic", c, e, i))
     print(f"{len(jobs)} jobs, cap ${args.cap}", flush=True)
     with cf.ThreadPoolExecutor(args.jobs) as pool:
