@@ -60,7 +60,7 @@ DEFAULTS = {
     # this likely (Codex, which has no current tier: stronger than Jev's choice).
     "escalate_mass": 0.4,
     "respect_explicit_model": False,
-    # scout and runner are pinned so Jev never moves them off their benchmarked Haiku tier.
+    # scout and runner are pinned so Jev never moves them off Haiku (scout was benchmarked on lookups).
     "pinned_agents": ["critic", "fork", "scout", "runner"],
     "max_prompt_chars": 6000,
     "send_prompt": True,

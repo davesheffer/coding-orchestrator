@@ -69,7 +69,7 @@ untouched. Its named builder role uses Sonnet, its scout and runner use Haiku at
 uses Fable. The read-only benchmark (`bin/compare-claude-readonly.py --efforts`) found Haiku matching
 Sonnet on lookup tasks at about a twelfth of the cost, with no measurable gain from medium over low effort;
 builder and critic keep the session's effort until they have their own benchmark. Jev's default
-`pinned_agents` includes `scout` and `runner`, so routing never moves them off Haiku. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
+`pinned_agents` includes `scout` and `runner`, so routing never moves them off Haiku. Only those named roles are held: a built-in agent called with `model: haiku` can still be upgraded by Jev. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
 follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
 Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
 [Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
