@@ -26,12 +26,17 @@ BUILDER_MODEL, CRITIC_MODEL = "sonnet", "claude-fable-5-2"
 EXPECTED = {"builder": "claude-sonnet-5-5", "critic": "claude-fable-5-2"}
 lock, spent, rows = threading.Lock(), [0.0], []
 ARGS = OUT = None
+UNITTEST_TIMEOUT = 60
 
 
 def model_mismatch(role, used):
-    """Error text when any non-Haiku model in `used` is not the expected id for `role`, else None."""
+    """Error text when a non-Haiku model in `used` is not the expected id for `role`, or that id is absent."""
     bad = sorted(k for k in used if "haiku" not in k and k != EXPECTED[role])
-    return f"model mismatch: {bad}" if bad else None
+    if bad:
+        return f"model mismatch: {bad}"
+    if EXPECTED[role] not in used:
+        return f"model mismatch: expected {EXPECTED[role]} missing, saw {sorted(used)}"
+    return None
 
 
 def run(prompt, model, effort, cwd, tools, role, extra=()):
@@ -55,7 +60,7 @@ def run(prompt, model, effort, cwd, tools, role, extra=()):
          "cost": d.get("total_cost_usd") or 0.0, "models": sorted(mu), "turns": d.get("num_turns")}
     if d.get("is_error"):
         r["error"] = f"cli error: {d.get('subtype')}"
-    mismatch = model_mismatch(role, mu)
+    mismatch = None if "error" in r else model_mismatch(role, mu)
     if mismatch:
         r["error"] = mismatch
     return r
@@ -73,31 +78,39 @@ def builder(task, effort):
                   "examples; do not edit it or create other files. Reply DONE when finished.")
         r = run(prompt, BUILDER_MODEL, effort, ws, "Read,Edit,Write", "builder",
                 ("--permission-mode", "acceptEdits"))
-        extra = sorted(p.name for p in ws.iterdir() if p.name not in
-                       {"solution.py", "test_solution.py", "__pycache__"})
-        tamper = hashlib.sha256((ws / "test_solution.py").read_bytes()).hexdigest() != h or bool(extra)
         try:
-            vis = subprocess.run([sys.executable, "-m", "unittest", "-q", "test_solution"], cwd=ws,
-                                 capture_output=True, text=True, timeout=60)
-            vis_pass = vis.returncode == 0
-        except subprocess.TimeoutExpired:
-            vis_pass = False
-        (ws / "test_hidden.py").write_text(t["hidden"], encoding="utf-8")
-        try:
-            hid = subprocess.run([sys.executable, "-m", "unittest", "-q", "test_hidden"], cwd=ws,
-                                 capture_output=True, text=True, timeout=60)
-            hid_pass, err = hid.returncode == 0, hid.stderr
-            m = re.search(r"Ran (\d+) tests?", err)
-            fails = re.search(r"FAILED \((.*)\)", err)
-            summary = (fails.group(1) if fails else "ok") if m else err[-200:]
-        except subprocess.TimeoutExpired:
-            hid_pass, err, summary = False, "", "timeout"
-        r.update(visible_pass=vis_pass, hidden_pass=hid_pass, tamper=tamper,
-                 extra_files=extra, hidden_summary=summary,
-                 hidden_tail=err[-1200:] if not hid_pass else "",
-                 solution=(ws / "solution.py").read_text(encoding="utf-8", errors="replace"))
-        r["correct"] = r["visible_pass"] and r["hidden_pass"] and not tamper and "error" not in r
-        return r
+            return score_builder(r, t, ws, h)
+        except Exception as e:  # keep the paid run's cost
+            r.update(error=f"scoring: {type(e).__name__}: {e}", correct=False)
+            return r
+
+
+def score_builder(r, t, ws, h):
+    extra = sorted(p.name for p in ws.iterdir() if p.name not in
+                   {"solution.py", "test_solution.py", "__pycache__"})
+    tamper = hashlib.sha256((ws / "test_solution.py").read_bytes()).hexdigest() != h or bool(extra)
+    try:
+        vis = subprocess.run([sys.executable, "-m", "unittest", "-q", "test_solution"], cwd=ws,
+                             capture_output=True, text=True, timeout=UNITTEST_TIMEOUT)
+        vis_pass = vis.returncode == 0
+    except subprocess.TimeoutExpired:
+        vis_pass = False
+    (ws / "test_hidden.py").write_text(t["hidden"], encoding="utf-8")
+    try:
+        hid = subprocess.run([sys.executable, "-m", "unittest", "-q", "test_hidden"], cwd=ws,
+                             capture_output=True, text=True, timeout=UNITTEST_TIMEOUT)
+        hid_pass, err = hid.returncode == 0, hid.stderr
+        m = re.search(r"Ran (\d+) tests?", err)
+        fails = re.search(r"FAILED \((.*)\)", err)
+        summary = (fails.group(1) if fails else "ok") if m else err[-200:]
+    except subprocess.TimeoutExpired:
+        hid_pass, err, summary = False, "", "timeout"
+    r.update(visible_pass=vis_pass, hidden_pass=hid_pass, tamper=tamper,
+             extra_files=extra, hidden_summary=summary,
+             hidden_tail=err[-1200:] if not hid_pass else "",
+             solution=(ws / "solution.py").read_text(encoding="utf-8", errors="replace"))
+    r["correct"] = r["visible_pass"] and r["hidden_pass"] and not tamper and "error" not in r
+    return r
 
 
 def case_diff(c):
@@ -117,7 +130,7 @@ def parse_line(x):
         return None
     if isinstance(x, int):
         return x
-    if isinstance(x, str) and x.strip().isdigit():
+    if isinstance(x, str) and x.strip().isascii() and x.strip().isdigit():
         return int(x.strip())
     return None
 
@@ -149,10 +162,20 @@ def critic(case, effort):
                   f'{{"findings":[{{"file":"{c["file"]}","line":<line number in the changed file>,'
                   '"kind":"<short>","why":"<one sentence>"}]} and use {"findings":[]} if there are none.')
         r = run(prompt, CRITIC_MODEL, effort, ws, "Read,Grep,Glob", "critic")
+    try:
+        return score_critic_run(r, c, seeded)
+    except Exception as e:  # keep the paid run's cost
+        r.update(error=f"scoring: {type(e).__name__}: {e}", correct=False)
+        return r
+
+
+def score_critic_run(r, c, seeded):
     m = re.search(r"\{.*\}", r.get("result", ""), re.S)
     try:
         f = json.loads(m.group(0))["findings"] if m else None
     except (ValueError, KeyError, TypeError):
+        f = None
+    if not isinstance(f, list):
         f = None
     r.update(findings=f, parsed=f is not None, seeded_line=seeded)
     r.update(score_critic(c, f, seeded))
@@ -163,7 +186,7 @@ def critic(case, effort):
 
 def unittest_ok(ws, module):
     return subprocess.run([sys.executable, "-m", "unittest", "-q", module], cwd=ws, capture_output=True,
-                          text=True, timeout=60).returncode == 0
+                          text=True, timeout=UNITTEST_TIMEOUT).returncode == 0
 
 
 def check():
