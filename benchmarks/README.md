@@ -38,7 +38,17 @@ python bin/compare-claude-readonly.py --models haiku sonnet --efforts low medium
 | Sonnet @ low | 4 | $0.242 | 15.3 s |
 | Sonnet @ medium | 2 | $0.248 | 16.1 s |
 
-Sonnet's failures were three read-only errors caused by concurrent git activity in the target repository and three missed required terms. The run supports Haiku at `effort: low` for scout lookups. It does not measure runner command execution, builds, edits, or review. A 2026-11-15 spot check (`claude -p --model haiku --effort low|high`, two runs each on one short reasoning prompt) found no consistent difference in output tokens (low 262 and 384, high 322 and 235), so whether Haiku 5.5 honours effort is still unverified.
+Sonnet's failures were three read-only errors caused by concurrent git activity in the target repository and three missed required terms. The run supports Haiku at `effort: low` for scout lookups. It does not measure runner command execution, builds, edits, or review. A 2026-11-15 spot check (`claude -p --model haiku --effort low|high`, two runs each on one short reasoning prompt) found no consistent difference in output tokens (low 262 and 384, high 322 and 235).
+
+A larger 2026-11-15 check ran `claude -p --model haiku --effort low|high --tools ""` from an empty directory on three short reasoning prompts with known answers (inclusion-exclusion count, 12-step modular recurrence, anagram count), four interleaved runs per prompt and effort: 24 runs, all on `claude-haiku-5-5`, 0 errors, about $0.22.
+
+| Prompt | Correct low / high | Median output tokens low / high | Median seconds low / high |
+|---|---|---|---|
+| inclusion-exclusion | 4/4 / 4/4 | 390 / 341 | 16.5 / 14.4 |
+| recurrence | 4/4 / 4/4 | 401 / 391 | 16.2 / 17.0 |
+| anagrams | 4/4 / 4/4 | 93 / 117 | 17.5 / 15.8 |
+
+Per-run token ranges overlapped on every prompt and high was not consistently longer, so `--effort` had no measurable effect on Haiku 5.5's accuracy, output length or latency here. Either the CLI or model ignores effort for Haiku, or the effect is below noise on prompts this short. Keeping `effort: low` on scout and runner costs nothing either way; this does not measure long, tool-using tasks.
 
 The raw local pilot artifacts are in the user's private `~/.codex/agent-runs/` directory. Model, version, pricing, and task mix can change; repeat on a broader frozen task set before claiming general savings.
 
