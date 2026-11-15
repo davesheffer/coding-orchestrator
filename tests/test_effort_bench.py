@@ -47,6 +47,8 @@ class EffortBenchTests(unittest.TestCase):
         self.assertTrue(score(case, [{"line": 9}])["correct"])
         self.assertFalse(score(case, [{"line": 20}])["correct"])
         self.assertEqual(score(case, [{"line": 9}, {"line": 20}])["extra_findings"], 1)
+        self.assertEqual(score(case, [{"line": 9}, {"line": "x"}, "junk", {}])["extra_findings"], 3)
+        self.assertTrue(score(case, [{"line": 9}, {"line": "x"}])["correct"])
         self.assertTrue(score(case, [{"line": "10"}])["correct"])
         self.assertIsNone(bench.parse_line("²"))
         tags = bench.CASES["tags"]  # seeded line 1, so True == 1 would land without the bool guard
@@ -296,6 +298,39 @@ class EffortBenchTests(unittest.TestCase):
             self.assertFalse(r["correct"])
             self.assertIn("exception: RuntimeError: boom", r["error"])
             self.assertEqual(json.loads(bench.OUT.read_text(encoding="utf-8"))[0]["error"], r["error"])
+            self.assertTrue(r["cost_unknown"])
+            self.assertEqual(bench.spent[0], bench.RUN_BUDGET)
+
+    def test_rows_without_cost_still_reach_the_cap(self):
+        bench = load("bench")
+        with tempfile.TemporaryDirectory() as tmp:
+            bench.ARGS = types.SimpleNamespace(cap=2.0)
+            bench.OUT = Path(tmp) / "rows.json"
+            calls = []
+
+            def fake_builder(task, effort):
+                calls.append(task)
+                return bench.run("p", "sonnet", effort, ".", "Read", "builder")
+
+            for result in (subprocess.TimeoutExpired("claude", 900),
+                           subprocess.CompletedProcess([], 1, "not json", "boom"),
+                           subprocess.CompletedProcess([], 0, "[1]", "")):
+                calls.clear()
+                bench.spent[0] = 0.0
+                kw = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+                with mock.patch.object(bench, "builder", fake_builder), \
+                        mock.patch.object(bench.subprocess, "run", **kw), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    for t in list(bench.TASKS):
+                        bench.work(("builder", t, "low", 0))
+                self.assertEqual(len(calls), 2, result)
+            ok = {"cost": 0.25, "result": "DONE"}
+            bench.spent[0] = 0.0
+            with mock.patch.object(bench, "builder", return_value=dict(ok)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                r = bench.work(("builder", next(iter(bench.TASKS)), "low", 0))
+            self.assertNotIn("cost_unknown", r)
+            self.assertEqual(bench.spent[0], 0.25)
 
 
 if __name__ == "__main__":
