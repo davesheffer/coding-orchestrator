@@ -54,16 +54,26 @@ def run(prompt, model, effort, cwd, tools, role, extra=()):
         d = json.loads(p.stdout)
     except ValueError:
         return {"error": (p.stderr or p.stdout)[-300:], "rc": p.returncode, "secs": dt}
-    mu = d.get("modelUsage") or {}
+    if not isinstance(d, dict):
+        return {"error": f"non-object json: {p.stdout[-300:]}", "rc": p.returncode, "secs": dt}
+    mu = d.get("modelUsage")
+    if not isinstance(mu, dict):
+        mu = {}
     r = {"rc": p.returncode, "secs": dt, "result": (d.get("result") or "").strip(),
          "out_tokens": sum(v.get("outputTokens", 0) for k, v in mu.items() if "haiku" not in k),
          "cost": d.get("total_cost_usd") or 0.0, "models": sorted(mu), "turns": d.get("num_turns")}
     if d.get("is_error"):
         r["error"] = f"cli error: {d.get('subtype')}"
-    mismatch = None if "error" in r else model_mismatch(role, mu)
+    mismatch = model_mismatch(role, mu)
     if mismatch:
-        r["error"] = mismatch
+        r["error"] = f"{r['error']}; {mismatch}" if "error" in r else mismatch
     return r
+
+
+def scoring_error(e, r):
+    """Scoring failure text, keeping any earlier run error after it."""
+    msg = f"scoring: {type(e).__name__}: {e}"
+    return f"{msg}; {r['error']}" if r.get("error") else msg
 
 
 def builder(task, effort):
@@ -81,7 +91,7 @@ def builder(task, effort):
         try:
             return score_builder(r, t, ws, h)
         except Exception as e:  # keep the paid run's cost
-            r.update(error=f"scoring: {type(e).__name__}: {e}", correct=False)
+            r.update(error=scoring_error(e, r), correct=False)
             return r
 
 
@@ -130,8 +140,9 @@ def parse_line(x):
         return None
     if isinstance(x, int):
         return x
-    if isinstance(x, str) and x.strip().isascii() and x.strip().isdigit():
-        return int(x.strip())
+    s = x.strip() if isinstance(x, str) else ""
+    if s.isascii() and s.isdigit() and len(s) <= 18:  # longer strings are not line numbers
+        return int(s)
     return None
 
 
@@ -165,7 +176,7 @@ def critic(case, effort):
     try:
         return score_critic_run(r, c, seeded)
     except Exception as e:  # keep the paid run's cost
-        r.update(error=f"scoring: {type(e).__name__}: {e}", correct=False)
+        r.update(error=scoring_error(e, r), correct=False)
         return r
 
 
