@@ -1639,11 +1639,14 @@ class GateTests(unittest.TestCase):
         self.assertEqual((self.logs[-1]["decision"], self.logs[-1]["reason"]),
                          ("deny", "too_many_targets"))
         # Ordinary commands are unaffected: the cap's pushes (to missing directories) are
-        # denied once as unjudged, and the identical retry passes as before.
-        out = self.gate(self.payload(at_cap), classify_fn=self.classify())
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
-                         jev.UNJUDGED_PUSH_REASON)
-        self.assertIsNone(self.gate(self.payload(at_cap), classify_fn=self.classify()))
+        # denied once as unjudged, and the identical retry passes as before. A failed and a
+        # skipped git call both leave a push unjudged, so a short git budget gives the same
+        # result without running every target's git calls.
+        with mock.patch.object(jev, "GIT_SUBPROCESS_BUDGET_SECONDS", 0.5):
+            out = self.gate(self.payload(at_cap), classify_fn=self.classify())
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"],
+                             jev.UNJUDGED_PUSH_REASON)
+            self.assertIsNone(self.gate(self.payload(at_cap), classify_fn=self.classify()))
         self.stage_change()
         out = self.gate(self.payload("cd . || cd x; git commit -m x"),
                         classify_fn=self.classify())
@@ -1998,6 +2001,30 @@ class GateTests(unittest.TestCase):
         self.assertTrue(seen)
         self.assertTrue(all(d is not None and d <= deadline for d in seen), seen)
         self.assertEqual(ask_deadlines, [deadline])
+
+    def test_git_budget_binds_below_the_hook_deadline(self):
+        # The git sub-budget, not the later hook deadline, bounds the gate's git calls.
+        self.stage_change()
+        seen = []
+        real_run_git = jev._run_git
+
+        def spy_run_git(args, cwd, deadline=None, git_opts=None):
+            seen.append(deadline)
+            return real_run_git(args, cwd, deadline, git_opts)
+        # Only compared, never waited on; 60 s past the git budget.
+        start = time.monotonic()
+        deadline = start + 90.0
+        with mock.patch.object(jev, "GIT_SUBPROCESS_BUDGET_SECONDS", 30.0), \
+                mock.patch.object(jev, "_run_git", spy_run_git):
+            jev.gate(self.payload("git commit -m x"), self.cfg, self.classify(), self.logs.append,
+                     state_dir=self.state_dir, deadline=deadline)
+        end = time.monotonic()
+        self.assertTrue(seen)
+        # Sandwiched: the patched budget from a reading taken during the call, not the hook
+        # deadline or another constant. (When the budget starts is not pinned here.)
+        self.assertTrue(all(d is not None and start + 30.0 <= d <= end + 30.0 for d in seen),
+                        seen)
+        self.assertTrue(all(d < deadline - 30.0 for d in seen), seen)
 
     def test_slow_classifier_is_cut_off_at_the_hook_deadline(self):
         self.stage_change()
