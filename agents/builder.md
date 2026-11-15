@@ -2,6 +2,7 @@
 name: builder
 description: Implement a specified change in assigned files and run its acceptance check. Use for mechanical edits and clear briefs; leave design and root cause to the main session.
 model: sonnet
+effort: low
 tools: Read, Edit, Write, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: acceptEdits
