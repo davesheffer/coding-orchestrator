@@ -186,10 +186,10 @@ def score_critic(case, findings, seeded=None):
     if seeded is None:
         return {"correct": findings == [], "false_pos": len(findings) if findings else 0}
     lo, hi = case.get("accept", (seeded - 2, seeded + 2))
-    lines = [n for n in (parse_line(x.get("line")) for x in (findings or []) if isinstance(x, dict))
-             if n is not None]
-    return {"correct": any(lo <= n <= hi for n in lines),
-            "extra_findings": sum(1 for n in lines if not lo <= n <= hi)}
+    # A finding without a readable line cannot land on the defect, so it counts as an extra finding.
+    lines = [parse_line(x.get("line")) if isinstance(x, dict) else None for x in (findings or [])]
+    return {"correct": any(n is not None and lo <= n <= hi for n in lines),
+            "extra_findings": sum(1 for n in lines if n is None or not lo <= n <= hi)}
 
 
 def critic(case, effort):
@@ -279,7 +279,9 @@ def work(job):
         r = {"error": f"exception: {type(e).__name__}: {e}", "correct": False}
     r.update(role=role, item=item, effort=effort, rep=rep)
     with lock:
-        spent[0] += r.get("cost") or 0.0
+        if "cost" not in r:  # timeout, unparseable output or a crash: the spend is unknown, so fail closed
+            r["cost_unknown"] = True
+        spent[0] += RUN_BUDGET if r.get("cost_unknown") else (r.get("cost") or 0.0)
         rows.append(r)
         OUT.write_text(json.dumps(rows, indent=1), encoding="utf-8")
         print(json.dumps({k: r.get(k) for k in ("role", "item", "effort", "rep", "correct", "out_tokens", "secs",
