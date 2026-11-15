@@ -30,8 +30,8 @@ sending messages stay with the orchestrator and the user's authorization.
 | Role | Responsibility | Claude Code | Codex model / reasoning |
 |---|---|---|---|
 | Orchestrator | Design, ambiguity, root causes, final verification | Opus 5.5 | GPT-6.1 Sol / medium |
-| `scout` | Read-only lookup and reconnaissance | Sonnet | GPT-6 Luna / low |
-| `runner` | Exact commands; exit codes and verbatim failures | Haiku | GPT-6 Luna / low |
+| `scout` | Read-only lookup and reconnaissance | Haiku / low effort | GPT-6 Luna / low |
+| `runner` | Exact commands; exit codes and verbatim failures | Haiku / low effort | GPT-6 Luna / low |
 | `builder` | A specified change, then its acceptance check | Sonnet | GPT-6.1 Sol / medium |
 | `critic` | Fresh-context adversarial review | Fable | GPT-6 Astra / high |
 
@@ -59,12 +59,17 @@ unchanged.
 
 The cross-client tier mapping is **Sol → Opus 5.5**, **Astra → Fable**,
 **Tera → Sonnet**, and **Luna → Sonnet**. Tera has no separate bundled role;
-the mapping applies if that tier is used for a future role.
+the mapping applies if that tier is used for a future role. The Luna mapping
+is the generic tier pairing; the bundled scout and runner roles, which are Luna
+roles elsewhere, run on Haiku on Claude.
 
 The Claude installer sets `claude-opus-5-5` as the main-session default when no
 model is already selected in user settings; existing explicit choices remain
-untouched. Its named scout and builder roles use Sonnet, its runner uses Haiku, and its critic
-uses Fable. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
+untouched. Its named builder role uses Sonnet, its scout and runner use Haiku at `effort: low`, and its critic
+uses Fable. The read-only benchmark (`bin/compare-claude-readonly.py --efforts`) found Haiku matching
+Sonnet on lookup tasks at about a twelfth of the cost, with no measurable gain from medium over low effort;
+builder and critic keep the session's effort until they have their own benchmark. Jev's default
+`pinned_agents` includes `scout` and `runner`, so routing never moves them off Haiku. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
 follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
 Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
 [Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
@@ -351,7 +356,7 @@ installed `relay/config.json`:
 | `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
 | `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
 | `respect_explicit_model` | `false` | route: never override a call that already sets `model`. When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id) |
-| `pinned_agents` | `["critic", "fork"]` | route: subagent types that are never rerouted |
+| `pinned_agents` | `["critic", "fork", "scout", "runner"]` | route: subagent types that are never rerouted. A list you set replaces the default, so keep `scout` and `runner` in it to hold them on Haiku |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
 | `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted. A removed tier's full model id (e.g. `claude-opus-4-1` with `opus` removed) can still be rewritten to a kept tier, as its alias would be. `opusplan` counts as the opus tier, so it is never rewritten to `opus` |
 | `shift_low`, `shift_high` | `0.25`, `0.75` | shift: probability-of-continuation thresholds |
@@ -400,7 +405,9 @@ rule (pinned agents, low or invalid confidence and same-tier choices keep the
 current model). It makes 30 live API calls. `--dry-run` only validates the file,
 and `--labels-file` tries alternative tier rubrics. The last recorded run of the
 default rubrics (2026-10-01) scored 30/30, with applied accuracy 30/30 (21 of
-the 30 decisions changed the model) and confidence 0.92 to 0.98. The rubrics
+the 30 decisions changed the model) and confidence 0.92 to 0.98. That run
+predates pinning `scout` and `runner`; their seven cases now use
+`general-purpose` and have not been rerun. The rubrics
 were tuned on this benchmark, so check your own log with `jev-report.py` too.
 
 ##### Asking Jev about files: `ask-jev.py`

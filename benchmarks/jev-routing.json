@@ -3,14 +3,14 @@
   "tasks": [
     {
       "id": "locate-write-log",
-      "subagent_type": "scout",
+      "subagent_type": "general-purpose",
       "description": "Find jev log writer",
       "prompt": "Locate the function that appends entries to relay/jev-log.jsonl and the size threshold that triggers rotation. Cite path and line numbers. Do not edit files.",
       "expected": "sonnet"
     },
     {
       "id": "run-relay-tests",
-      "subagent_type": "runner",
+      "subagent_type": "general-purpose",
       "description": "Run relay tests",
       "prompt": "Run `python3 -m unittest tests.test_relay -v` from the repository root and report the pass/fail counts and the exact exit code. Quote any failure tracebacks verbatim, truncated to 40 lines.",
       "expected": "sonnet"
@@ -24,7 +24,7 @@
     },
     {
       "id": "list-hook-events",
-      "subagent_type": "scout",
+      "subagent_type": "general-purpose",
       "description": "List hook events",
       "prompt": "Read hooks.json and list every hook event name with the command it runs. Report as a table; do not edit anything.",
       "expected": "sonnet"
@@ -38,7 +38,7 @@
     },
     {
       "id": "pr-status-once",
-      "subagent_type": "runner",
+      "subagent_type": "general-purpose",
       "description": "Check PR status",
       "prompt": "Run bin/pr-status once for the current branch and summarize the CI checks that are failing, with their names and URLs. Do not retry or poll.",
       "expected": "sonnet"
@@ -52,7 +52,7 @@
     },
     {
       "id": "summarize-install-flags",
-      "subagent_type": "scout",
+      "subagent_type": "general-purpose",
       "description": "Summarize installer flags",
       "prompt": "Summarize the command-line flags accepted by claude/install.py and what each one does, citing the argparse lines. Read-only.",
       "expected": "sonnet"
@@ -101,7 +101,7 @@
     },
     {
       "id": "tricky-scout-debug",
-      "subagent_type": "scout",
+      "subagent_type": "general-purpose",
       "description": "Fix empty jev log",
       "prompt": "relay/jev-log.jsonl stays empty because write_log resolves its path from the script directory, and the installer copies jev-route.py somewhere else. Make write_log and the installer's copy step agree on the relay/ log location, and add a test that runs a temp install and checks a routed call lands in the log.",
       "expected": "opus"
@@ -178,7 +178,7 @@
     },
     {
       "id": "tricky-scout-threat-model",
-      "subagent_type": "scout",
+      "subagent_type": "general-purpose",
       "description": "Look at endpoint check",
       "prompt": "Is endpoint_allowed in bin/jev_client.py sufficient to stop the API key being sent to an attacker-controlled host, considering userinfo tricks, IPv6 literals, DNS rebinding for localhost and redirects followed by urllib? Give a verdict with concrete bypasses if any.",
       "expected": "fable"

@@ -267,6 +267,15 @@ class DecideTests(unittest.TestCase):
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify()))
         self.assertEqual(self.calls, [])
 
+    def test_haiku_scout_and_runner_are_pinned_by_default(self):
+        for role in ("scout", "runner"):
+            with self.subTest(role=role):
+                self.agent(self.home, role, "haiku")
+                self.payload["tool_input"]["subagent_type"] = role
+                self.payload["tool_input"].pop("model", None)
+                self.assertIsNone(self.decide(self.payload, self.cfg, self.classify(choice="fable", confidence=0.99)))
+        self.assertEqual(self.calls, [])
+
     def test_missing_key_is_noop(self):
         with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
             self.assertIsNone(self.decide(self.payload, self.cfg, self.classify()))
@@ -341,7 +350,7 @@ class DecideTests(unittest.TestCase):
         cfg = self.load({"labels": {"gpt": "y", "haiku": "tiny"}, "min_confidence": 0.9})
         self.assertEqual(set(cfg["labels"]), {"sonnet", "opus", "fable", "haiku"})
         self.assertEqual(cfg["min_confidence"], 0.9)
-        self.assertEqual(cfg["pinned_agents"], ["critic", "fork"])
+        self.assertEqual(cfg["pinned_agents"], ["critic", "fork", "scout", "runner"])
 
     def test_partial_label_override_keeps_other_defaults(self):
         cfg = self.load({"labels": {"opus": "custom opus rubric"}})

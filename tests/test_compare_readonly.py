@@ -166,12 +166,85 @@ class CompareReadonlyTests(unittest.TestCase):
     def test_claude_answer_is_graded_against_the_required_terms(self):
         full = self.claude_record(json.dumps({"result": "ALPHA then beta", "modelUsage": {"haiku-x": {}}}))
         self.assertEqual((full["exit"], full["required_met"], full["actual_model"]), (0, True, "haiku-x"))
+        mixed = self.claude_record(json.dumps({"result": "alpha beta", "modelUsage": {
+            "side-haiku": {"costUSD": 0.001}, "main-sonnet": {"costUSD": 0.04}, "odd": "x"}}))
+        self.assertEqual(mixed["actual_model"], "main-sonnet")
         partial = self.claude_record(json.dumps({"result": "alpha only", "modelUsage": None}))
         self.assertEqual(partial["required_hits"], {"alpha": True, "beta": False})
         self.assertEqual((partial["exit"], partial["required_met"]), (0, False))
         # A task file may lower the threshold from "every term".
         self.assertTrue(self.claude_record(json.dumps({"result": "alpha only"}), min_hits=1)["required_met"])
         self.assertFalse(self.claude_record(json.dumps({"result": "neither"}), min_hits=1)["required_met"])
+
+    def test_effort_is_sent_to_the_cli_only_when_asked(self):
+        module = load("compare-claude-readonly")
+        done = module.subprocess.CompletedProcess([], 0, '{"result": "alpha"}', "")
+        for effort, expected in ((None, None), ("low", "low")):
+            with self.subTest(effort=effort), \
+                    mock.patch.object(module, "executable", return_value="claude.exe"), \
+                    mock.patch.object(module.subprocess, "run", return_value=done) as run:
+                record = module.run_one(Path("."), {"id": "t1", "prompt": "p", "required": ["alpha"]},
+                                        "haiku", .2, effort)
+                command = run.call_args.args[0]
+                self.assertEqual(record.get("effort"), expected)
+                if expected:
+                    self.assertEqual(command[command.index("--effort") + 1], expected)
+                else:
+                    self.assertNotIn("--effort", command)
+
+    def test_main_runs_every_model_at_every_requested_effort(self):
+        module = load("compare-claude-readonly")
+        calls = []
+
+        def run_one(repo, task, model, budget, effort=None):
+            calls.append((model, effort))
+            return {"task": task["id"], "model": model, "effort": effort, "exit": 0,
+                    "required_hits": {"alpha": True}, "required_met": True}
+
+        for efforts, expected in (([], [("haiku", None), ("sonnet", None)]),
+                                  (["--efforts", "low", "medium", "low"],
+                                   [("haiku", "low"), ("haiku", "medium"),
+                                    ("sonnet", "low"), ("sonnet", "medium")])):
+            calls.clear()
+            with self.subTest(efforts=efforts), \
+                    tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as temp:
+                tasks = Path(temp) / "tasks.json"
+                tasks.write_text(json.dumps([{"id": "t1", "prompt": "p", "required": ["alpha"]}]),
+                                 encoding="utf-8")
+                printed = io.StringIO()
+                with mock.patch.object(module, "run_one", run_one), \
+                        mock.patch.object(module, "tree_status", return_value=""), \
+                        contextlib.redirect_stdout(printed):
+                    code = module.main(["--tasks", str(tasks), *efforts, "--jobs", "1",
+                                        "--output", str(Path(temp) / "results.json")])
+                self.assertEqual(code, 0)
+                self.assertEqual(sorted(calls, key=str), sorted(expected, key=str))
+                self.assertEqual("@low" in printed.getvalue(), bool(efforts))
+
+    def test_a_run_that_raises_keeps_its_effort_in_the_error_record(self):
+        module = load("compare-claude-readonly")
+
+        def run_one(repo, task, model, budget, effort=None):
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as temp:
+            tasks = Path(temp) / "tasks.json"
+            tasks.write_text(json.dumps([{"id": "t1", "prompt": "p", "required": ["alpha"]}]),
+                             encoding="utf-8")
+            output = Path(temp) / "results.json"
+            printed = io.StringIO()
+            with mock.patch.object(module, "run_one", run_one), \
+                    mock.patch.object(module, "tree_status", return_value=""), \
+                    contextlib.redirect_stdout(printed):
+                code = module.main(["--tasks", str(tasks), "--models", "haiku", "--efforts", "low",
+                                    "--jobs", "1", "--output", str(output)])
+            records = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["effort"], "low")
+        self.assertEqual(records[0]["exit"], 1)
+        self.assertIn("RuntimeError: boom", records[0]["error"])
+        self.assertIn("t1 haiku@low: exit=1", printed.getvalue())
 
     def test_exit_status_fails_when_a_run_misses_its_required_hits(self):
         for name in ("compare-claude-readonly", "compare-codex-readonly"):
