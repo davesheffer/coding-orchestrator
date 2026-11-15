@@ -25,7 +25,8 @@ EFFORTS = ("low", "medium", "high")
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 BUILDER_MODEL, CRITIC_MODEL = "sonnet", "claude-fable-5-2"
 DEFAULT_MODELS = (BUILDER_MODEL, CRITIC_MODEL)
-MODEL_ID = re.compile(r"claude-[a-z]+-[0-9]+(-[0-9]+)*")  # full versioned id; aliases cannot be checked
+MODEL_ID = re.compile(r"claude-[a-z]+-[0-9]+(-[0-9]+)+")  # full versioned id; aliases cannot be checked
+RUN_BUDGET = 1.5  # --max-budget-usd per call; also what an unreadable cost is counted as
 
 EXPECTED = {"builder": "claude-sonnet-5-5", "critic": "claude-fable-5-2"}
 DEFAULT_EXPECTED = dict(EXPECTED)
@@ -45,22 +46,24 @@ def model_mismatch(role, used):
 
 
 def num(x):
-    """x if it is a real number (not bool), else 0, so malformed CLI fields cannot crash a paid row."""
-    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else 0
+    """x if it is a finite, non-negative real number (not bool), else 0, so malformed CLI fields
+    cannot crash a paid row or poison a total."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return 0
+    try:
+        return x if math.isfinite(x) and x >= 0 else 0
+    except OverflowError:  # an int too large for a float
+        return 0
 
 
 def safe_cost(x):
-    """Finite float cost, or 0.0 (the row is then labelled "bad cost")."""
-    try:
-        c = float(num(x))
-    except OverflowError:
-        return 0.0
-    return c if math.isfinite(c) else 0.0
+    """Finite non-negative float cost, or 0.0 (run() then labels the row and counts RUN_BUDGET)."""
+    return float(num(x))
 
 
 def run(prompt, model, effort, cwd, tools, role, extra=()):
     cmd = [CLAUDE, "-p", "--model", model, "--effort", effort, "--output-format", "json",
-           "--max-budget-usd", "1.5", "--no-session-persistence", "--strict-mcp-config",
+           "--max-budget-usd", str(RUN_BUDGET), "--no-session-persistence", "--strict-mcp-config",
            "--setting-sources", "", "--tools", tools, *extra]
     t = time.monotonic()
     try:
@@ -88,7 +91,9 @@ def run(prompt, model, effort, cwd, tools, role, extra=()):
         r["error"] = f"cli error: {d.get('subtype')}"
     cost = d.get("total_cost_usd")
     if cost is not None and (isinstance(cost, bool) or cost != 0 and safe_cost(cost) == 0.0):
-        bad = f"bad cost: {str(cost)[:40]}"
+        # Fail closed: count the per-call budget so --cap still stops a run whose costs are unreadable.
+        r["cost"] = RUN_BUDGET
+        bad = f"bad cost: {str(cost)[:40]} (counted as ${RUN_BUDGET})"
         r["error"] = f"{r['error']}; {bad}" if "error" in r else bad
     # A CLI error before the role's model answered leaves no non-Haiku usage; that is not a wrong model.
     served = any("haiku" not in k for k in mu)
@@ -310,8 +315,9 @@ def main(argv=None):
     ARGS = args = ap.parse_args(argv)
     if not args.check and not args.output:
         ap.error("--output is required unless --check is given")
-    efforts = tuple(dict.fromkeys(e.strip() for e in args.efforts.split(",") if e.strip()))
-    if not efforts or any(e not in EFFORT_CHOICES for e in efforts):
+    items = [e.strip() for e in args.efforts.split(",")]
+    efforts = tuple(dict.fromkeys(items))
+    if any(e not in EFFORT_CHOICES for e in items):
         ap.error(f"--efforts must be a comma-separated subset of {','.join(EFFORT_CHOICES)}")
     for flag in ("builder_model", "critic_model"):
         v = getattr(args, flag)
