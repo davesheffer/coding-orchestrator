@@ -38,7 +38,7 @@ python bin/compare-claude-readonly.py --models haiku sonnet --efforts low medium
 | Sonnet @ low | 4 | $0.242 | 15.3 s |
 | Sonnet @ medium | 2 | $0.248 | 16.1 s |
 
-Sonnet's failures were three read-only errors caused by concurrent git activity in the target repository and three missed required terms. The run supports Haiku at `effort: low` for scout and runner lookups; it does not measure builds, edits, or review.
+Sonnet's failures were three read-only errors caused by concurrent git activity in the target repository and three missed required terms. The run supports Haiku at `effort: low` for scout lookups. It does not measure runner command execution, builds, edits, or review. A 2026-11-15 spot check (`claude -p --model haiku --effort low|high`, two runs each on one short reasoning prompt) found no consistent difference in output tokens (low 262 and 384, high 322 and 235), so whether Haiku 5.5 honours effort is still unverified.
 
 The raw local pilot artifacts are in the user's private `~/.codex/agent-runs/` directory. Model, version, pricing, and task mix can change; repeat on a broader frozen task set before claiming general savings.
 
