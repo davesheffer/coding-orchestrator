@@ -69,7 +69,7 @@ untouched. Its named builder role uses Sonnet, its scout and runner use Haiku at
 uses Fable. The read-only benchmark (`bin/compare-claude-readonly.py --efforts`) found Haiku matching
 Sonnet on lookup tasks at about a twelfth of the cost, with no measurable gain from medium over low effort;
 builder and critic keep the session's effort until they have their own benchmark. Jev's default
-`pinned_agents` includes `scout` and `runner`, so routing never moves them off Haiku. Only those named roles are held: a built-in agent called with `model: haiku` can still be upgraded by Jev. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
+`pinned_agents` includes `scout` and `runner`, so routing never moves them off Haiku. Only those exact `subagent_type` names are held: with the default `respect_explicit_model: false`, a built-in agent called with `model: haiku` can still be upgraded by Jev. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
 follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
 Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
 [Claude Code 2.1.280 or later](https://code.claude.com/docs/en/model-config)
@@ -356,7 +356,7 @@ installed `relay/config.json`:
 | `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
 | `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
 | `respect_explicit_model` | `false` | route: never override a call that already sets `model`. When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id) |
-| `pinned_agents` | `["critic", "fork", "scout", "runner"]` | route: subagent types that are never rerouted. A list you set replaces the default, so keep `scout` and `runner` in it to hold them on Haiku |
+| `pinned_agents` | `["critic", "fork", "scout", "runner"]` | route: subagent types that are never rerouted. A list you set replaces the default, so keep `scout` and `runner` in it to hold them on Haiku. Matching is exact and case-sensitive: `Scout` or `plugin:scout` is not pinned |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
 | `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted. A removed tier's full model id (e.g. `claude-opus-4-1` with `opus` removed) can still be rewritten to a kept tier, as its alias would be. `opusplan` counts as the opus tier, so it is never rewritten to `opus` |
 | `shift_low`, `shift_high` | `0.25`, `0.75` | shift: probability-of-continuation thresholds |
