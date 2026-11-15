@@ -404,10 +404,11 @@ applied accuracy: the model that would actually run after `jev-route.py`'s own
 rule (pinned agents, low or invalid confidence and same-tier choices keep the
 current model). It makes 30 live API calls. `--dry-run` only validates the file,
 and `--labels-file` tries alternative tier rubrics. The last recorded run of the
-default rubrics (2026-10-01) scored 30/30, with applied accuracy 30/30 (21 of
-the 30 decisions changed the model) and confidence 0.92 to 0.98. That run
-predates pinning `scout` and `runner`; their seven cases now use
-`general-purpose` and have not been rerun. The rubrics
+default rubrics (2026-11-15, after pinning `scout` and `runner` moved their
+seven cases to `general-purpose`) scored 30/30, with applied accuracy 30/30
+(26 of the 30 decisions changed the model) and mean confidence 0.976. The
+previous run (2026-10-01, before that change) also scored 30/30, with 21
+model changes and confidence 0.92 to 0.98. The rubrics
 were tuned on this benchmark, so check your own log with `jev-report.py` too.
 
 ##### Asking Jev about files: `ask-jev.py`
