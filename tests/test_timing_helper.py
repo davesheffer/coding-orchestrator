@@ -36,6 +36,38 @@ class TimingHelperTests(unittest.TestCase):
             timing.assert_scales(self, lambda n: n, run, 300, 1200, label="quadratic")
         self.assertIn("ratio", str(raised.exception))
 
+    def scripted(self, costs):
+        # A fake clock: run call i costs costs[i] seconds and returns i.
+        clock = [0.0]
+        calls = iter(range(len(costs)))
+
+        def run(n):
+            i = next(calls)
+            clock[0] += costs[i]
+            return i
+        return clock, run
+
+    def test_scales_keeps_each_sizes_fastest_run(self):
+        # Rounds of (small, large): each size's stalled run must be discarded for its
+        # best-so-far. Min/min ratios are 10, 4 and 1.5, so the third round passes. Small's
+        # last run (0.5 > 0.1) passes round two; small's never-lowered max passes round one;
+        # large's never-lowered max never passes.
+        clock, run = self.scripted([0.1, 1.0, 0.5, 0.4, 0.3, 0.15])
+        with mock.patch.object(timing.time, "perf_counter", lambda: clock[0]):
+            result = timing.assert_scales(self, lambda n: n, run, 1, 2, max_ratio=2.0,
+                                          label="scripted", n=3)
+        self.assertEqual(result, 5)
+
+    def test_scales_reports_each_sizes_fastest_run(self):
+        # Every round fails; the report must show each size's minimum (0.1 and 0.6), not
+        # its last run (0.2 and 0.8).
+        clock, run = self.scripted([0.3, 0.9, 0.1, 0.6, 0.2, 0.8])
+        with mock.patch.object(timing.time, "perf_counter", lambda: clock[0]), \
+                self.assertRaises(AssertionError) as raised:
+            timing.assert_scales(self, lambda n: n, run, 1, 2, max_ratio=2.0, label="scripted",
+                                 n=3)
+        self.assertIn("n=1 took 0.1000s, n=2 took 0.6000s, ratio 6.0 > 2", str(raised.exception))
+
     def test_best_of_returns_shortest_run(self):
         times = iter([0.0, 5.0, 10.0, 11.0, 20.0, 20.5])
         with mock.patch.object(timing.time, "perf_counter", lambda: next(times)):
