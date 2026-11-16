@@ -88,6 +88,29 @@ A follow-up run used the same six builder tasks with Opus as the builder (`claud
 
 A second follow-up ran the same six builder tasks with Fable as the builder (`claude-fable-5-2`, one run per effort, 12 runs, $0.99, 0 errors, served only by Fable plus the CLI's Haiku calls). Low effort matched medium at 6/6 each; low had a median of 1039 output tokens against 1180, about 22 s for both, and $0.078 against $0.082 per run. Fable's default effort, `high`, was not run. Fable at low effort is therefore measured on these tasks, with one run per cell and the same ceiling caveat.
 
+A third follow-up, on 2026-11-16, tested harder builder tasks, because the six above sit at the ceiling. `--task-set hard` runs six multi-file tasks from `benchmarks/effort/hard_tasks.py`, each with two or three files to change:
+- `settings_leak`: a bug report about settings shared between services.
+- `cursor_pages`: offset cursors that skip or repeat items when the data changes between pages.
+- `units_refactor`: move a table into a new module, add temperature conversion, and keep an existing caller working.
+- `install_order`: deterministic dependency order with cycle reporting.
+- `event_bus`: changing handlers while an event is being emitted.
+- `money_cents`: replace float prices with integer cents.
+
+Specs are written more like bug reports than full specifications. Hidden tests check edge cases that follow from the spec but are not spelled out in it. Each task names the files the builder may edit or create; changing any other file, including `test_solution.py`, or adding a stray file fails the run. Multi-file runs also get Glob and Grep. `--check` also validates each task's file layout.
+
+```bash
+python benchmarks/effort/bench.py --output <private-path>/hard.json --only builder --task-set hard --builder-reps 2 --efforts low,medium --cap 6
+```
+
+The Sonnet builder (`claude-sonnet-5-5`) ran each task twice per effort: 24 runs, $0.80, 0 errors, served only by Sonnet plus the CLI's Haiku calls.
+
+| Builder @ effort | Correct | Median output tokens | Median seconds | Cost per run |
+|---|---|---|---|---|
+| sonnet @ low | 12/12 | 1179 | 20.0 | $0.033 |
+| sonnet @ medium | 12/12 | 1258 | 20.4 | $0.034 |
+
+These tasks also sit at the ceiling. They took about twice the output tokens of the single-file tasks at the same effort, but low still passed every hidden edge-case test. The run supports keeping the builder at `effort: low` for bounded multi-file changes of this size. It does not show where low starts to hurt; finding that would need larger changes, or specs with real gaps, than a benchmark with fixed hidden tests can grade fairly.
+
 `claude -p --model fable` resolved to `claude-fable-5-1`, which billed about $0.18 and returned no output tokens; `claude-opus-4-8` then produced the answer. This happened in 3 of 3 calls. A critic subagent with `model: fable` served every response from `claude-fable-5-2` (7 of 7 in its transcript), so the role is unaffected in that test. Inside Claude Code the alias also reached 5.2 when Jev chose it: Jev's log shows 17 subagent calls it moved to `fable` (2 builders, 11 general-purpose, 4 scouts), and all 40 non-critic subagents with `model: fable` in local transcripts up to 2026-11-15 were served only by `claude-fable-5-2`. Fallback still happens: 3 critic transcripts with `model: fable` had part of their responses served by `claude-opus-4-8`. Benchmark scripts should pass the explicit model id.
 
 The raw local pilot artifacts are in the user's private `~/.codex/agent-runs/` directory. Model, version, pricing, and task mix can change; repeat on a broader frozen task set before claiming general savings.
