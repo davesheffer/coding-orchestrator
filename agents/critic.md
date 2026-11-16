@@ -2,6 +2,7 @@
 name: critic
 description: Fresh adversarial review of a risky diff or unresolved claim, read-only by instruction; Bash is not sandboxed. Reserve for security, migrations, concurrency, data-loss risk, public APIs, or low-confidence conclusions.
 model: fable
+effort: high
 tools: Read, Grep, Glob, Bash
 disallowedTools: mcp__*
 permissionMode: plan

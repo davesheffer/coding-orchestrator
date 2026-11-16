@@ -113,7 +113,7 @@ class ClaudeInstallTests(unittest.TestCase):
         guard = (self.home / "bin/turn-guard.py").as_posix()
         self.assertEqual((self.home / "bin/turn-guard.py").read_bytes(), (ROOT / "bin/turn-guard.py").read_bytes())
         routing = {"scout": ("haiku", "low"), "runner": ("haiku", "low"),
-                   "builder": ("sonnet", "low"), "critic": ("fable", None)}
+                   "builder": ("sonnet", "low"), "critic": ("fable", "high")}
         for name, cap in (("scout", 20), ("runner", 15), ("builder", 60), ("critic", 40)):
             text = (self.home / "agents" / f"{name}.md").read_text(encoding="utf-8")
             self.assertNotIn("__TURN_GUARD__", text)
