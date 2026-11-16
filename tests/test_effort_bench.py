@@ -332,6 +332,110 @@ class EffortBenchTests(unittest.TestCase):
             self.assertNotIn("cost_unknown", r)
             self.assertEqual(bench.spent[0], 0.25)
 
+    def fake_builder_run(self, bench, write, seen):
+        """A bench.run stand-in that records the call and writes `write` (name -> text or None to delete)."""
+        def fake_run(prompt, model, effort, cwd, tools, role, extra=()):
+            seen.append((prompt, tools))
+            for name, text in write.items():
+                if text is None:
+                    (Path(cwd) / name).unlink()
+                else:
+                    (Path(cwd) / name).write_text(text, encoding="utf-8")
+            return {"cost": 0.1, "result": "DONE"}
+        return fake_run
+
+    def test_hard_task_reference_scores_correct_and_prompt_names_files(self):
+        bench = load("bench")
+        t = bench.HARD_TASKS["units_refactor"]
+        seen = []
+        with mock.patch.object(bench, "run", self.fake_builder_run(bench, t["ref"], seen)):
+            r = bench.builder("units_refactor", "low")
+        self.assertTrue(r["correct"], r)
+        self.assertEqual((r["extra_files"], r["changed_fixed"]), ([], []))
+        self.assertEqual(set(r["solution"]), {"units.py", "unit_table.py"})
+        prompt, tools = seen[0]
+        self.assertIn("Edit only units.py and create unit_table.py", prompt)
+        self.assertEqual(tools, "Read,Edit,Write,Glob,Grep")
+
+    def test_hard_task_tamper_and_stray_files_fail(self):
+        bench = load("bench")
+        t = bench.HARD_TASKS["units_refactor"]
+        cases = (
+            ({**t["ref"], "legacy.py": t["files"]["legacy.py"] + "\n# touched\n"}, "changed_fixed", ["legacy.py"]),
+            ({**t["ref"], "legacy.py": None}, "changed_fixed", ["legacy.py"]),
+            ({**t["ref"], "test_solution.py": "import unittest\n"}, "changed_fixed", ["test_solution.py"]),
+            ({**t["ref"], "helper.py": "X = 1\n"}, "extra_files", ["helper.py"]),
+        )
+        for write, key, want in cases:
+            with self.subTest(key=key, want=want), \
+                    mock.patch.object(bench, "run", self.fake_builder_run(bench, write, [])):
+                r = bench.builder("units_refactor", "low")
+                self.assertTrue(r["tamper"])
+                self.assertFalse(r["correct"])
+                self.assertEqual(r[key], want)
+
+    def test_single_file_tamper_and_stray_files_fail(self):
+        bench = load("bench")
+        name = next(iter(bench.TASKS))
+        ref = {"solution.py": bench.TASKS[name]["ref"]}
+        for write, key, want in (({**ref, "test_solution.py": "import unittest\n"}, "changed_fixed",
+                                  ["test_solution.py"]),
+                                 ({**ref, "helper.py": "X = 1\n"}, "extra_files", ["helper.py"])):
+            with self.subTest(key=key), mock.patch.object(bench, "run", self.fake_builder_run(bench, write, [])):
+                r = bench.builder(name, "low")
+                self.assertTrue(r["tamper"])
+                self.assertFalse(r["correct"])
+                self.assertEqual(r[key], want)
+
+    def test_single_file_prompt_and_tools_unchanged(self):
+        bench = load("bench")
+        name = next(iter(bench.TASKS))
+        seen = []
+        with mock.patch.object(bench, "run",
+                               self.fake_builder_run(bench, {"solution.py": bench.TASKS[name]["ref"]}, seen)):
+            r = bench.builder(name, "low")
+        self.assertTrue(r["correct"], r)
+        self.assertIsInstance(r["solution"], str)
+        prompt, tools = seen[0]
+        self.assertEqual(prompt, f"Edit only solution.py in the current directory. {bench.TASKS[name]['spec']} "
+                         "test_solution.py shows examples; do not edit it or create other files. "
+                         "Reply DONE when finished.")
+        self.assertEqual(tools, "Read,Edit,Write")
+
+    def test_check_rejects_bad_hard_layouts(self):
+        base = load("bench").HARD_TASKS["install_order"]
+        # Each case must be caught by its own rule: the expected text is asserted, not only the exit code.
+        for change, want in (({"ref": {**base["ref"], "notes.py": "X = 1\n"}}, "ref changes files it may not"),
+                             ({"editable": ("graph.py", "installer.py", "missing.py")},
+                              "editable names not in files"),
+                             ({"create": ("graph.py",)}, "create names already in files"),
+                             ({"create": ("new.py",)}, "create names without a reference"),
+                             ({"create": ("test_hidden.py",), "ref": {**base["ref"], "test_hidden.py": "X = 1\n"}},
+                              "reserved file name"),
+                             ({"ref": {"graph.py": base["files"]["graph.py"],
+                                       "installer.py": base["files"]["installer.py"]}}, "ref fails test_hidden")):
+            bench = load("bench")
+            bench.HARD_TASKS = {"install_order": {**base, **change}}
+            out = io.StringIO()
+            with self.subTest(want=want), contextlib.redirect_stdout(out):
+                rc = bench.check()
+            self.assertEqual(rc, 1, want)
+            line = next(x for x in out.getvalue().splitlines() if x.startswith("builder install_order:"))
+            self.assertIn(want, line)
+
+    def test_hard_task_set_flag(self):
+        bench = load("bench")
+        with tempfile.TemporaryDirectory() as tmp:
+            seen = []
+            with mock.patch.object(bench, "work", side_effect=seen.append), \
+                    mock.patch.object(bench, "CLAUDE", "claude-must-not-run"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                bench.main(["--output", str(Path(tmp) / "rows.json"), "--only", "builder", "--task-set", "hard",
+                            "--builder-reps", "2", "--efforts", "low,medium"])
+        self.assertEqual(len(seen), 2 * 2 * len(bench.HARD_TASKS))
+        self.assertEqual({job[1] for job in seen}, set(bench.HARD_TASKS))
+        self.assertFalse(set(bench.TASKS) & set(bench.HARD_TASKS))
+
 
 if __name__ == "__main__":
     unittest.main()

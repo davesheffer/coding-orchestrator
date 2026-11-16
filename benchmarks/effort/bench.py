@@ -2,12 +2,14 @@
 
 Usage: python benchmarks/effort/bench.py --output <private-path>.json [--builder-reps 3] [--critic-reps 2]
        [--jobs 3] [--cap 12] [--only builder|critic] [--builder-model <id>] [--critic-model <id>]
-       [--efforts low,medium,high]
+       [--efforts low,medium,high] [--task-set default|hard]
        python benchmarks/effort/bench.py --check    (offline: validate tasks and cases, no claude calls)
 
 Arms (override with --builder-model / --critic-model): the builder runs on `sonnet`; the critic runs on the explicit id `claude-fable-5-2`, because on
 2026-11-15 `claude -p --model fable` resolved to claude-fable-5-1 and fell back to claude-opus-4-8.
-Each builder task gives a stub and visible tests, then scores hidden tests (builder_tasks.py); each critic
+Each builder task gives a stub and visible tests, then scores hidden tests (builder_tasks.py; --task-set hard
+uses the multi-file tasks in hard_tasks.py, where files outside a task's `editable` and `create` must not
+change); each critic
 case gives a diff and scores whether a finding lands within its `accept` range (default two lines of the seeded defect), or that a clean
 change gets no findings (critic_tasks.py). Rows are rewritten to --output after every job; keep that file
 private. Prompts go on stdin (claude.CMD runs through cmd.exe, which would treat < > in argv as redirects).
@@ -18,6 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from builder_tasks import TASKS  # noqa: E402
+from hard_tasks import HARD_TASKS  # noqa: E402
 from critic_tasks import CASES  # noqa: E402
 
 CLAUDE = shutil.which("claude") or "claude"
@@ -109,29 +112,58 @@ def scoring_error(e, r):
     return f"{msg}; {r['error']}" if r.get("error") else msg
 
 
+def all_tasks():
+    """Every builder task by name, across both task sets (names must not collide)."""
+    clash = set(TASKS) & set(HARD_TASKS)
+    assert not clash, ("builder task name in both sets", sorted(clash))
+    return {**TASKS, **HARD_TASKS}
+
+
+def layout(t):
+    """(starting files, reference files, editable names, names to create) for a single- or multi-file task."""
+    if "files" not in t:
+        return {"solution.py": t["stub"]}, {"solution.py": t["ref"]}, ("solution.py",), ()
+    return dict(t["files"]), {**t["files"], **t["ref"]}, tuple(t["editable"]), tuple(t.get("create", ()))
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
 def builder(task, effort):
-    t = TASKS[task]
+    t = all_tasks()[task]
+    files, _, editable, create = layout(t)
     with tempfile.TemporaryDirectory() as tmp:
         ws = Path(tmp) / "ws"
         ws.mkdir()
-        (ws / "solution.py").write_text(t["stub"], encoding="utf-8")
+        for name, src in files.items():
+            (ws / name).write_text(src, encoding="utf-8")
         (ws / "test_solution.py").write_text(t["visible"], encoding="utf-8")
-        h = hashlib.sha256((ws / "test_solution.py").read_bytes()).hexdigest()
-        prompt = (f"Edit only solution.py in the current directory. {t['spec']} test_solution.py shows "
-                  "examples; do not edit it or create other files. Reply DONE when finished.")
-        r = run(prompt, BUILDER_MODEL, effort, ws, "Read,Edit,Write", "builder",
-                ("--permission-mode", "acceptEdits"))
+        fixed = {n: sha(ws / n) for n in [*files, "test_solution.py"] if n not in editable}
+        if "files" not in t:  # the original single-file prompt and tools, unchanged
+            prompt = (f"Edit only solution.py in the current directory. {t['spec']} test_solution.py shows "
+                      "examples; do not edit it or create other files. Reply DONE when finished.")
+            tools = "Read,Edit,Write"
+        else:
+            may = f"Edit only {', '.join(editable)}" + (f" and create {', '.join(create)}" if create else "")
+            prompt = (f"{may} in the current directory. {t['spec']} test_solution.py shows examples; do not "
+                      "edit it or any other file, and do not create other files. Reply DONE when finished.")
+            tools = "Read,Edit,Write,Glob,Grep"
+        r = run(prompt, BUILDER_MODEL, effort, ws, tools, "builder", ("--permission-mode", "acceptEdits"))
         try:
-            return score_builder(r, t, ws, h)
+            return score_builder(r, t, ws, fixed)
         except Exception as e:  # keep the paid run's cost
             r.update(error=scoring_error(e, r), correct=False)
             return r
 
 
-def score_builder(r, t, ws, h):
-    extra = sorted(p.name for p in ws.iterdir() if p.name not in
-                   {"solution.py", "test_solution.py", "__pycache__"})
-    tamper = hashlib.sha256((ws / "test_solution.py").read_bytes()).hexdigest() != h or bool(extra)
+def score_builder(r, t, ws, fixed):
+    """Run visible and hidden tests in ws; `fixed` maps each file the builder must not change to its sha256."""
+    files, _, editable, create = layout(t)
+    allowed = {*files, *create, "test_solution.py", "__pycache__"}
+    extra = sorted(p.name for p in ws.iterdir() if p.name not in allowed)
+    changed = sorted(n for n, h in fixed.items() if sha(ws / n) != h)
+    tamper = bool(changed or extra)
     try:
         vis = subprocess.run([sys.executable, "-m", "unittest", "-q", "test_solution"], cwd=ws,
                              capture_output=True, text=True, timeout=UNITTEST_TIMEOUT)
@@ -148,10 +180,12 @@ def score_builder(r, t, ws, h):
         summary = (fails.group(1) if fails else "ok") if m else err[-200:]
     except subprocess.TimeoutExpired:
         hid_pass, err, summary = False, "", "timeout"
+    out = {n: (ws / n).read_text(encoding="utf-8", errors="replace") if (ws / n).is_file() else None
+           for n in (*editable, *create)}
     r.update(visible_pass=vis_pass, hidden_pass=hid_pass, tamper=tamper,
-             extra_files=extra, hidden_summary=summary,
+             extra_files=extra, changed_fixed=changed, hidden_summary=summary,
              hidden_tail=err[-1200:] if not hid_pass else "",
-             solution=(ws / "solution.py").read_text(encoding="utf-8", errors="replace"))
+             solution=out["solution.py"] if "files" not in t else out)
     r["correct"] = r["visible_pass"] and r["hidden_pass"] and not tamper and "error" not in r
     return r
 
@@ -233,17 +267,39 @@ def unittest_ok(ws, module):
                           text=True, timeout=UNITTEST_TIMEOUT).returncode == 0
 
 
+def layout_problems(t):
+    """Static checks on a multi-file task's layout; [] for a single-file task."""
+    if "files" not in t:
+        return []
+    files, _, editable, create = layout(t)
+    out = []
+    if set(editable) - set(files):
+        out.append(f"editable names not in files: {sorted(set(editable) - set(files))}")
+    if set(create) & set(files):
+        out.append(f"create names already in files: {sorted(set(create) & set(files))}")
+    if set(t["ref"]) - set(editable) - set(create):
+        out.append(f"ref changes files it may not: {sorted(set(t['ref']) - set(editable) - set(create))}")
+    if set(create) - set(t["ref"]):
+        out.append(f"create names without a reference: {sorted(set(create) - set(t['ref']))}")
+    if {"test_solution.py", "test_hidden.py", "__pycache__"} & {*files, *create}:
+        out.append("task uses a reserved file name")
+    return out
+
+
 def check():
     bad = 0
-    for name, t in TASKS.items():
-        problems = []
-        with tempfile.TemporaryDirectory() as tmp:
-            ws = Path(tmp)
-            (ws / "test_solution.py").write_text(t["visible"], encoding="utf-8")
-            (ws / "test_hidden.py").write_text(t["hidden"], encoding="utf-8")
-            for label, src, want in (("stub", t["stub"], False), ("ref", t["ref"], True)):
-                (ws / "solution.py").write_text(src, encoding="utf-8")
-                shutil.rmtree(ws / "__pycache__", ignore_errors=True)
+    for name, t in all_tasks().items():
+        problems = layout_problems(t)
+        files, ref, _, _ = layout(t)
+        for label, srcs, want in (("stub", files, False), ("ref", ref, True)):
+            if problems:
+                break
+            with tempfile.TemporaryDirectory() as tmp:  # fresh per label: no stale created files or bytecode
+                ws = Path(tmp)
+                (ws / "test_solution.py").write_text(t["visible"], encoding="utf-8")
+                (ws / "test_hidden.py").write_text(t["hidden"], encoding="utf-8")
+                for fname, src in srcs.items():
+                    (ws / fname).write_text(src, encoding="utf-8")
                 for module in ("test_solution", "test_hidden"):
                     if unittest_ok(ws, module) != want:
                         problems.append(f"{label} {'fails' if want else 'passes'} {module}")
@@ -312,6 +368,8 @@ def main(argv=None):
     ap.add_argument("--builder-model", help="full model id, e.g. claude-opus-5-5 (default: sonnet alias, "
                     "expected to serve claude-sonnet-5-5)")
     ap.add_argument("--critic-model", help="full model id (default: claude-fable-5-2)")
+    ap.add_argument("--task-set", choices=("default", "hard"), default="default",
+                    help="builder tasks: builder_tasks.py (default) or the multi-file hard_tasks.py")
     ap.add_argument("--efforts", default=",".join(EFFORTS),
                     help="comma-separated efforts from " + ",".join(EFFORT_CHOICES))
     ARGS = args = ap.parse_args(argv)
@@ -335,8 +393,9 @@ def main(argv=None):
     spent[0] = 0.0
     jobs = []
     if args.only != "critic":
+        task_set = HARD_TASKS if args.task_set == "hard" else TASKS
         for i in range(args.builder_reps):
-            for t in TASKS:
+            for t in task_set:
                 for e in efforts:
                     jobs.append(("builder", t, e, i))
     if args.only != "builder":
