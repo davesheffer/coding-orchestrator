@@ -148,6 +148,20 @@ class ReportTests(unittest.TestCase):
         summary = report.summarize([escalated, check("task", True)])["report_check"]
         self.assertEqual(list(summary["per_tier"]), ["fable"])
 
+    def test_fallback_route_counts_apart_and_sets_the_tier(self):
+        entries = [
+            route("task", "opus", 0.9),                                       # Jev route: opus
+            {**route("task", None, None, applied=False), "fallback": "sonnet"},  # Jev down: sonnet ran
+            check("task", True),                                              # joins the fallback tier
+            {**route("bad", "'gpt'", 0.9, applied=False), "fallback": "sonnet"},  # unknown label
+            check("bad", False),
+        ]
+        summary = report.summarize(entries)
+        self.assertEqual((summary["route"]["applied"], summary["route"]["fallback"]), (1, 2))
+        self.assertEqual(list(summary["report_check"]["per_tier"]), ["sonnet"])
+        self.assertIn("fallback 2,", report.render(summary))
+        self.assertNotIn("fallback", report.render(report.summarize([route("x", "opus", 0.9)])))
+
     def test_report_check_tier_join_legacy_description(self):
         entries = [
             route("legacy-task", "sonnet", 0.9, legacy=True),

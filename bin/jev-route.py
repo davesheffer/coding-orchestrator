@@ -13,13 +13,16 @@ that model. Configuration lives under the "jev" key of
 `jev.api_key_file`.
 
 Fail-open: any missing key, disabled config, error, timeout or low-confidence
-answer prints nothing and exits 0, leaving the call unchanged. The classifier
+answer prints nothing and exits 0, leaving the call unchanged. The one exception,
+while routing is on: a built-in agent that would inherit the main session's model
+runs on `inherit_fallback` (default sonnet) when Jev gives no usable answer. The classifier
 call runs under a hard wall-clock deadline of min(timeout_seconds, 4) seconds so
 the script always finishes inside the hook's 5 s timeout.
 """
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -33,6 +36,8 @@ from jev_client import (  # noqa: E402  (re-exported for callers and tests)
     http_classify, load_config, safe_repr, session_log, timestamp, write_log)
 
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# Built-in agents that run on the main session's model when a call names no model.
+INHERITING_AGENTS = ("general-purpose", "Explore", "Plan")
 # Claude Code model aliases that run a known tier (opusplan plans with opus).
 MODEL_ALIASES = {"opusplan": "opus"}
 INSTRUCTIONS = ("Which model tier should run this subagent task? "
@@ -40,7 +45,8 @@ INSTRUCTIONS = ("Which model tier should run this subagent task? "
                 "when torn between two tiers, pick the stronger one.")
 
 
-def frontmatter_model(path):
+def frontmatter_value(path):
+    """The raw `model:` value of an agent file's frontmatter, or None."""
     try:
         text = Path(path).read_text(encoding="utf-8-sig").replace("\r\n", "\n")
     except Exception:
@@ -49,10 +55,27 @@ def frontmatter_model(path):
         return None
     for line in text[4:].split("\n---", 1)[0].splitlines():
         if line.split(":", 1)[0].strip() == "model" and ":" in line:
-            value = line.split(":", 1)[1].strip().strip("'\"")
-            # A full model id of a known tier (claude-opus-4-1) counts as that tier too.
-            return value if value in AGENT_MODELS or model_tier(value, AGENT_MODELS) in AGENT_MODELS else None
+            return line.split(":", 1)[1].strip().strip("'\"")
     return None
+
+
+def frontmatter_model(path):
+    value = frontmatter_value(path)
+    if value is None:
+        return None
+    # A full model id of a known tier (claude-opus-4-1) counts as that tier too.
+    return value if value in AGENT_MODELS or model_tier(value, AGENT_MODELS) in AGENT_MODELS else None
+
+
+def agent_files(payload, name, home=ROOT):
+    """Candidate agent files for subagent_type `name`: project, then user."""
+    if not isinstance(name, str) or not AGENT_NAME_RE.match(name) or ".." in name:
+        return []
+    roots = []
+    if isinstance(payload.get("cwd"), str) and payload["cwd"]:
+        roots.append(Path(payload["cwd"]) / ".claude")
+    roots.append(Path(home))
+    return [root / "agents" / f"{name}.md" for root in roots]
 
 
 def current_model(payload, tool_input, home=ROOT):
@@ -60,15 +83,8 @@ def current_model(payload, tool_input, home=ROOT):
     model = tool_input.get("model")
     if isinstance(model, str) and model.strip():
         return model  # an empty/blank string counts as unset
-    name = tool_input.get("subagent_type")
-    if not isinstance(name, str) or not AGENT_NAME_RE.match(name) or ".." in name:
-        return None
-    roots = []
-    if isinstance(payload.get("cwd"), str) and payload["cwd"]:
-        roots.append(Path(payload["cwd"]) / ".claude")
-    roots.append(Path(home))
-    for root in roots:
-        model = frontmatter_model(root / "agents" / f"{name}.md")
+    for path in agent_files(payload, tool_input.get("subagent_type"), home):
+        model = frontmatter_model(path)
         if model:
             return model
     return None
@@ -194,6 +210,46 @@ def threshold(current, choice, cfg):
     return float(cfg["min_confidence"])
 
 
+def fallback_model(payload, tool_input, current, cfg, home=ROOT):
+    """jev.inherit_fallback for a built-in agent that would inherit the main model, else None.
+
+    Only while routing is on (jev.enabled and features.route), so the kill switches still turn
+    the hook off. A call is inheriting only when it names no model, no agent file pins one, and
+    no CLAUDE_CODE_SUBAGENT_MODEL default applies. An agent file with any model but
+    `inherit` (even one this hook cannot rank, such as opus[1m]) pins that model.
+    """
+    model = cfg.get("inherit_fallback")
+    if current is not None or not isinstance(model, str) or model not in AGENT_MODELS:
+        return None
+    if not feature_enabled(cfg, "route"):
+        return None
+    default = os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL", "").strip().lower()
+    if default and default != "inherit":
+        return None
+    name = tool_input.get("subagent_type")
+    if not (name is None or name == "" or name in INHERITING_AGENTS):
+        return None
+    for path in agent_files(payload, name, home):
+        value = frontmatter_value(path)
+        if value and value.lower() != "inherit":
+            return None
+    return model
+
+
+def falls_back(why, fallback):
+    """True when Jev answered but the answer is unusable (a usable answer always wins)."""
+    return bool(fallback) and why in ("invalid label", "invalid confidence")
+
+
+def fallback_output(tool_input, model, why):
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": f"jev: inherit → {model} (fallback: {why})",
+        "updatedInput": {**tool_input, "model": model},
+    }}
+
+
 def build_questions(cfg):
     return {"model": {"type": "choice", "instructions": INSTRUCTIONS, "criteria": cfg["labels"]}}
 
@@ -202,7 +258,8 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
     """Return the PreToolUse hook output dict, or None to leave the call unchanged.
 
     classify_fn(body, key) returns the parsed Jev response (None means HTTP); it
-    runs under a hard deadline, and any exception or timeout is a no-op.
+    runs under a hard deadline. Any exception or timeout is a no-op, except that an
+    inheriting built-in call then runs on the jev.inherit_fallback tier.
     """
     if not isinstance(payload, dict) or payload.get("tool_name") not in ("Agent", "Task"):
         return None
@@ -220,6 +277,7 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
                     "reason": "skipped: invalid model"})
         return None
     current = current_model(payload, tool_input, home)
+    fallback = fallback_model(payload, tool_input, current, cfg, home)
     shown = display_model(current)
     start = time.monotonic()
     errors = []
@@ -232,6 +290,12 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         entry["desc_hash"] = hashed
     if answers is None:
         # Log only real failures (never the body or key); disabled features stay silent.
+        # "applied" counts Jev's own routes only; a fallback is logged under "fallback".
+        if fallback:
+            if log_fn:
+                log_fn({**entry, "applied": False, "fallback": fallback, "reason": "unavailable",
+                        **({"error": errors[0]} if errors else {})})
+            return fallback_output(tool_input, fallback, "unavailable")
         if log_fn and errors:
             log_fn({**entry, "applied": False, "reason": "unavailable", "error": errors[0]})
         return None
@@ -245,8 +309,9 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
         # Malformed shape (answers["model"] not a dict, no string choice), same as ask()'s own
         # check and codex/jev-hook.py; an unknown string label is "invalid label" below.
         if log_fn:
-            log_fn({**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse"})
-        return None
+            log_fn({**entry, "applied": False, "reason": "unavailable", "error": "MalformedResponse",
+                    **({"fallback": fallback} if fallback else {})})
+        return fallback_output(tool_input, fallback, "unavailable") if fallback else None
     confidence = coerce_confidence(answer.get("confidence"))
     why, applied_model, escalated_mass = verdict(choice, confidence, current, cfg, probabilities,
                                                  explicit_model(tool_input))
@@ -264,9 +329,12 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
                       "applied": applied, "reason": reason if applied else f"{reason}; skipped: {why}"})
         if escalated_mass is not None:
             entry["escalated_to"] = applied_model
+        if not applied and falls_back(why, fallback):
+            entry["fallback"] = fallback
         log_fn(entry)
     if not applied:
-        return None
+        # A usable answer below threshold keeps inheriting: under-routing costs more.
+        return fallback_output(tool_input, fallback, why) if falls_back(why, fallback) else None
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",

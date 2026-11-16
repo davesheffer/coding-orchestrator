@@ -96,6 +96,7 @@ def counts(values):
 
 def summarize_route(entries):
     applied = sum(1 for e in entries if e.get("applied") is True)
+    fallback = sum(1 for e in entries if e.get("applied") is not True and e.get("fallback"))
     choices = {}
     for entry in entries:
         agent = str(entry.get("subagent_type") or "unknown")
@@ -114,7 +115,7 @@ def summarize_route(entries):
     saturated = sum(1 for c in confidences if c >= SATURATION_LEVEL)
     warning = (SATURATION_WARNING
                if confidences and saturated >= SATURATION_SHARE * len(confidences) else None)
-    return {"total": len(entries), "applied": applied, "applied_rate": rate(applied, len(entries)),
+    return {"total": len(entries), "applied": applied, "applied_rate": rate(applied, len(entries)), "fallback": fallback,
             "choices": {k: dict(sorted(v.items())) for k, v in sorted(choices.items())},
             "confidence_histogram": histogram, "latency_ms": latency(entries), "warning": warning}
 
@@ -146,6 +147,11 @@ def effective_tiers(entries):
             key = join_key(entry)
             if key is not None:
                 last_applied[key] = str(entry.get("escalated_to") or entry["choice"])
+        elif feature == "route" and isinstance(entry.get("fallback"), str) and entry["fallback"]:
+            # jev.inherit_fallback ran the agent on this tier when Jev gave no usable answer.
+            key = join_key(entry)
+            if key is not None:
+                last_applied[key] = entry["fallback"]
         elif feature == "report_check":
             model = entry.get("model")
             if isinstance(model, str) and model:
@@ -241,7 +247,8 @@ def fmt_counts(mapping):
 def render(summary):
     lines = [f"jev log: {summary['entries']} entries"]
     route = summary["route"]
-    lines.append(f"route: {route['total']} total, applied {fmt_rate(route['applied_rate'])}, "
+    fallback = f", fallback {route['fallback']}" if route.get("fallback") else ""
+    lines.append(f"route: {route['total']} total, applied {fmt_rate(route['applied_rate'])}{fallback}, "
                  f"{fmt_latency(route['latency_ms'])}")
     for agent, choices in route["choices"].items():
         lines.append(f"  {agent}: {fmt_counts(choices)}")

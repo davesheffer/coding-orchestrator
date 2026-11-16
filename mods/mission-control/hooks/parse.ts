@@ -1434,6 +1434,9 @@ export function summarize(line: JevLine): JevEntry | undefined {
       }
     }
     case 'route': {
+      // jev.inherit_fallback ran the agent on line.fallback when Jev gave no usable answer.
+      const fallback = line.applied !== true ? text(line.fallback) : ''
+      if (fallback) return { ts, feature, summary: `${text(line.subagent_type)} -> ${fallback} (fallback)${offline}`, isAlert: false }
       const choice = text(line.choice) || text(line.current)
       const applied = line.applied === true ? '' : ' (kept)'
 

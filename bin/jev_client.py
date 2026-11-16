@@ -8,7 +8,8 @@ report check, handoff grading, the ask-jev CLI) loads its settings from the "jev
 Fail-open contract: `ask()` returns None when the feature is disabled, the key
 is missing, the endpoint is not allowed, or the call errors or outlives its
 hard deadline of min(timeout_seconds, 4) seconds. Callers treat None as "no
-opinion" and keep their pre-Jev behaviour. Nothing here logs prompt, diff or
+opinion" and keep their pre-Jev behaviour, except that route runs an inheriting
+built-in agent on `jev.inherit_fallback`. Nothing here logs prompt, diff or
 report text, or the key. A successful call that reports token usage appends one
 `"kind": "usage"` line (tokens and USD, reported or estimated) to the same log.
 """
@@ -62,6 +63,9 @@ DEFAULTS = {
     "respect_explicit_model": False,
     # scout and runner are pinned so Jev never moves them off Haiku (scout was benchmarked on lookups).
     "pinned_agents": ["critic", "fork", "scout", "runner"],
+    # A built-in agent (general-purpose/Explore/Plan) with no model would inherit the main
+    # session's model; when Jev gives no usable answer it runs on this tier instead (null: off).
+    "inherit_fallback": "sonnet",
     "max_prompt_chars": 6000,
     "send_prompt": True,
     "labels": {
