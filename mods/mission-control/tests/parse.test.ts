@@ -795,6 +795,17 @@ describe('jev log', () => {
     expect(summarize({ feature: 'shift', decision: 'continue' })).toBeUndefined()
     expect(summarize({ kind: 'usage', feature: 'route' })).toBeUndefined()
   })
+
+  test('a route line names the tier the agent ran on', async () => {
+    const route = { feature: 'route', subagent_type: 'Explore', current: 'inherit' }
+    expect(summarize({ ...route, choice: 'haiku', applied: true })?.summary).toBe('Explore -> haiku')
+    expect(summarize({ ...route, choice: 'opus', applied: false })?.summary).toBe('Explore -> opus (kept)')
+    expect(summarize({ ...route, applied: false, fallback: 'sonnet' })?.summary).toBe('Explore -> sonnet (fallback)')
+    expect(summarize({ ...route, applied: false, fallback: 'sonnet', error: 'unavailable' })?.summary).toBe(
+      'Explore -> sonnet (fallback) (offline)',
+    )
+    expect(summarize({ ...route, choice: 'haiku', applied: true, fallback: 'sonnet' })?.summary).toBe('Explore -> haiku')
+  })
 })
 
 describe('report cards are read closed', () => {

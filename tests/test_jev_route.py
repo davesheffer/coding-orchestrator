@@ -56,7 +56,7 @@ def response(choice, confidence):
 
 class DecideTests(unittest.TestCase):
     def setUp(self):
-        patcher = mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
+        patcher = mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key", "CLAUDE_CODE_SUBAGENT_MODEL": ""})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.cfg = jev.load_config(Path("/nonexistent/config.json"))
@@ -329,6 +329,114 @@ class DecideTests(unittest.TestCase):
         def boom(body, key):
             raise TimeoutError("slow")
         self.assertIsNone(self.decide(self.payload, self.cfg, boom))
+
+    def inheriting(self, name="general-purpose"):
+        """A built-in agent call with no model, which would inherit the main session's model."""
+        tool_input = {k: v for k, v in self.payload["tool_input"].items() if k != "model"}
+        if name is None:
+            tool_input.pop("subagent_type")
+        else:
+            tool_input["subagent_type"] = name
+        return {**self.payload, "tool_input": tool_input}
+
+    def assert_fallback(self, out, payload, model="sonnet"):
+        hook = out["hookSpecificOutput"]
+        self.assertEqual(hook["permissionDecision"], "allow")
+        self.assertIn("fallback", hook["permissionDecisionReason"])
+        self.assertEqual(hook["updatedInput"], {**payload["tool_input"], "model": model})
+
+    def test_inherit_fallback_default_is_sonnet(self):
+        self.assertEqual(jev.load_config(Path("/nonexistent/config.json"))["inherit_fallback"], "sonnet")
+
+    def test_inheriting_builtin_falls_back_when_jev_unavailable(self):
+        def boom(body, key):
+            raise TimeoutError("slow")
+        for name in ("general-purpose", "Explore", "Plan", None, ""):
+            with self.subTest(name=name):
+                payload = self.inheriting(name)
+                logs = []
+                self.assert_fallback(self.decide(payload, self.cfg, boom, logs.append), payload)
+                self.assertFalse(logs[-1]["applied"])  # "applied" counts Jev's own routes only
+                self.assertEqual(logs[-1]["fallback"], "sonnet")
+
+    def test_kill_switches_turn_the_fallback_off(self):
+        payload = self.inheriting()
+        logs = []
+        self.assertIsNone(self.decide(payload, {**self.cfg, "enabled": False}, self.classify(), logs.append))
+        self.assertIsNone(self.decide(payload, {**self.cfg, "features": {
+            **self.cfg["features"], "route": False}}, self.classify(), logs.append))
+        self.assertEqual((self.calls, logs), ([], []))
+
+    def test_inheriting_builtin_falls_back_when_keyless(self):
+        payload = self.inheriting()
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}):
+            self.assert_fallback(self.decide(payload, self.cfg, self.classify()), payload)
+        self.assertEqual(self.calls, [])
+
+    def test_configured_subagent_model_is_not_inheriting(self):
+        def boom(body, key):
+            raise TimeoutError("slow")
+        payload = self.inheriting("Explore")
+        for value in ("haiku", "opus", "claude-opus-5-5"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"CLAUDE_CODE_SUBAGENT_MODEL": value}):
+                self.assertIsNone(self.decide(payload, self.cfg, boom))
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SUBAGENT_MODEL": "inherit"}):
+            self.assert_fallback(self.decide(payload, self.cfg, boom), payload)
+
+    def test_inheriting_builtin_falls_back_on_malformed_or_invalid_answer(self):
+        payload = self.inheriting()
+        self.assert_fallback(self.decide(payload, self.cfg, lambda b, k: {"answers": {"model": "x"}}), payload)
+        logs = []
+        self.assert_fallback(self.decide(payload, self.cfg, self.classify(choice="gpt"), logs.append), payload)
+        self.assertFalse(logs[-1]["applied"])
+        self.assertEqual(logs[-1]["fallback"], "sonnet")
+        for confidence in (None, "high", float("nan")):
+            with self.subTest(confidence=confidence):
+                self.assert_fallback(self.decide(payload, self.cfg, self.classify("opus", confidence)), payload)
+
+    def test_jev_answer_wins_over_fallback(self):
+        payload = self.inheriting("Explore")
+        out = self.decide(payload, self.cfg, self.classify(choice="opus", confidence=0.82))
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+        self.assertNotIn("fallback", out["hookSpecificOutput"]["permissionDecisionReason"])
+        # A usable answer below threshold keeps inheriting, whatever its tier: under-routing costs more.
+        for choice in ("opus", "sonnet"):
+            with self.subTest(choice=choice):
+                logs = []
+                self.assertIsNone(self.decide(payload, self.cfg, self.classify(choice, 0.3), logs.append))
+                self.assertNotIn("fallback", logs[-1])
+
+    def test_agent_file_with_any_model_but_inherit_pins_it(self):
+        def boom(body, key):
+            raise TimeoutError("slow")
+        payload = self.inheriting("Plan")
+        self.agent(self.home, "Plan", "opus[1m]")  # a model this hook cannot rank still pins
+        self.assertIsNone(self.decide(payload, self.cfg, boom))
+        self.agent(self.home, "Plan", "inherit")
+        self.assert_fallback(self.decide(payload, self.cfg, boom), payload)
+        project = {**payload, "cwd": str(self.project)}
+        self.agent(self.project / ".claude", "Plan", "haiku")
+        self.assertIsNone(self.decide(project, self.cfg, boom))
+
+    def test_fallback_skips_non_inheriting_calls(self):
+        def boom(body, key):
+            raise TimeoutError("slow")
+        self.assertIsNone(self.decide(self.payload, self.cfg, boom))  # explicit model
+        self.assertIsNone(self.decide(self.inheriting("fork"), self.cfg, boom))  # pinned
+        self.assertIsNone(self.decide(self.inheriting("plugin:helper"), self.cfg, boom))  # not built-in
+        self.assertIsNone(self.decide(self.inheriting("explore"), self.cfg, boom))  # exact names only
+        self.agent(self.home, "Explore", "haiku")  # a user agent of that name pins its own model
+        self.assertIsNone(self.decide(self.inheriting("Explore"), self.cfg, boom))
+
+    def test_fallback_null_or_unknown_is_off(self):
+        def boom(body, key):
+            raise TimeoutError("slow")
+        payload = self.inheriting()
+        for value in (None, "gpt-5", "", 3, ["sonnet"]):
+            with self.subTest(value=value):
+                self.assertIsNone(self.decide(payload, {**self.cfg, "inherit_fallback": value}, boom))
+        out = self.decide(payload, {**self.cfg, "inherit_fallback": "haiku"}, boom)
+        self.assert_fallback(out, payload, "haiku")
 
     def test_send_prompt_false_omits_prompt(self):
         cfg = {**self.cfg, "send_prompt": False}

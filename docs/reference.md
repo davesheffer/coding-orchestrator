@@ -255,7 +255,7 @@ features. Your own hooks and other `jev` keys stay. A
 
 | Feature | Runs in | Question for Jev | What happens | Sent to TypeSafe |
 |---|---|---|---|---|
-| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A choice that differs from the current model is applied through `updatedInput.model` when confident enough: moving to a stronger tier needs less confidence than moving to a weaker one, and a task escalates when stronger tiers together are likely enough | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
+| `route` | `PreToolUse` `Agent\|Task` → `bin/jev-route.py` | Which tier (sonnet/opus/fable) should run this subagent task? | A choice that differs from the current model is applied through `updatedInput.model` when confident enough: moving to a stronger tier needs less confidence than moving to a weaker one, and a task escalates when stronger tiers together are likely enough. A built-in agent that would inherit the main model runs on `inherit_fallback` when Jev gives no usable answer | Subagent type, description, prompt (`send_prompt`, `max_prompt_chars`) |
 | `shift` | `UserPromptSubmit` → `relay/relay.py prompt` | Does the new prompt continue the recent prompts / handoff goal? | Below `shift_low`: "TASK SHIFT DETECTED — roll over now". Above `shift_high`: the generic task-shift reminder is dropped | Last 5 prompts (500 chars each), handoff GOAL, new prompt (2,000 chars) |
 | `risk_gate` | `PreToolUse` `Bash` → `bin/jev-guard.py gate` | Risk category (none/security/concurrency/data_loss/public_api), and whether it needs an adversarial reviewer | A risky `git commit` or `git push` with no critic run since the changed files were last modified is **denied once**. The identical retry proceeds | Operation, changed file names, diff (`send_diff`, `max_diff_chars`), with secret-looking files and tokens redacted (below) |
 | `report_check` | `PreToolUse` `SubagentHandback` → `jev-guard.py handback`, and `PostToolUse` `Agent\|Task\|SubagentHandback` → `jev-guard.py agent-done` | Does EVIDENCE support RESULT? Is anything material UNVERIFIED? | A hand-back report with missing sections or unsupported EVIDENCE is **denied once**, and the subagent must verify or list the gap. An identical resend proceeds. A weak foreground report adds a "verify or escalate one tier" note for the orchestrator | The report's RESULT, EVIDENCE, CONFIDENCE and UNVERIFIED sections, with tokens redacted (below) |
@@ -334,10 +334,13 @@ the text listed in their row above; turn those features off if you want to
 avoid sending it.
 
 Everything fails open. A missing key, a disabled feature, an HTTP error, a
-malformed answer, or a timeout gives exactly the pre-Jev behaviour. Every
-classifier call has a hard deadline of `min(timeout_seconds, 4)` seconds.
-Denials and the handoff's exit 3 are the only ways a Jev hook changes the
-outcome of a call, and each can be overridden by retrying.
+malformed answer, or a timeout gives exactly the pre-Jev behaviour, with one
+exception: while `route` is on, a built-in agent call that would inherit the
+main session's model runs on `inherit_fallback` instead (see its row below).
+Every classifier call has a hard deadline of `min(timeout_seconds, 4)` seconds.
+Denials, the handoff's exit 3 and that fallback are the only ways a Jev hook
+changes the outcome of a call; denials can be overridden by retrying, and the
+fallback turned off by setting `inherit_fallback` to `null`.
 
 Provide `TYPESAFE_API_KEY` in your shell environment, in the `"env"` block of
 Claude Code's `settings.json`, or as a file path in `jev.api_key_file`. The key
@@ -357,6 +360,7 @@ installed `relay/config.json`:
 | `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
 | `respect_explicit_model` | `false` | route: never override a call that already sets `model`. When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id) |
 | `pinned_agents` | `["critic", "fork", "scout", "runner"]` | route: subagent types that are never rerouted. A list you set replaces the default, so keep `scout` and `runner` in it to hold them on Haiku. Matching is exact and case-sensitive: `Scout` or `plugin:scout` is not pinned |
+| `inherit_fallback` | `"sonnet"` | route: a `general-purpose`, `Explore` or `Plan` call (or one with no `subagent_type`) that sets no `model` would inherit the main session's model, unless an agent file (`<cwd>/.claude/agents/<name>.md` or `~/.claude/agents/<name>.md`) sets a `model` other than `inherit` or `CLAUDE_CODE_SUBAGENT_MODEL` is set to something other than `inherit` (the hook then skips the fallback for all three agents). While routing is on (`enabled` and `features.route`, with at least one label), such a call runs on this tier when Jev gives no usable answer: no key, an endpoint `endpoint_allowed` rejects, an error, a timeout, a malformed answer, an unknown label or an invalid confidence. A usable answer always wins, and one below threshold keeps inheriting. The tier need not be in `labels`, and it applies whatever the main model is, so a Haiku main session moves such calls up to Sonnet. `null` or a value other than `haiku`, `sonnet`, `opus` or `fable` turns it off. Pinned agents, explicit models and other agents are never touched. Agents defined only by `--agents`, by a file whose `name:` differs from its filename, or above `cwd` are not seen, so the hook treats an override of a built-in name made that way as inheriting |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
 | `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted. A removed tier's full model id (e.g. `claude-opus-4-1` with `opus` removed) can still be rewritten to a kept tier, as its alias would be. `opusplan` counts as the opus tier, so it is never rewritten to `opus` |
 | `shift_low`, `shift_high` | `0.25`, `0.75` | shift: probability-of-continuation thresholds |
@@ -379,7 +383,7 @@ whatever ACL it already had. Decision lines the Claude Code hooks (`jev-guard.py
 session id, so the lines of concurrent sessions sharing the log can be told
 apart (none when the payload has no usable id; `"kind": "usage"` lines, the
 pre-push git hook, the Codex hook, `ask-jev.py` and the relay add none). `route` records `desc_hash`, a short hash of the task description, so
-`jev-report.py` can join routing decisions with report checks. When a
+`jev-report.py` can join routing decisions with report checks. A route line where `inherit_fallback` ran the agent adds `fallback` (the tier) and keeps `applied` false, so the applied rate measures Jev alone; the report counts these lines as `fallback` (also on the route line of the text report, when any) and joins report checks to that tier; Mission Control shows them as `-> <tier> (fallback)`. When a
 `risk_gate` or `report_check` call fails (no key, HTTP error, timeout, bad
 answer), its line adds `"reason": "unavailable"` and `error`, the exception
 class name (e.g. `HTTPError`, `TimeoutError`, `NoApiKey`). Log lines never
