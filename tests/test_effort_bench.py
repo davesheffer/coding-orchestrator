@@ -405,23 +405,33 @@ class EffortBenchTests(unittest.TestCase):
     def test_check_rejects_bad_hard_layouts(self):
         base = load("bench").HARD_TASKS["install_order"]
         # Each case must be caught by its own rule: the expected text is asserted, not only the exit code.
-        for change, want in (({"ref": {**base["ref"], "notes.py": "X = 1\n"}}, "ref changes files it may not"),
-                             ({"editable": ("graph.py", "installer.py", "missing.py")},
-                              "editable names not in files"),
-                             ({"create": ("graph.py",)}, "create names already in files"),
-                             ({"create": ("new.py",)}, "create names without a reference"),
-                             ({"create": ("test_hidden.py",), "ref": {**base["ref"], "test_hidden.py": "X = 1\n"}},
-                              "reserved file name"),
-                             ({"ref": {"graph.py": base["files"]["graph.py"],
-                                       "installer.py": base["files"]["installer.py"]}}, "ref fails test_hidden")):
+        # Layout cases also assert that no behaviour run happened (check() skips it on a bad layout).
+        layout = (({"ref": {**base["ref"], "notes.py": "X = 1\n"}}, "ref changes files it may not"),
+                  ({"editable": ("graph.py", "installer.py", "missing.py")}, "editable names not in files"),
+                  ({"create": ("graph.py",)}, "create names already in files"),
+                  ({"create": ("new.py",)}, "create names without a reference"),
+                  ({"create": ("test_hidden.py",), "ref": {**base["ref"], "test_hidden.py": "X = 1\n"}},
+                   "reserved file name"),
+                  ({"files": {**base["files"], "test_solution.py": "X = 1\n"}}, "reserved file name"))
+        behaviour = (({"ref": {"graph.py": base["files"]["graph.py"], "installer.py": base["files"]["installer.py"]}},
+                      ("ref fails test_solution", "ref fails test_hidden")),
+                     ({"files": {**base["files"], **base["ref"]}},
+                      ("stub passes test_solution", "stub passes test_hidden")))
+        cases = [(c, (w,), True) for c, w in layout] + [(c, w, False) for c, w in behaviour]
+        for change, wants, is_layout in cases:
             bench = load("bench")
             bench.HARD_TASKS = {"install_order": {**base, **change}}
             out = io.StringIO()
-            with self.subTest(want=want), contextlib.redirect_stdout(out):
-                rc = bench.check()
-            self.assertEqual(rc, 1, want)
-            line = next(x for x in out.getvalue().splitlines() if x.startswith("builder install_order:"))
-            self.assertIn(want, line)
+            with self.subTest(wants=wants, change=sorted(change)):
+                with contextlib.redirect_stdout(out):
+                    rc = bench.check()
+                self.assertEqual(rc, 1, wants)
+                line = next(x for x in out.getvalue().splitlines() if x.startswith("builder install_order:"))
+                for want in wants:
+                    self.assertIn(want, line)
+                if is_layout:
+                    self.assertNotIn("stub passes", line)
+                    self.assertNotIn("ref fails", line)
 
     def test_hard_task_set_flag(self):
         bench = load("bench")
