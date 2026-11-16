@@ -8,10 +8,11 @@ report check, handoff grading, the ask-jev CLI) loads its settings from the "jev
 Fail-open contract: `ask()` returns None when the feature is disabled, the key
 is missing, the endpoint is not allowed, or the call errors or outlives its
 hard deadline of min(timeout_seconds, 4) seconds. Callers treat None as "no
-opinion" and keep their pre-Jev behaviour, except that, while routing is
-on, route runs an inheriting built-in agent on `jev.inherit_fallback`. Nothing
-here logs prompt, diff or report text, or the key. A successful call that reports token usage appends one
-`"kind": "usage"` line (tokens and USD, reported or estimated) to the same log.
+opinion" and keep their pre-Jev behaviour, except that, while routing is on,
+route runs an inheriting built-in agent on `jev.inherit_fallback`. Nothing here
+logs prompt, diff or report text, or the key. A successful call that reports
+token usage appends one `"kind": "usage"` line (tokens and USD, reported or
+estimated) to the same log.
 """
 import csv
 import ctypes
