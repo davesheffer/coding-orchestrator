@@ -975,6 +975,60 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.home.exists())
 
+    def read_json(self, rel):
+        return json.loads(self.home.joinpath(rel).read_text(encoding="utf-8"))
+
+    def test_lean_default_pinned_mirrors_jev_client(self):
+        spec = importlib.util.spec_from_file_location("jev_client_lean", ROOT / "bin" / "jev_client.py")
+        jev_client = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(jev_client)
+        self.assertEqual(list(install_module.JEV_DEFAULT_PINNED), jev_client.DEFAULTS["pinned_agents"])
+
+    def test_lean_fresh_install_writes_lean_jev_keys(self):
+        result = self.run_install("--jev", "--lean")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("settings.json")["model"], "claude-opus-5-5")
+        jev = self.read_json("relay/config.json")["jev"]
+        self.assertTrue(jev["enabled"])
+        self.assertEqual(jev["labels"], {"fable": None})
+        self.assertEqual(jev["pinned_agents"], ["critic", "fork", "scout", "runner", "builder"])
+        self.assertEqual(jev["upgrade_min_confidence"], 0.6)
+        self.assertEqual(jev["risk_min_probability"], 0.75)
+
+    def test_lean_drops_only_the_long_context_suffix(self):
+        for model, expected in (("opus[1m]", "opus"), ("claude-opus-5-5[1M]", "claude-opus-5-5"),
+                                ("sonnet", "sonnet")):
+            with self.subTest(model=model):
+                self.home.mkdir(exist_ok=True)
+                self.home.joinpath("settings.json").write_text(json.dumps({"model": model}), encoding="utf-8")
+                self.assertEqual(self.run_install("--lean").returncode, 0)
+                self.assertEqual(self.read_json("settings.json")["model"], expected)
+
+    def test_without_lean_long_context_model_is_kept(self):
+        self.home.mkdir()
+        self.home.joinpath("settings.json").write_text(json.dumps({"model": "opus[1m]"}), encoding="utf-8")
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.read_json("settings.json")["model"], "opus[1m]")
+        self.assertNotIn("labels", self.read_json("relay/config.json").get("jev", {}))
+
+    def test_lean_merges_into_tuned_config_and_is_idempotent(self):
+        self.home.joinpath("relay").mkdir(parents=True)
+        tuned = {"soft_tokens": 10, "jev": {"enabled": True, "log": False,
+                                            "labels": {"opus": "custom rubric"},
+                                            "pinned_agents": ["critic", "scout"]}}
+        self.home.joinpath("relay/config.json").write_text(json.dumps(tuned), encoding="utf-8")
+        self.assertEqual(self.run_install("--jev", "--lean").returncode, 0)
+        config = self.read_json("relay/config.json")
+        self.assertEqual(config["soft_tokens"], 10)
+        self.assertEqual(config["jev"], {"enabled": True, "log": False,
+                                         "labels": {"opus": "custom rubric", "fable": None},
+                                         "pinned_agents": ["critic", "scout", "builder"],
+                                         "upgrade_min_confidence": 0.6, "risk_min_probability": 0.75})
+        before = self.home.joinpath("relay/config.json").read_bytes()
+        result = self.run_install("--jev", "--lean")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.home.joinpath("relay/config.json").read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
