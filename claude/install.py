@@ -62,6 +62,8 @@ LONG_CONTEXT_SUFFIX = "[1m]"
 # Mirrors jev_client.DEFAULTS["pinned_agents"]; a list a user sets replaces that default.
 JEV_DEFAULT_PINNED = ("critic", "fork", "scout", "runner")
 LEAN_PINNED = ("builder",)
+# Agents allowed to run on an explicitly requested Fable model; a list the user set is kept.
+LEAN_FABLE_AGENTS = ("critic",)
 # Floors: a stricter (higher) value the user already set is kept.
 LEAN_JEV_NUMBERS = {"upgrade_min_confidence": 0.6}
 
@@ -634,6 +636,8 @@ def main(argv: list[str] | None = None) -> int:
         pinned = list(pinned) if isinstance(pinned, list) else []
         pinned += [name for name in LEAN_PINNED if name not in pinned]
         lean = {"labels": {**labels, "fable": None}, "pinned_agents": pinned}
+        if not isinstance(jev.get("fable_agents"), list):
+            lean["fable_agents"] = list(LEAN_FABLE_AGENTS)
         for key, floor in LEAN_JEV_NUMBERS.items():
             value = jev.get(key)
             valid = isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1

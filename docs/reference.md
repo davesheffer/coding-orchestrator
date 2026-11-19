@@ -234,7 +234,8 @@ not a number (numeric strings are accepted) falls back to its default.
 (`opus[1m]` becomes `opus`; other models are left alone) and merges these keys into
 the `jev` section of `relay/config.json`: `labels.fable: null` (routing never picks
 Fable), `builder` added to `pinned_agents` (starting from the default list when the key is
-absent) and `upgrade_min_confidence` of at least `0.6` (a higher value is kept). The risk
+absent), `fable_agents: ["critic"]` (unless a list is already set) and
+`upgrade_min_confidence` of at least `0.6` (a higher value is kept). The risk
 gate is unchanged. Other keys stay as they are and a repeat run changes nothing. Jev keys
 only take effect with `--jev`.
 
@@ -367,8 +368,9 @@ installed `relay/config.json`:
 | `upgrade_min_confidence`, `downgrade_min_confidence` | `0.35`, `0.8` | route: confidence needed to move to a stronger or weaker tier than the current one. Moving up is easy because under-routing is the costly error |
 | `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
 | `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
-| `respect_explicit_model` | `false` | route: never override a call that already sets `model`. When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id) |
+| `respect_explicit_model` | `false` | route: never override a call that already sets `model` (except the `fable_agents` clamp below). When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id) |
 | `pinned_agents` | `["critic", "fork", "scout", "runner"]` | route: subagent types that are never rerouted. A list you set replaces the default, so keep `scout` and `runner` in it to hold them on Haiku. Matching is exact and case-sensitive: `Scout` or `plugin:scout` is not pinned |
+| `fable_agents` | `null` | route: when a list, an Agent call whose explicit `model` is a Fable model (`fable` or a `claude-fable-*` id) runs on `opus` unless its `subagent_type` is listed (no `subagent_type` counts as `general-purpose`; a trailing `[...]` suffix such as `fable[1m]` is ignored; matching is exact, so `Critic` is clamped). Applies to pinned agents too and needs no classifier answer; logged with `clamped`. An agent file that sets `model: fable` in its own frontmatter is left alone. `null` or a non-list turns it off, as do `enabled: false` and `features.route: false`. It checks only the incoming call: Jev routing or `inherit_fallback` can still choose Fable unless `labels.fable` is `null`, which `--lean` also sets. `--lean` sets `["critic"]` |
 | `inherit_fallback` | `"sonnet"` | route: a `general-purpose`, `Explore` or `Plan` call (or one with no `subagent_type`) that sets no `model` would inherit the main session's model, unless an agent file (`<cwd>/.claude/agents/<name>.md` or `~/.claude/agents/<name>.md`) sets a `model` other than `inherit` or `CLAUDE_CODE_SUBAGENT_MODEL` is set to something other than `inherit` (the hook then skips the fallback for all three agents). While routing is on (`enabled` and `features.route`, with at least one label), such a call runs on this tier when Jev gives no usable answer: no key, an endpoint `endpoint_allowed` rejects, an error, a timeout, a malformed answer, an unknown label or an invalid confidence. A usable answer always wins, and one below threshold keeps inheriting. The tier need not be in `labels`, and it applies whatever the main model is, so a Haiku main session moves such calls up to Sonnet. `null` or a value other than `haiku`, `sonnet`, `opus` or `fable` turns it off. Pinned agents, explicit models and other agents are never touched. Agents defined only by `--agents`, by a file whose `name:` differs from its filename, or above `cwd` are not seen, so the hook treats an override of a built-in name made that way as inheriting |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
 | `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted. A removed tier's full model id (e.g. `claude-opus-4-1` with `opus` removed) can still be rewritten to a kept tier, as its alias would be. `opusplan` counts as the opus tier, so it is never rewritten to `opus` |
@@ -490,6 +492,29 @@ output; never prompt, transcript or handoff text) to
 `relay/state/hook-log.jsonl` (created 0600 on POSIX; on Windows it inherits the
 folder's access), which rotates to `hook-log.jsonl.1` above 1 MB instead of
 expiring.
+
+##### Usage report: `usage-report.py`
+
+`bin/usage-report.py` reads local Claude Code transcripts and prints, per role (`main` or the
+subagent's `agentType`) and model: turns, input, cache-write, cache-read and output tokens, and an
+API-equivalent dollar figure. It also prints each role's share, runs per session (median, p90,
+max) and each subagent's launched-with versus actual model (`model` in `agent-*.meta.json`,
+recorded after hooks such as the Jev route rewrote it). It runs from the checkout, needs no Jev key and
+is not installed:
+
+```bash
+python bin/usage-report.py --days 30   --project c--Users-me-src-app --project c--Users-me-src-api   # default: every project
+python bin/usage-report.py --json                                 # machine-readable
+```
+
+Each assistant message counts once per message id; files older than the window (by mtime) and
+records with an older `timestamp` are skipped. The dollar figure weights tokens by list prices
+in `PRICES` (Opus $4/$20, Fable $8/$40, Sonnet $2/$10, Haiku $0.10/$0.50 per million input/output),
+with cache writes at 1.25x input for 5-minute and 2x for 1-hour TTL (from `usage.cache_creation`;
+a write without that split counts as 1-hour) and the cache-read rates in the script (Haiku's is
+assumed). Workflow agents under `subagents/workflows/` are included. It is a way
+to compare roles, not a subscription bill. A model whose family is not priced counts as $0 and
+is listed as unpriced. No prompt or message text is printed.
 
 ##### pre-push gate
 
@@ -884,6 +909,7 @@ runner. No credentials are included.
 | `bin/jev_client.py`, `bin/jev-route.py`, `bin/jev-guard.py`, `bin/jev-report.py`, `bin/ask-jev.py`, `bin/eval-jev-routing.py` | Opt-in TypeSafe Jev hooks (routing, risk gate, report check), ask-about-files command, log and spend report, routing eval |
 | `bin/agent-run.py`, `docs/agent-routing.md` | Restricted Windows launch, model fallback and per-role network consent |
 | `bin/agent-report.py`, `bin/compare-*-readonly.py`, `benchmarks/` | Aggregate private launcher evidence and run bounded model comparisons |
+| `bin/usage-report.py` | Claude Code transcript tokens and API-equivalent cost per role and model (see [Usage report](#usage-report-usage-reportpy)) |
 | `tests/` | Bundle, marker, and relay contracts; both installers; agent-run/report, ro, role-guard, Jev (client, route, guard, report, ask), PR status, rollover-open, session-focus, and read-only comparison tests |
 | `.github/workflows/ci.yml` | Python 3.11–3.13 Linux and Windows CI plus macOS 3.12, compilation, shell syntax, and tests |
 

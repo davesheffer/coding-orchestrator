@@ -64,6 +64,9 @@ DEFAULTS = {
     "respect_explicit_model": False,
     # scout and runner are pinned so Jev never moves them off Haiku (scout was benchmarked on lookups).
     "pinned_agents": ["critic", "fork", "scout", "runner"],
+    # route: when a list, an Agent call that names a Fable model for any other agent runs on
+    # opus instead (null: off). --lean sets ["critic"].
+    "fable_agents": None,
     # A built-in agent (general-purpose/Explore/Plan) with no model would inherit the main
     # session's model; when Jev gives no usable answer it runs on this tier instead (null: off).
     "inherit_fallback": "sonnet",
