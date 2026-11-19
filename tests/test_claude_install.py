@@ -993,11 +993,11 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(jev["labels"], {"fable": None})
         self.assertEqual(jev["pinned_agents"], ["critic", "fork", "scout", "runner", "builder"])
         self.assertEqual(jev["upgrade_min_confidence"], 0.6)
-        self.assertEqual(jev["risk_min_probability"], 0.75)
+        self.assertNotIn("risk_min_probability", jev)
 
     def test_lean_drops_only_the_long_context_suffix(self):
         for model, expected in (("opus[1m]", "opus"), ("claude-opus-5-5[1M]", "claude-opus-5-5"),
-                                ("sonnet", "sonnet")):
+                                ("sonnet", "sonnet"), ("[1M]", "[1M]")):
             with self.subTest(model=model):
                 self.home.mkdir(exist_ok=True)
                 self.home.joinpath("settings.json").write_text(json.dumps({"model": model}), encoding="utf-8")
@@ -1023,11 +1023,33 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(config["jev"], {"enabled": True, "log": False,
                                          "labels": {"opus": "custom rubric", "fable": None},
                                          "pinned_agents": ["critic", "scout", "builder"],
-                                         "upgrade_min_confidence": 0.6, "risk_min_probability": 0.75})
+                                         "upgrade_min_confidence": 0.6})
         before = self.home.joinpath("relay/config.json").read_bytes()
         result = self.run_install("--jev", "--lean")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.home.joinpath("relay/config.json").read_bytes(), before)
+
+
+    def test_lean_keeps_stricter_thresholds_and_reads_null_pinned_as_empty(self):
+        self.home.joinpath("relay").mkdir(parents=True)
+        tuned = {"jev": {"enabled": True, "upgrade_min_confidence": 0.9, "pinned_agents": None}}
+        self.home.joinpath("relay/config.json").write_text(json.dumps(tuned), encoding="utf-8")
+        self.assertEqual(self.run_install("--jev", "--lean").returncode, 0)
+        jev = self.read_json("relay/config.json")["jev"]
+        self.assertEqual(jev["upgrade_min_confidence"], 0.9)
+        self.assertEqual(jev["pinned_agents"], ["builder"])
+
+    def test_lean_without_jev_settles_in_one_run(self):
+        self.assertEqual(self.run_install("--lean").returncode, 0)
+        jev = self.read_json("relay/config.json")["jev"]
+        self.assertIs(jev["enabled"], False)
+        self.assertEqual(jev["labels"], {"fable": None})
+        result = self.run_install("--lean")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("config.json", result.stdout)
+        self.assertFalse(any(self.home.joinpath("relay").glob("config.json.bak*")))
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertFalse(any(self.home.joinpath("relay").glob("config.json.bak*")))
 
 
 if __name__ == "__main__":

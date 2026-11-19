@@ -62,7 +62,8 @@ LONG_CONTEXT_SUFFIX = "[1m]"
 # Mirrors jev_client.DEFAULTS["pinned_agents"]; a list a user sets replaces that default.
 JEV_DEFAULT_PINNED = ("critic", "fork", "scout", "runner")
 LEAN_PINNED = ("builder",)
-LEAN_JEV_NUMBERS = {"upgrade_min_confidence": 0.6, "risk_min_probability": 0.75}
+# Floors: a stricter (higher) value the user already set is kept.
+LEAN_JEV_NUMBERS = {"upgrade_min_confidence": 0.6}
 
 
 def fail(message: str) -> None:
@@ -604,7 +605,8 @@ def main(argv: list[str] | None = None) -> int:
     merged_settings = merge_jev_hook(merged_settings, dest / "bin", args.jev)
     merged_settings.setdefault("model", "claude-opus-5-5")
     model = merged_settings.get("model")
-    if args.lean and isinstance(model, str) and model.lower().endswith(LONG_CONTEXT_SUFFIX):
+    if (args.lean and isinstance(model, str) and len(model) > len(LONG_CONTEXT_SUFFIX)
+            and model.lower().endswith(LONG_CONTEXT_SUFFIX)):
         # A 1M window lets sessions grow far past 200k before compacting, and every turn
         # re-reads the whole context; keep the model, drop only the long-context variant.
         merged_settings["model"] = model[:-len(LONG_CONTEXT_SUFFIX)]
@@ -620,6 +622,26 @@ def main(argv: list[str] | None = None) -> int:
         if tuned.get("rollover") != args.rollover:
             tuned["rollover"] = args.rollover
             desired[config_path] = dump_json(tuned)
+    if args.lean:
+        # Merge only the lean keys into the jev section; other tuned keys stay as they are.
+        # Runs before the enable/disable step so one run settles (a second run writes nothing).
+        base = desired.get(config_path, config_existing)
+        tuned = parse_json(config_path, base)
+        jev = dict(tuned["jev"]) if isinstance(tuned.get("jev"), dict) else {}
+        labels = jev.get("labels") if isinstance(jev.get("labels"), dict) else {}
+        # Absent means the jev_client default list; an explicit non-list means nothing pinned.
+        pinned = jev.get("pinned_agents", list(JEV_DEFAULT_PINNED))
+        pinned = list(pinned) if isinstance(pinned, list) else []
+        pinned += [name for name in LEAN_PINNED if name not in pinned]
+        lean = {"labels": {**labels, "fable": None}, "pinned_agents": pinned}
+        for key, floor in LEAN_JEV_NUMBERS.items():
+            value = jev.get(key)
+            valid = isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+            lean[key] = max(value, floor) if valid else floor
+        jev.update(lean)
+        if jev != tuned.get("jev"):
+            tuned["jev"] = jev
+            desired[config_path] = dump_json(tuned)
     # Jev features are opt-in: --jev turns them on; installing without it turns them off,
     # so a TYPESAFE_API_KEY in the environment alone never sends data. Turning off an
     # enabled config is reported, so a routine upgrade never disables it silently.
@@ -633,19 +655,6 @@ def main(argv: list[str] | None = None) -> int:
     elif not args.jev and jev is not None and jev.get("enabled") is not False:
         tuned["jev"] = {**jev, "enabled": False}
         desired[config_path] = dump_json(tuned)
-    if args.lean:
-        # Merge only the lean keys into the jev section; other tuned keys stay as they are.
-        base = desired.get(config_path, config_existing)
-        tuned = parse_json(config_path, base)
-        jev = dict(tuned["jev"]) if isinstance(tuned.get("jev"), dict) else {}
-        labels = jev.get("labels") if isinstance(jev.get("labels"), dict) else {}
-        pinned = jev.get("pinned_agents")
-        pinned = list(pinned) if isinstance(pinned, list) else list(JEV_DEFAULT_PINNED)
-        pinned += [name for name in LEAN_PINNED if name not in pinned]
-        jev.update({"labels": {**labels, "fable": None}, "pinned_agents": pinned, **LEAN_JEV_NUMBERS})
-        if jev != tuned.get("jev"):
-            tuned["jev"] = jev
-            desired[config_path] = dump_json(tuned)
 
     conflicts = []
     for path, data in managed_sources.items():

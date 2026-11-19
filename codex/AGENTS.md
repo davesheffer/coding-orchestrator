@@ -37,7 +37,7 @@ UNVERIFIED: remaining gaps, or none
 
 Read builder diffs yourself and require an acceptance check after the final edit. Missing reports, low/medium confidence, or material UNVERIFIED claims require direct verification or escalation (scout/runner to builder/main; builder to main), not the same retry. Escalation never expands authority.
 
-Risky or irreversible work needs a critic pass before being called done. Risky means security/auth, data migrations or data-loss paths, concurrency, public API changes, or irreversible operations; docs, tests, config tweaks and routine local changes get no critic. Resolve findings and preserve `SHIP | FIX FIRST | RETHINK` plus `[blocker|major|minor] path:line` evidence. Distinguish reproduced failures from suspicions; never invent a verdict.
+Risky or irreversible work (security/auth, data migrations or data-loss paths, concurrency, public API changes, irreversible operations) needs a critic pass before being called done. Every other code change gets one critic pass on the final diff before push, not one per fix round: fix its findings and rerun the checks, and run the critic again only when it reported a blocker. Docs- and comment-only changes get no critic. Resolve findings and preserve `SHIP | FIX FIRST | RETHINK` plus `[blocker|major|minor] path:line` evidence. Distinguish reproduced failures from suspicions; never invent a verdict.
 
 Keep push, publish, deploy, delete, and send actions in the main session within existing user authorization. Batch genuinely outstanding approvals into one brief: PR, fix, CI, critic verdict, order, decisions. Continue independent authorized work while waiting. State the actual work split and unresolved verification briefly in the final answer.
 
