@@ -24,7 +24,7 @@ Own the request, design, root cause, judgment, verification, and final answer. D
 
 ## Briefing and verification
 
-Provide goal, exact paths/ranges, applicable project rules, constraints, acceptance check, and expected output. Give critics the exact diff/base and claim to attack, using fresh context rather than the author's conversation or conclusions.
+Provide goal, exact paths/ranges, applicable project rules, constraints, acceptance check, and expected output. Give critics the exact diff/base and claim to attack, using fresh context rather than the author's conversation or conclusions. In a repo with `.hunch/`, run `hunch_check_constraints(<changed paths>)` and paste its output into the critic brief: the critic may not use MCP tools, so it cannot see the recorded invariants itself.
 
 Every agent returns:
 

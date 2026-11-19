@@ -162,6 +162,18 @@ class ReportTests(unittest.TestCase):
         self.assertIn("fallback 2,", report.render(summary))
         self.assertNotIn("fallback", report.render(report.summarize([route("x", "opus", 0.9)])))
 
+    def test_clamped_route_counts_apart_and_sets_the_tier(self):
+        entries = [
+            {**route("task", None, None, applied=False), "clamped": "opus"},  # fable builder ran on opus
+            check("task", True),
+        ]
+        summary = report.summarize(entries)
+        self.assertEqual((summary["route"]["applied"], summary["route"]["clamped"]), (0, 1))
+        self.assertEqual((summary["route"]["total"], summary["route"]["choices"]), (0, {}))
+        self.assertEqual(list(summary["report_check"]["per_tier"]), ["opus"])
+        self.assertIn("clamped 1,", report.render(summary))
+        self.assertNotIn("clamped", report.render(report.summarize([route("x", "opus", 0.9)])))
+
     def test_report_check_tier_join_legacy_description(self):
         entries = [
             route("legacy-task", "sonnet", 0.9, legacy=True),

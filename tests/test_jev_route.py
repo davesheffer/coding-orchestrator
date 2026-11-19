@@ -262,6 +262,69 @@ class DecideTests(unittest.TestCase):
         fn = self.probs("sonnet", 0.6, {"sonnet": 0.6, "opus": "x", "fable": 0.4})
         self.assertIsNone(self.decide(self.payload, cfg, fn))
 
+    def fable_cfg(self, agents=("critic",)):
+        return {**self.cfg, "fable_agents": list(agents)}
+
+    def test_fable_clamp_moves_explicit_fable_builder_to_opus_without_classifying(self):
+        logs = []
+        for model in ("fable", "claude-fable-5-2", " FABLE ", "fable[1m]", "claude-fable-5-2[1M]"):
+            with self.subTest(model=model):
+                self.payload["tool_input"]["model"] = model
+                out = self.decide(self.payload, self.fable_cfg(), self.classify(choice="fable"), logs.append)
+                hook = out["hookSpecificOutput"]
+                self.assertEqual(hook["updatedInput"], {**self.payload["tool_input"], "model": "opus"})
+                self.assertIn("fable is reserved for critic", hook["permissionDecisionReason"])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(logs[0]["clamped"], "opus")
+        self.assertFalse(logs[0]["applied"])
+        self.assertEqual(logs[0]["desc_hash"], jev.hashlib.sha256(b"Fix parser").hexdigest()[:12])
+        self.assertNotIn("Refactor", json.dumps(logs))
+
+    def test_fable_clamp_applies_to_pinned_and_unnamed_agents(self):
+        for role in ("builder", "scout", None):
+            with self.subTest(role=role):
+                tool_input = {**self.payload["tool_input"], "model": "fable"}
+                tool_input.pop("subagent_type")
+                if role:
+                    tool_input["subagent_type"] = role
+                cfg = {**self.fable_cfg(), "pinned_agents": ["critic", "builder", "scout"]}
+                out = self.decide({**self.payload, "tool_input": tool_input}, cfg, self.classify())
+                self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+
+    def test_fable_clamp_keeps_listed_agents_and_other_models(self):
+        cases = (("critic", "fable"), ("builder", "opus"), ("builder", "sonnet"), ("builder", None))
+        for role, model in cases:
+            with self.subTest(role=role, model=model):
+                tool_input = {**self.payload["tool_input"], "subagent_type": role}
+                tool_input.pop("model")
+                if model:
+                    tool_input["model"] = model
+                cfg = {**self.fable_cfg(), "pinned_agents": ["critic", "builder"]}
+                self.assertIsNone(self.decide({**self.payload, "tool_input": tool_input}, cfg, self.classify()))
+
+    def test_fable_clamp_leaves_an_agent_file_fable_pin_alone(self):
+        self.agent(self.home, "architect", "fable")
+        self.payload["tool_input"].update(subagent_type="architect")
+        self.payload["tool_input"].pop("model")
+        cfg = {**self.fable_cfg(), "pinned_agents": ["architect"]}
+        self.assertIsNone(self.decide(self.payload, cfg, self.classify()))
+
+    def test_fable_clamp_off_by_default_and_with_kill_switches(self):
+        self.payload["tool_input"]["model"] = "fable"
+        cfg = {**self.cfg, "pinned_agents": ["builder"]}
+        self.assertIsNone(self.decide(self.payload, cfg, self.classify()))
+        for off in ({"enabled": False}, {"features": {**self.cfg["features"], "route": False}},
+                    {"fable_agents": "critic"}):
+            with self.subTest(off=off):
+                self.assertIsNone(self.decide(self.payload, {**self.fable_cfg(), **cfg, "fable_agents": ["critic"], **off},
+                                              self.classify()))
+
+    def test_fable_clamp_with_empty_list_clamps_every_agent(self):
+        self.payload["tool_input"].update(subagent_type="critic", model="fable")
+        out = self.decide(self.payload, self.fable_cfg(()), self.classify())
+        self.assertEqual(out["hookSpecificOutput"]["updatedInput"]["model"], "opus")
+        self.assertIn("reserved for no agent", out["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_pinned_critic_is_noop(self):
         self.payload["tool_input"]["subagent_type"] = "critic"
         self.assertIsNone(self.decide(self.payload, self.cfg, self.classify()))

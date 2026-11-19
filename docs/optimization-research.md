@@ -43,6 +43,31 @@ Anthropic's [Claude Code cost guide](https://code.claude.com/docs/en/costs) reco
 5. **Measure context reductions.** Role descriptions were shortened while permission and reporting instructions stayed intact. Compare model-visible prompt size and task behavior before trimming safety instructions. Stable prefixes can improve [prompt-cache reuse](https://developers.openai.com/api/docs/guides/prompt-caching); the CLI controls its own request construction, so API cache knobs should not be assumed available here.
 6. **Finish native acceptance checks.** A fresh Codex config loaded through `codex debug prompt-input`, and the earlier Claude role validator and four role selections passed under the prior route. Recheck Claude on version 2.1.280 or later for Opus 5.5 and the Haiku scout at `effort: low`. Codex Luna/Sol scouts and a Sol builder ran through probed restrictions; installed local roles parse with all 12 prohibited features disabled. `docs/client-validation.md` still needs Codex native child-role discovery, upgrade, full role/model-access, and compaction checks. On Windows, record the active sandbox and firewall profile; never treat a network-available fallback as isolation.
 
+## Usage measurement — 2026-11-19
+
+`bin/usage-report.py` over 30 days of two active repositories' Claude Code transcripts gave an
+API-equivalent total of about $3,200 (list-price weights, cache writes priced by their 5-minute or
+1-hour TTL; not a subscription bill). Shares: critic 41% (433 runs, about $3 per run, median 2 per
+session, p90 5, max 24), main session 41%, builder 16%, everything else under 3%. 91% of builder
+spend ran on Opus or Fable, not the Sonnet the rules name: the Jev route log showed 74 builder
+upgrades from Sonnet to Opus since 2026-11-10, and the main session asked for a Fable builder
+about two dozen times although `CLAUDE.md` has reserved Fable for the critic since 2026-09-23.
+
+Changes made from this measurement:
+
+- `--lean` pins `builder` in Jev routing (#125) and sets `jev.fable_agents: ["critic"]`, which
+  moves an explicit Fable request for any other agent to Opus in the route hook. The rule text
+  alone did not hold.
+- The critic is deliberately **not** a cost lever: its model (Fable), effort (`high`), trigger
+  rules and brief stay as they are. The only critic change adds context: in a repo with
+  `.hunch/`, the brief includes `hunch_check_constraints` output, since the critic has no MCP
+  access.
+
+Unverified: whether Sonnet-pinned builders raise critic rounds or defect rates, and the saving
+(roughly $350 per 30 days if the Fable and upgraded Opus builder runs had run on Sonnet,
+before any rework). Rerun the report about a week after installing to compare
+builder spend and critic runs per session.
+
 ## Decision rule
 
 Keep a cheaper route only when it meets the same correctness and permission criteria on the frozen task set. Rank candidates by **cost per correctly completed task** and median/p95 elapsed time, not token price or one successful demo. A model or prompt change should ship with the task-set result, native-client evidence where applicable, and a rollback path. The current change is a routing baseline aligned with local preferences; its end-to-end quality and monetary savings remain unverified.
