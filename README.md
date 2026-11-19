@@ -63,6 +63,7 @@ Then start a new session. That's it. 🎉
 |---|---|
 | `--rollover open` | Open the fresh session automatically when a chat gets too long (`copy` puts the prompt on your clipboard instead) |
 | `--jev` | Turn on the optional Jev helpers (smarter routing and a safety check before pushes). Uses a paid third-party API |
+| `--lean` | Use less of your plan's limit: switch a `[1m]` long-context model to its standard window, and write Jev routing limits (no Fable tier, builder kept on Sonnet, a higher upgrade threshold) that apply when Jev is on |
 
 **Rollover modes.** `open` and `copy` work as before. `--rollover inplace` never
 stops a session for size: the model keeps a per-session checkpoint file current,

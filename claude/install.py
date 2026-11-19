@@ -57,6 +57,13 @@ LEGACY_MANAGED_HASHES = {
 MANIFEST = ".coding-orchestrator-manifest.json"
 JEV_SCRIPTS = ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py",
                "pre-push-gate.py")
+# --lean: Claude Code's long-context model suffix, and the Jev keys it merges into relay/config.json.
+LONG_CONTEXT_SUFFIX = "[1m]"
+# Mirrors jev_client.DEFAULTS["pinned_agents"]; a list a user sets replaces that default.
+JEV_DEFAULT_PINNED = ("critic", "fork", "scout", "runner")
+LEAN_PINNED = ("builder",)
+# Floors: a stricter (higher) value the user already set is kept.
+LEAN_JEV_NUMBERS = {"upgrade_min_confidence": 0.6}
 
 
 def fail(message: str) -> None:
@@ -521,6 +528,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rollover", choices=("open", "copy", "inplace"),
                         help="relay handoffs open a new Claude tab, only copy the relay prompt, "
                              "or continue in place (compaction re-injects a checkpoint)")
+    parser.add_argument("--lean", action="store_true",
+                        help="cap usage: drop the 1M-context model variant, keep Jev routing off "
+                             "Fable and builder on Sonnet, raise the upgrade and risk-gate thresholds")
     parser.add_argument("--pre-push-hook", metavar="REPO", type=Path,
                         help="only install the pre-push gate hook into this repository")
     args = parser.parse_args(argv)
@@ -594,6 +604,12 @@ def main(argv: list[str] | None = None) -> int:
     merged_settings = merge_hooks(settings, hook_template, dest / "relay" / "relay.py")
     merged_settings = merge_jev_hook(merged_settings, dest / "bin", args.jev)
     merged_settings.setdefault("model", "claude-opus-5-5")
+    model = merged_settings.get("model")
+    if (args.lean and isinstance(model, str) and len(model) > len(LONG_CONTEXT_SUFFIX)
+            and model.lower().endswith(LONG_CONTEXT_SUFFIX)):
+        # A 1M window lets sessions grow far past 200k before compacting, and every turn
+        # re-reads the whole context; keep the model, drop only the long-context variant.
+        merged_settings["model"] = model[:-len(LONG_CONTEXT_SUFFIX)]
     # Compare parsed JSON: a file that already says the same is left as it is, in its own layout.
     if settings_existing is None or merged_settings != settings:
         desired[settings_path] = dump_json(merged_settings, target_newline(settings_existing))
@@ -605,6 +621,26 @@ def main(argv: list[str] | None = None) -> int:
         tuned = parse_json(config_path, base)
         if tuned.get("rollover") != args.rollover:
             tuned["rollover"] = args.rollover
+            desired[config_path] = dump_json(tuned)
+    if args.lean:
+        # Merge only the lean keys into the jev section; other tuned keys stay as they are.
+        # Runs before the enable/disable step so one run settles (a second run writes nothing).
+        base = desired.get(config_path, config_existing)
+        tuned = parse_json(config_path, base)
+        jev = dict(tuned["jev"]) if isinstance(tuned.get("jev"), dict) else {}
+        labels = jev.get("labels") if isinstance(jev.get("labels"), dict) else {}
+        # Absent means the jev_client default list; an explicit non-list means nothing pinned.
+        pinned = jev.get("pinned_agents", list(JEV_DEFAULT_PINNED))
+        pinned = list(pinned) if isinstance(pinned, list) else []
+        pinned += [name for name in LEAN_PINNED if name not in pinned]
+        lean = {"labels": {**labels, "fable": None}, "pinned_agents": pinned}
+        for key, floor in LEAN_JEV_NUMBERS.items():
+            value = jev.get(key)
+            valid = isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+            lean[key] = max(value, floor) if valid else floor
+        jev.update(lean)
+        if jev != tuned.get("jev"):
+            tuned["jev"] = jev
             desired[config_path] = dump_json(tuned)
     # Jev features are opt-in: --jev turns them on; installing without it turns them off,
     # so a TYPESAFE_API_KEY in the environment alone never sends data. Turning off an

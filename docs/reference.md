@@ -225,9 +225,18 @@ Choose the mode in any of these ways (highest precedence first):
 3. Legacy `"auto_open": false` in `relay/config.json` still means `copy`.
 
 `relay.py handoff --no-open` behaves as `copy` for a single handoff. Without
-`--rollover`, the installer never changes an existing `relay/config.json`, which
-also holds the zone thresholds. A threshold or `handoff_ttl_hours` value that is
+`--rollover` or `--lean`, the installer changes an existing `relay/config.json` only to set
+`jev.enabled` to match `--jev`. The file also holds the zone
+thresholds. A threshold or `handoff_ttl_hours` value that is
 not a number (numeric strings are accepted) falls back to its default.
+
+`--lean` caps usage. It removes a `[1m]` suffix from `model` in `settings.json`
+(`opus[1m]` becomes `opus`; other models are left alone) and merges these keys into
+the `jev` section of `relay/config.json`: `labels.fable: null` (routing never picks
+Fable), `builder` added to `pinned_agents` (starting from the default list when the key is
+absent) and `upgrade_min_confidence` of at least `0.6` (a higher value is kept). The risk
+gate is unchanged. Other keys stay as they are and a repeat run changes nothing. Jev keys
+only take effect with `--jev`.
 
 Each relay measurement reads at most the last **8 MiB** of the transcript.
 Synthetic entries (an API error or interrupted turn, which report zero usage) are
