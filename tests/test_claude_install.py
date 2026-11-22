@@ -572,6 +572,24 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertNotIn(message, again.stdout)
         self.assertTrue((bin_dir / "jev-route.py").exists())
 
+    def test_spawn_guard_merge_legacy_mixed_and_malformed(self):
+        bin_dir = self.home / "bin"
+        legacy = 'python3 "$HOME/.claude/bin/spawn-guard.py" 2>/dev/null || true'
+        user = {"type": "command", "command": "echo mine"}
+        existing = {"hooks": {"PreToolUse": [
+            {"matcher": "Agent|Task", "hooks": [{"type": "command", "command": legacy}, user]}]}}
+        groups = install_module.merge_spawn_guard(existing, bin_dir)["hooks"]["PreToolUse"]
+        commands = [h["command"] for g in groups for h in g["hooks"]]
+        self.assertNotIn(legacy, commands)
+        self.assertIn("echo mine", commands)
+        self.assertEqual(sum("spawn-guard.py" in c for c in commands), 1)
+        bad = {"hooks": {"PreToolUse": [{"matcher": "x", "hooks": "nope"}]}}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            merged = install_module.merge_spawn_guard(bad, bin_dir)
+        self.assertEqual(merged, bad)
+        self.assertIn("spawn guard not installed", err.getvalue())
+
     def test_rollover_flag_sets_only_that_config_key(self):
         config = self.home / "relay/config.json"
         self.assertEqual(self.run_install("--rollover", "copy").returncode, 0)

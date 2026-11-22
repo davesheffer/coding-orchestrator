@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,47 @@ class SpawnGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         out = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(out["permissionDecision"], "deny")
+
+    def test_blank_line_after_marker_does_not_count(self):
+        self.assertIn("RISK", guard.decide(spawn("RISK:\n\nx", subagent_type="critic", model="fable")))
+        self.assertIn("ROLE-EXCEPTION",
+                      guard.decide(spawn("ROLE-EXCEPTION:\n\nx", subagent_type="general-purpose")))
+
+    def test_non_ascii_prompt_under_cp1252_still_denied(self):
+        prompt = "שלום “quote”"
+        payload = json.dumps(spawn(prompt, subagent_type="claude"), ensure_ascii=False).encode("utf-8")
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        result = subprocess.run([sys.executable, str(GUARD)], input=payload, capture_output=True, env=env)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_task_tool_name_denied(self):
+        self.assertIn("ROLE-EXCEPTION", guard.decide(spawn(tool="Task", subagent_type="claude")))
+
+    def test_non_dict_payload_silent(self):
+        result = subprocess.run([sys.executable, str(GUARD)], input=b"[1, 2]", capture_output=True)
+        self.assertEqual((result.returncode, result.stdout), (0, b""))
+
+    def test_project_critic_takes_precedence(self):
+        home_fable = self.home_with_critic("fable")
+        home_opus = self.home_with_critic("opus")
+        for project_model, home, denied in (("fable", home_opus, True), ("opus", home_fable, False)):
+            with self.subTest(project=project_model):
+                proj = tempfile.TemporaryDirectory()
+                self.addCleanup(proj.cleanup)
+                agents = Path(proj.name) / ".claude" / "agents"
+                agents.mkdir(parents=True)
+                (agents / "critic.md").write_text(f"---\nmodel: {project_model}\n---\n", encoding="utf-8")
+                payload = {**spawn(subagent_type="critic"), "cwd": proj.name}
+                self.assertEqual(guard.decide(payload, home=home) is not None, denied)
+
+    def test_model_line_in_body_ignored(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        (Path(tmp.name) / "agents").mkdir()
+        (Path(tmp.name) / "agents" / "critic.md").write_text(
+            "---\nname: critic\nmodel:\n---\nmodel: fable\n", encoding="utf-8")
+        self.assertIsNone(guard.decide(spawn(subagent_type="critic"), home=Path(tmp.name)))
 
 
 if __name__ == "__main__":

@@ -18,14 +18,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 HEAVY = {"", "general-purpose", "claude"}
-EXCEPTION = re.compile(r"^\s*ROLE-EXCEPTION:\s*\S", re.MULTILINE)
-RISK = re.compile(r"^\s*RISK:\s*\S", re.MULTILINE)
+EXCEPTION = re.compile(r"^[ \t]*ROLE-EXCEPTION:[ \t]*\S", re.MULTILINE)
+RISK = re.compile(r"^[ \t]*RISK:[ \t]*\S", re.MULTILINE)
 
 HEAVY_REASON = (
     "spawn-guard: `{kind}` starts with every tool and skill loaded (about 58K tokens against "
     "about 23K for a named role). Use a named role instead: implementer or plan/document "
     "writing -> builder (add `model: opus` for a plan), lookup or summary -> scout, exact "
-    "command -> runner, review -> critic. If this task truly needs tools no role has, add a "
+    "command -> runner, review -> critic (with `model: opus` unless risky). If this task truly "
+    "needs tools no role has, add a "
     "line `ROLE-EXCEPTION: <reason>` to the prompt and spawn again."
 )
 FABLE_REASON = (
@@ -37,14 +38,22 @@ FABLE_REASON = (
 )
 
 
-def frontmatter_model(name, home=ROOT):
-    """The `model:` value of an installed role file, lowercased, or "" when unreadable."""
-    try:
-        text = (home / "agents" / f"{name}.md").read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    match = re.search(r"^model:\s*(\S+)", text, re.MULTILINE)
-    return match.group(1).lower() if match else ""
+def frontmatter_model(name, home=ROOT, cwd=None):
+    """The `model:` of a role file (project, then user), lowercased, or "" when unreadable."""
+    roots = []
+    if isinstance(cwd, str) and cwd:
+        roots.append(Path(cwd) / ".claude")
+    roots.append(Path(home))
+    for root in roots:
+        try:
+            text = (root / "agents" / f"{name}.md").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        block = re.match(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", text, re.DOTALL)
+        match = re.search(r"^model:[ \t]*(\S+)", block.group(1), re.MULTILINE) if block else None
+        if match:
+            return match.group(1).lower()
+    return ""
 
 
 def decide(payload, home=ROOT):
@@ -61,7 +70,7 @@ def decide(payload, home=ROOT):
             return None
         return HEAVY_REASON.format(kind=kind or "general-purpose (no subagent_type)")
     if kind == "critic":
-        model = str(tool_input.get("model") or "").lower() or frontmatter_model("critic", home)
+        model = str(tool_input.get("model") or "").lower() or frontmatter_model("critic", home, payload.get("cwd"))
         if "fable" in model and not RISK.search(prompt):
             return FABLE_REASON
     return None
@@ -69,7 +78,7 @@ def decide(payload, home=ROOT):
 
 def main():
     try:
-        reason = decide(json.load(sys.stdin))
+        reason = decide(json.loads(sys.stdin.buffer.read().decode("utf-8", "replace")))
     except Exception:
         return 0
     if reason:

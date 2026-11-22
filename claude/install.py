@@ -330,6 +330,8 @@ def merge_spawn_guard(existing: dict, bin_dir: Path) -> dict:
     if not isinstance(have, list):
         fail("settings.json hooks.PreToolUse must be an array")
     if not all(isinstance(g, dict) and isinstance(g.get("hooks", []), list) for g in have):
+        print("warning: spawn guard not installed: a PreToolUse group in settings.json is "
+              "malformed; fix it and re-run install.py", file=os.sys.stderr)
         return result  # a malformed user group: leave the user's hooks as they are
     cleaned = strip_owned(have, "PreToolUse", lambda command: is_spawn_guard_hook(command, bin_dir))
     command = f"{hook_python()} {shlex.quote(str(bin_dir / 'spawn-guard.py'))} 2>/dev/null || true"
