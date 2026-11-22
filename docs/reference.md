@@ -877,6 +877,7 @@ runner. No credentials are included.
 | `codex/install.sh`, `codex/install.py`, `codex/config.example.toml` | Codex installation and new-home defaults |
 | `codex/PROMPT.md`, `codex/CONTEXT-GAUGE.md` | Validation brief and optional gauge proposal |
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
+| `bin/spawn-guard.py` | `PreToolUse` `Agent\|Task` hook, always installed: denies `general-purpose`/`claude` spawns without a `ROLE-EXCEPTION:` line and a Fable critic without a `RISK:` line |
 | `bin/pr-status` | Shared PR/CI helper |
 | `bin/session-focus.py` | Switch VS Code to a running Claude Code session's tab (used by `/sessions`) |
 | `bin/rollover-open.py`, `vscode/handoff-bridge/` | Shared handoff protocol and VS Code tab bridge |
