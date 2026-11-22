@@ -71,7 +71,7 @@ class ClaudeInstallTests(unittest.TestCase):
         settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(settings["model"], "claude-opus-5-5")
         commands = [h["command"] for groups in settings["hooks"].values()
-                    for group in groups for h in group["hooks"]]
+                    for group in groups for h in group["hooks"] if "spawn-guard.py" not in h["command"]]
         self.assertTrue(all(str(self.home / "relay/relay.py") in command for command in commands))
         self.assertTrue(all("$HOME/.claude" not in command for command in commands))
         for role in ("scout", "runner", "builder", "critic"):
@@ -383,7 +383,7 @@ class ClaudeInstallTests(unittest.TestCase):
             self.assertNotIn(placeholder, leftover)
         settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
         commands = [h["command"] for groups in settings["hooks"].values()
-                    for group in groups for h in group["hooks"]]
+                    for group in groups for h in group["hooks"] if "spawn-guard.py" not in h["command"]]
         self.assertEqual(sorted(commands), sorted(f"{python} {relay} {action} 2>/dev/null || true"
                                                   for action in ("prompt", "stop", "precompact",
                                                                  "session-start")))
@@ -546,7 +546,8 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(hooks(), (
             [user, group("Agent|Task", "jev-route.py"),
              group("Bash|PowerShell", "jev-guard.py", " gate"),
-             group("SubagentHandback", "jev-guard.py", " handback")],
+             group("SubagentHandback", "jev-guard.py", " handback"),
+             group("Agent|Task", "spawn-guard.py")],
             [group("Agent|Task|SubagentHandback", "jev-guard.py", " agent-done")]))
         manifest = json.loads(self.home.joinpath(".coding-orchestrator-manifest.json").read_text())
         for name in ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py", "ask-jev.py"):
@@ -564,12 +565,30 @@ class ClaudeInstallTests(unittest.TestCase):
         off = self.run_install()
         self.assertEqual(off.returncode, 0, off.stderr)
         self.assertIn(message, off.stdout)
-        self.assertEqual(hooks(), ([user], None))
+        self.assertEqual(hooks(), ([user, group("Agent|Task", "spawn-guard.py")], None))
         self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["jev"], {"enabled": False})
         again = self.run_install()
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertNotIn(message, again.stdout)
         self.assertTrue((bin_dir / "jev-route.py").exists())
+
+    def test_spawn_guard_merge_legacy_mixed_and_malformed(self):
+        bin_dir = self.home / "bin"
+        legacy = 'python3 "$HOME/.claude/bin/spawn-guard.py" 2>/dev/null || true'
+        user = {"type": "command", "command": "echo mine"}
+        existing = {"hooks": {"PreToolUse": [
+            {"matcher": "Agent|Task", "hooks": [{"type": "command", "command": legacy}, user]}]}}
+        groups = install_module.merge_spawn_guard(existing, bin_dir)["hooks"]["PreToolUse"]
+        commands = [h["command"] for g in groups for h in g["hooks"]]
+        self.assertNotIn(legacy, commands)
+        self.assertIn("echo mine", commands)
+        self.assertEqual(sum("spawn-guard.py" in c for c in commands), 1)
+        bad = {"hooks": {"PreToolUse": [{"matcher": "x", "hooks": "nope"}]}}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            merged = install_module.merge_spawn_guard(bad, bin_dir)
+        self.assertEqual(merged, bad)
+        self.assertIn("spawn guard not installed", err.getvalue())
 
     def test_rollover_flag_sets_only_that_config_key(self):
         config = self.home / "relay/config.json"
@@ -599,7 +618,7 @@ class ClaudeInstallTests(unittest.TestCase):
         relay = str(self.home / "relay/relay.py")
         return {event: [(group.get("matcher"), h) for group in groups for h in group["hooks"]
                         if relay in h["command"]]
-                for event, groups in settings["hooks"].items()}
+                for event, groups in settings["hooks"].items() if event != "PreToolUse"}
 
     def test_fresh_install_has_four_relay_hooks_and_is_idempotent(self):
         result = self.run_install()
@@ -886,10 +905,14 @@ class ClaudeInstallTests(unittest.TestCase):
         removed = install_module.merge_jev_hook(settings, bin_dir, False)
         self.assertEqual(removed["hooks"]["PreToolUse"], [user])
 
-    def test_default_install_adds_no_pre_tool_use_hook(self):
+    def test_default_install_adds_only_the_spawn_guard_pre_tool_use_hook(self):
         self.assertEqual(self.run_install().returncode, 0)
         settings = json.loads(self.home.joinpath("settings.json").read_text(encoding="utf-8"))
-        self.assertNotIn("PreToolUse", settings["hooks"])
+        [entry] = settings["hooks"]["PreToolUse"]
+        self.assertEqual(entry["matcher"], "Agent|Task")
+        self.assertEqual([h["command"] for h in entry["hooks"]], [
+            f"{install_module.hook_python()} {shlex.quote(str(self.home / 'bin/spawn-guard.py'))}"
+            " 2>/dev/null || true"])
         self.assertNotIn("PostToolUse", settings["hooks"])
 
     @unittest.skipUnless(os.name == "posix", "generated hook commands require a POSIX shell")

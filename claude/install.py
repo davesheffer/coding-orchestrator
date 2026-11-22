@@ -305,6 +305,44 @@ def merge_jev_hook(existing: dict, bin_dir: Path, enabled: bool) -> dict:
     return result
 
 
+def is_spawn_guard_hook(command: object, bin_dir: Path) -> bool:
+    """Match only a complete spawn-guard command emitted by this installer."""
+    if not isinstance(command, str):
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    script = "spawn-guard.py"
+    owned_paths = {str(bin_dir / script), str(Path.home() / ".claude/bin" / script),
+                   f"$HOME/.claude/bin/{script}", f"${{HOME}}/.claude/bin/{script}",
+                   f"~/.claude/bin/{script}"}
+    return (len(parts) >= 2 and parts[0] in OWNED_PYTHONS
+            and any(same_path(parts[1], owned) for owned in owned_paths)
+            and parts[2:] in ([], ["2>/dev/null", "||", "true"]))
+
+
+def merge_spawn_guard(existing: dict, bin_dir: Path) -> dict:
+    """Always (re)add the spawn guard as the last PreToolUse group; it needs no Jev."""
+    result = json.loads(json.dumps(existing))
+    hooks = result.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        fail("settings.json hooks must be an object")
+    have = hooks.get("PreToolUse", [])
+    if not isinstance(have, list):
+        fail("settings.json hooks.PreToolUse must be an array")
+    if not all(isinstance(g, dict) and isinstance(g.get("hooks", []), list) for g in have):
+        print("warning: spawn guard not installed: a PreToolUse group in settings.json is "
+              "malformed; fix it and re-run install.py", file=os.sys.stderr)
+        return result  # a malformed user group: leave the user's hooks as they are
+    cleaned = strip_owned(have, "PreToolUse", lambda command: is_spawn_guard_hook(command, bin_dir))
+    command = f"{hook_python()} {shlex.quote(str(bin_dir / 'spawn-guard.py'))} 2>/dev/null || true"
+    cleaned.append({"matcher": "Agent|Task", "hooks": [{
+        "type": "command", "command": command, "timeout": 5}]})
+    hooks["PreToolUse"] = cleaned
+    return result
+
+
 # Hook event -> relay.py subcommand. Ownership is matched by command (is_old_relay_hook),
 # never by matcher, so SessionStart keeps its "compact" matcher and foreign hooks stay.
 RELAY_ACTIONS = {"UserPromptSubmit": "prompt", "Stop": "stop",
@@ -572,6 +610,7 @@ def main(argv: list[str] | None = None) -> int:
     managed_sources[dest / "bin" / "rollover-open.py"] = (root / "bin" / "rollover-open.py").read_bytes()
     managed_sources[dest / "bin" / "session-focus.py"] = (root / "bin" / "session-focus.py").read_bytes()
     managed_sources[dest / "bin" / "role-guard.py"] = (root / "bin" / "role-guard.py").read_bytes()
+    managed_sources[dest / "bin" / "spawn-guard.py"] = (root / "bin" / "spawn-guard.py").read_bytes()
     managed_sources[dest / "bin" / "turn-guard.py"] = (root / "bin" / "turn-guard.py").read_bytes()
     managed_sources[dest / "bin" / "ro.py"] = (root / "bin" / "ro.py").read_bytes()
     for name in JEV_SCRIPTS:
@@ -605,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
     desired[claude_path] = merge_instructions(claude_existing, source_claude, claude_path)
     merged_settings = merge_hooks(settings, hook_template, dest / "relay" / "relay.py")
     merged_settings = merge_jev_hook(merged_settings, dest / "bin", args.jev)
+    merged_settings = merge_spawn_guard(merged_settings, dest / "bin")
     merged_settings.setdefault("model", "claude-opus-5-5")
     model = merged_settings.get("model")
     if (args.lean and isinstance(model, str) and len(model) > len(LONG_CONTEXT_SUFFIX)
