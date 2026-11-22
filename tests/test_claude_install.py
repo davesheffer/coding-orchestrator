@@ -1016,6 +1016,7 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(jev["labels"], {"fable": None})
         self.assertEqual(jev["pinned_agents"], ["critic", "fork", "scout", "runner", "builder"])
         self.assertEqual(jev["upgrade_min_confidence"], 0.6)
+        self.assertEqual(jev["fable_agents"], ["critic"])
         self.assertNotIn("risk_min_probability", jev)
 
     def test_lean_drops_only_the_long_context_suffix(self):
@@ -1046,6 +1047,7 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(config["jev"], {"enabled": True, "log": False,
                                          "labels": {"opus": "custom rubric", "fable": None},
                                          "pinned_agents": ["critic", "scout", "builder"],
+                                         "fable_agents": ["critic"],
                                          "upgrade_min_confidence": 0.6})
         before = self.home.joinpath("relay/config.json").read_bytes()
         result = self.run_install("--jev", "--lean")
@@ -1061,6 +1063,19 @@ class ClaudeInstallTests(unittest.TestCase):
         jev = self.read_json("relay/config.json")["jev"]
         self.assertEqual(jev["upgrade_min_confidence"], 0.9)
         self.assertEqual(jev["pinned_agents"], ["builder"])
+
+    def test_lean_keeps_a_fable_agents_list_the_user_set(self):
+        self.home.joinpath("relay").mkdir(parents=True)
+        tuned = {"jev": {"enabled": True, "fable_agents": ["critic", "architect"]}}
+        self.home.joinpath("relay/config.json").write_text(json.dumps(tuned), encoding="utf-8")
+        self.assertEqual(self.run_install("--jev", "--lean").returncode, 0)
+        self.assertEqual(self.read_json("relay/config.json")["jev"]["fable_agents"], ["critic", "architect"])
+
+    def test_lean_default_fable_agents_is_off_in_jev_client(self):
+        spec = importlib.util.spec_from_file_location("jev_client_fable", ROOT / "bin" / "jev_client.py")
+        jev_client = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(jev_client)
+        self.assertIsNone(jev_client.DEFAULTS["fable_agents"])
 
     def test_lean_without_jev_settles_in_one_run(self):
         self.assertEqual(self.run_install("--lean").returncode, 0)

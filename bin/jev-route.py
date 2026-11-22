@@ -8,7 +8,8 @@ input's `model`. Moving to a stronger tier needs less confidence than moving to
 a weaker one, and a task escalates when the stronger tiers together are likely
 enough, because under-routing costs more than over-routing. A call that sets `model`
 itself is never moved to a weaker tier when the hook can rank
-that model. Configuration lives under the "jev" key of
+that model, except that jev.fable_agents (when a list) moves an explicit Fable request for an
+unlisted agent to opus. Configuration lives under the "jev" key of
 `<install>/relay/config.json`; the API key comes from TYPESAFE_API_KEY or
 `jev.api_key_file`.
 
@@ -40,6 +41,8 @@ AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 INHERITING_AGENTS = ("general-purpose", "Explore", "Plan")
 # Claude Code model aliases that run a known tier (opusplan plans with opus).
 MODEL_ALIASES = {"opusplan": "opus"}
+# The tier an explicit Fable call runs on when jev.fable_agents does not list its agent.
+FABLE_CLAMP_MODEL = "opus"
 INSTRUCTIONS = ("Which model tier should run this subagent task? "
                 "Pick the least expensive tier that will reliably do it well; "
                 "when torn between two tiers, pick the stronger one.")
@@ -175,6 +178,28 @@ def pinned(tool_input, cfg):
     return bool(cfg.get("respect_explicit_model") and explicit_model(tool_input))
 
 
+def fable_clamp(tool_input, cfg):
+    """FABLE_CLAMP_MODEL when the call explicitly asks for Fable but its agent is not listed in
+    jev.fable_agents, else None.
+
+    Off unless jev.fable_agents is a list (null by default) and routing is on, so the kill
+    switches still turn it off. Only an explicit `model` is clamped: an agent file that pins
+    Fable in its own frontmatter is the user's choice and runs as written. Pinned agents are
+    clamped too: a pin stops Jev routing, not this rule. Only the incoming call is checked: keep
+    `labels.fable: null` (as --lean does) so routing itself never picks Fable.
+    """
+    allowed = cfg.get("fable_agents")
+    if not isinstance(allowed, list) or not feature_enabled(cfg, "route"):
+        return None
+    if not explicit_model(tool_input):
+        return None
+    # A context-window suffix (fable[1m]) still names a Fable model.
+    model = re.sub(r"\[[^\]]*\]\s*$", "", tool_input["model"].strip())
+    if model_tier(model, TIER_RANK) != "fable":
+        return None
+    return None if (tool_input.get("subagent_type") or "general-purpose") in allowed else FABLE_CLAMP_MODEL
+
+
 def desc_hash(description):
     """sha256(description)[:12], or None if description is empty/missing."""
     if not description:
@@ -264,7 +289,26 @@ def decide(payload, cfg, classify_fn, log_fn=None, home=ROOT):
     if not isinstance(payload, dict) or payload.get("tool_name") not in ("Agent", "Task"):
         return None
     tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict) or not cfg["labels"]:
+    if not isinstance(tool_input, dict):
+        return None
+    clamp = fable_clamp(tool_input, cfg)
+    if clamp is not None:
+        name = bounded(tool_input.get("subagent_type") or "general-purpose")
+        reason = (f"jev: {bounded(tool_input['model'])} → {clamp} "
+                  f"(fable is reserved for {', '.join(map(bounded, cfg['fable_agents'])) or 'no agent'})")
+        if log_fn:
+            description = tool_input.get("description")
+            hashed = desc_hash(description if isinstance(description, str) else "")
+            log_fn({"ts": timestamp(), "feature": "route", "subagent_type": name,
+                    "current": bounded(tool_input["model"]), "applied": False, "clamped": clamp,
+                    "reason": reason, **({"desc_hash": hashed} if hashed else {})})
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": reason,
+            "updatedInput": {**tool_input, "model": clamp},
+        }}
+    if not cfg["labels"]:
         return None
     if pinned(tool_input, cfg):
         return None

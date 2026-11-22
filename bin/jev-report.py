@@ -95,6 +95,9 @@ def counts(values):
 
 
 def summarize_route(entries):
+    # A clamp (jev.fable_agents) never asked Jev, so it stays out of the routing rate and choices.
+    clamped = sum(1 for e in entries if e.get("applied") is not True and e.get("clamped"))
+    entries = [e for e in entries if e.get("applied") is True or not e.get("clamped")]
     applied = sum(1 for e in entries if e.get("applied") is True)
     fallback = sum(1 for e in entries if e.get("applied") is not True and e.get("fallback"))
     choices = {}
@@ -116,7 +119,7 @@ def summarize_route(entries):
     warning = (SATURATION_WARNING
                if confidences and saturated >= SATURATION_SHARE * len(confidences) else None)
     return {"total": len(entries), "applied": applied, "applied_rate": rate(applied, len(entries)), "fallback": fallback,
-            "choices": {k: dict(sorted(v.items())) for k, v in sorted(choices.items())},
+            "clamped": clamped, "choices": {k: dict(sorted(v.items())) for k, v in sorted(choices.items())},
             "confidence_histogram": histogram, "latency_ms": latency(entries), "warning": warning}
 
 
@@ -152,6 +155,11 @@ def effective_tiers(entries):
             key = join_key(entry)
             if key is not None:
                 last_applied[key] = entry["fallback"]
+        elif feature == "route" and isinstance(entry.get("clamped"), str) and entry["clamped"]:
+            # jev.fable_agents moved an explicit Fable call to this tier.
+            key = join_key(entry)
+            if key is not None:
+                last_applied[key] = entry["clamped"]
         elif feature == "report_check":
             model = entry.get("model")
             if isinstance(model, str) and model:
@@ -248,6 +256,7 @@ def render(summary):
     lines = [f"jev log: {summary['entries']} entries"]
     route = summary["route"]
     fallback = f", fallback {route['fallback']}" if route.get("fallback") else ""
+    fallback += f", clamped {route['clamped']}" if route.get("clamped") else ""
     lines.append(f"route: {route['total']} total, applied {fmt_rate(route['applied_rate'])}{fallback}, "
                  f"{fmt_latency(route['latency_ms'])}")
     for agent, choices in route["choices"].items():
