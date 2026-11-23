@@ -26,7 +26,7 @@ class BundleContractTests(unittest.TestCase):
             "scout": ("haiku", "gpt-6-luna", "read-only"),
             "runner": ("haiku", "gpt-6-luna", "workspace-write"),
             "builder": ("sonnet", "gpt-6.1-sol", "workspace-write"),
-            "critic": ("fable", "gpt-6-astra", "read-only"),
+            "critic": ("opus", "gpt-6-astra", "read-only"),
         }
         for name in ROLES:
             with self.subTest(role=name):

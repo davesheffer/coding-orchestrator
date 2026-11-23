@@ -58,7 +58,7 @@ Changes made from this measurement:
 - `--lean` pins `builder` in Jev routing (#125) and sets `jev.fable_agents: ["critic"]`, which
   moves an explicit Fable request for any other agent to Opus in the route hook. The rule text
   alone did not hold.
-- The critic is deliberately **not** a cost lever: its model (Fable), effort (`high`), trigger
+- The critic was not a cost lever until 2026-11-23, when its default model moved from Fable to Opus (Fable critics were about 92% of critic tokens, mostly routine reviews; risky reviews still pass `model: fable` with `RISK:`). Its effort moved from `high` to `medium` the same day; trigger
   rules and brief stay as they are. The only critic change adds context: in a repo with
   `.hunch/`, the brief includes `hunch_check_constraints` output, since the critic has no MCP
   access.

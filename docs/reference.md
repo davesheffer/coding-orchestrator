@@ -33,7 +33,7 @@ sending messages stay with the orchestrator and the user's authorization.
 | `scout` | Read-only lookup and reconnaissance | Haiku / low effort | GPT-6 Luna / low |
 | `runner` | Exact commands; exit codes and verbatim failures | Haiku / low effort | GPT-6 Luna / low |
 | `builder` | A specified change, then its acceptance check | Sonnet / low effort | GPT-6.1 Sol / medium |
-| `critic` | Fresh-context adversarial review | Fable | GPT-6 Astra / high |
+| `critic` | Fresh-context adversarial review | Opus (Fable for `RISK:` reviews) | GPT-6 Astra / high |
 
 On Claude Code, scout is enforced: a frontmatter PreToolUse hook (`bin/role-guard.py`) limits Bash to the
 `bin/ro.py` read verbs (log, diff, show, status, blame, issues, issue, prs, pr) and fails closed if the
@@ -66,9 +66,9 @@ roles elsewhere, run on Haiku on Claude.
 The Claude installer sets `claude-opus-5-5` as the main-session default when no
 model is already selected in user settings; existing explicit choices remain
 untouched. Its named builder role uses Sonnet at `effort: low`, its scout and runner use Haiku at `effort: low`,
-and its critic uses Fable at `effort: high`, which is also Fable's default; the pin keeps a required review at `high` if that default or the critic's model changes. The read-only benchmark (`bin/compare-claude-readonly.py --efforts`) found Haiku matching
+and its critic uses Opus at `effort: medium` (Fable only when the brief passes `model: fable` with a `RISK:` line; the pin applies to that Fable run too, so risky reviews also run at medium, an owner trade-off made 2026-11-23); the pin keeps a required review at `medium` if that default or the critic's model changes. The read-only benchmark (`bin/compare-claude-readonly.py --efforts`) found Haiku matching
 Sonnet on lookup tasks at about a twelfth of the cost, with no measurable gain from medium over low effort;
-the builder's `effort: low` and the critic's `effort: high` follow `benchmarks/README.md`, "2026-11-15 builder and critic effort run". `builder` is not in Jev's `pinned_agents`, and the route hook rewrites only the model, so a builder call that Jev upgrades to Opus or Fable still runs at `effort: low`. Opus and Fable at `effort: low` matched medium on the same small specified edits (one run per cell for Fable). Unpinned roles send their model's default effort (`medium` on Sonnet and Opus, `high` on Fable), not a session-wide value. Jev's default
+the builder's `effort: low` follows `benchmarks/README.md`, "2026-11-15 builder and critic effort run"; the critic's `effort: medium` (owner choice 2026-11-23, down from the benchmarked `high`) trades some review depth for cost. `builder` is not in Jev's `pinned_agents`, and the route hook rewrites only the model, so a builder call that Jev upgrades to Opus or Fable still runs at `effort: low`. Opus and Fable at `effort: low` matched medium on the same small specified edits (one run per cell for Fable). Unpinned roles send their model's default effort (`medium` on Sonnet and Opus, `high` on Fable), not a session-wide value. Jev's default
 `pinned_agents` includes `scout` and `runner`, so routing never moves them off Haiku. Only those exact `subagent_type` names are held: with the default `respect_explicit_model: false`, a built-in agent called with `model: haiku` can still be upgraded by Jev. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
 follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
 Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
