@@ -33,7 +33,8 @@ sending messages stay with the orchestrator and the user's authorization.
 | `scout` | Read-only lookup and reconnaissance | Haiku / low effort | GPT-6 Luna / low |
 | `runner` | Exact commands; exit codes and verbatim failures | Haiku / low effort | GPT-6 Luna / low |
 | `builder` | A specified change, then its acceptance check | Sonnet / low effort | GPT-6.1 Sol / medium |
-| `critic` | Fresh-context adversarial review | Opus (Fable for `RISK:` reviews) | GPT-6 Astra / high |
+| `critic` | Fresh-context adversarial review | Opus, medium effort | GPT-6 Astra / high |
+| `critic-risk` | Same review for risky work; the prompt needs a `RISK:` line | Fable, high effort | GPT-6 Astra / high |
 
 On Claude Code, scout is enforced: a frontmatter PreToolUse hook (`bin/role-guard.py`) limits Bash to the
 `bin/ro.py` read verbs (log, diff, show, status, blame, issues, issue, prs, pr) and fails closed if the
@@ -46,7 +47,7 @@ fetches a missing object on demand (`GIT_NO_LAZY_FETCH=1`), and `ro.py diff` doe
 Filter drivers from your own global config (for example git-lfs) still run. Critic, builder, and runner
 remain instruction-only.
 
-Turn caps (`maxTurns`) are builder 60, critic 40, scout 20, runner 15. Every Claude Code role also has
+Turn caps (`maxTurns`) are builder 60, critic 40, critic-risk 40, scout 20, runner 15. Every Claude Code role also has
 frontmatter hooks running `bin/turn-guard.py`: a `tick` on PostToolUse and PostToolUseFailure counts tool
 calls (approximately turns; it warns early in most runs) and nudges once per cap cycle at half the budget
 (save progress; skipped when the cap is under 12) and at cap minus 5 (write the final RESULT report now),
@@ -66,9 +67,9 @@ roles elsewhere, run on Haiku on Claude.
 The Claude installer sets `claude-opus-5-5` as the main-session default when no
 model is already selected in user settings; existing explicit choices remain
 untouched. Its named builder role uses Sonnet at `effort: low`, its scout and runner use Haiku at `effort: low`,
-and its critic uses Opus at `effort: medium` (Fable only when the brief passes `model: fable` with a `RISK:` line; the pin applies to that Fable run too, so risky reviews also run at medium, an owner trade-off made 2026-11-23); the pin keeps a required review at `medium` if that default or the critic's model changes. The read-only benchmark (`bin/compare-claude-readonly.py --efforts`) found Haiku matching
+its `critic` uses Opus at `effort: medium` (owner choice 2026-11-23) and the separate `critic-risk` role uses Fable at `effort: high` for risky reviews (the prompt needs a `RISK:` line); the pins keep each at its effort if the default or the role's model changes. The read-only benchmark (`bin/compare-claude-readonly.py --efforts`) found Haiku matching
 Sonnet on lookup tasks at about a twelfth of the cost, with no measurable gain from medium over low effort;
-the builder's `effort: low` follows `benchmarks/README.md`, "2026-11-15 builder and critic effort run"; the critic's `effort: medium` (owner choice 2026-11-23, down from the benchmarked `high`) trades some review depth for cost. `builder` is not in Jev's `pinned_agents`, and the route hook rewrites only the model, so a builder call that Jev upgrades to Opus or Fable still runs at `effort: low`. Opus and Fable at `effort: low` matched medium on the same small specified edits (one run per cell for Fable). Unpinned roles send their model's default effort (`medium` on Sonnet and Opus, `high` on Fable), not a session-wide value. Jev's default
+the builder's `effort: low` follows `benchmarks/README.md`, "2026-11-15 builder and critic effort run"; the `critic`'s `effort: medium` (owner choice 2026-11-23, down from the benchmarked `high`; `critic-risk` keeps `high`) trades some review depth for cost. `builder` is not in Jev's `pinned_agents`, and the route hook rewrites only the model, so a builder call that Jev upgrades to Opus or Fable still runs at `effort: low`. Opus and Fable at `effort: low` matched medium on the same small specified edits (one run per cell for Fable). Unpinned roles send their model's default effort (`medium` on Sonnet and Opus, `high` on Fable), not a session-wide value. Jev's default
 `pinned_agents` includes `scout` and `runner`, so routing never moves them off Haiku. Only those exact `subagent_type` names are held: with the default `respect_explicit_model: false`, a built-in agent called with `model: haiku` can still be upgraded by Jev. Roles and Jev tiers name the `sonnet` and `fable` aliases, so they
 follow the client's current model: Claude Code 2.1.284 resolves `sonnet` to
 Sonnet 5.5 (`claude-sonnet-5-5`), while 2.1.280 still resolves it to Sonnet 5.
@@ -234,7 +235,7 @@ not a number (numeric strings are accepted) falls back to its default.
 (`opus[1m]` becomes `opus`; other models are left alone) and merges these keys into
 the `jev` section of `relay/config.json`: `labels.fable: null` (routing never picks
 Fable), `builder` added to `pinned_agents` (starting from the default list when the key is
-absent), `fable_agents: ["critic"]` (unless a list is already set) and
+absent), `fable_agents: ["critic", "critic-risk"]` (unless a list is already set) and
 `upgrade_min_confidence` of at least `0.6` (a higher value is kept). The risk
 gate is unchanged. Other keys stay as they are and a repeat run changes nothing. Jev keys
 only take effect with `--jev`.
@@ -369,8 +370,8 @@ installed `relay/config.json`:
 | `min_confidence` | `0.5` | route: confidence needed when the current tier is unknown. Before the directional thresholds existed it applied to every move, so a custom value no longer governs upgrades or downgrades |
 | `escalate_mass` | `0.4` | route: when Jev keeps the current tier but the stronger tiers together reach this probability, move up to the likeliest of them (ties go to the stronger). Needs a known current tier |
 | `respect_explicit_model` | `false` | route: never override a call that already sets `model` (except the `fable_agents` clamp below). When `false`, such a call can still be upgraded but is never moved to a weaker tier when the hook can rank that model (a tier alias, `opusplan`, or a full `claude-*` id) |
-| `pinned_agents` | `["critic", "fork", "scout", "runner"]` | route: subagent types that are never rerouted. A list you set replaces the default, so keep `scout` and `runner` in it to hold them on Haiku. Matching is exact and case-sensitive: `Scout` or `plugin:scout` is not pinned |
-| `fable_agents` | `null` | route: when a list, an Agent call whose explicit `model` is a Fable model (`fable` or a `claude-fable-*` id) runs on `opus` unless its `subagent_type` is listed (no `subagent_type` counts as `general-purpose`; a trailing `[...]` suffix such as `fable[1m]` is ignored; matching is exact, so `Critic` is clamped). Applies to pinned agents too and needs no classifier answer; logged with `clamped`. An agent file that sets `model: fable` in its own frontmatter is left alone. `null` or a non-list turns it off, as do `enabled: false` and `features.route: false`. It checks only the incoming call: Jev routing or `inherit_fallback` can still choose Fable unless `labels.fable` is `null`, which `--lean` also sets. `--lean` sets `["critic"]` |
+| `pinned_agents` | `["critic", "critic-risk", "fork", "scout", "runner"]` | route: subagent types that are never rerouted. A list you set replaces the default, so keep `scout` and `runner` in it to hold them on Haiku. Matching is exact and case-sensitive: `Scout` or `plugin:scout` is not pinned |
+| `fable_agents` | `null` | route: when a list, an Agent call whose explicit `model` is a Fable model (`fable` or a `claude-fable-*` id) runs on `opus` unless its `subagent_type` is listed (no `subagent_type` counts as `general-purpose`; a trailing `[...]` suffix such as `fable[1m]` is ignored; matching is exact, so `Critic` is clamped). Applies to pinned agents too and needs no classifier answer; logged with `clamped`. An agent file that sets `model: fable` in its own frontmatter is left alone. `null` or a non-list turns it off, as do `enabled: false` and `features.route: false`. It checks only the incoming call: Jev routing or `inherit_fallback` can still choose Fable unless `labels.fable` is `null`, which `--lean` also sets. `--lean` sets `["critic", "critic-risk"]` |
 | `inherit_fallback` | `"sonnet"` | route: a `general-purpose`, `Explore` or `Plan` call (or one with no `subagent_type`) that sets no `model` would inherit the main session's model, unless an agent file (`<cwd>/.claude/agents/<name>.md` or `~/.claude/agents/<name>.md`) sets a `model` other than `inherit` or `CLAUDE_CODE_SUBAGENT_MODEL` is set to something other than `inherit` (the hook then skips the fallback for all three agents). While routing is on (`enabled` and `features.route`, with at least one label), such a call runs on this tier when Jev gives no usable answer: no key, an endpoint `endpoint_allowed` rejects, an error, a timeout, a malformed answer, an unknown label or an invalid confidence. A usable answer always wins, and one below threshold keeps inheriting. The tier need not be in `labels`, and it applies whatever the main model is, so a Haiku main session moves such calls up to Sonnet. `null` or a value other than `haiku`, `sonnet`, `opus` or `fable` turns it off. Pinned agents, explicit models and other agents are never touched. Agents defined only by `--agents`, by a file whose `name:` differs from its filename, or above `cwd` are not seen, so the hook treats an override of a built-in name made that way as inheriting |
 | `send_prompt`, `max_prompt_chars` | `true`, `6000` | route: send the truncated task prompt, or only the type and description |
 | `labels` | sonnet / opus / fable rubric | route: merged over the defaults. Set a tier to `null` to remove it. Only `sonnet`, `opus`, `haiku`, and `fable` are accepted. A removed tier's full model id (e.g. `claude-opus-4-1` with `opus` removed) can still be rewritten to a kept tier, as its alias would be. `opusplan` counts as the opus tier, so it is never rewritten to `opus` |
@@ -378,7 +379,7 @@ installed `relay/config.json`:
 | `send_diff`, `max_diff_chars` | `true`, `12000` | risk_gate: send the truncated diff, or only the operation and file names |
 | `risk_min_probability` | `0.6` | risk_gate and the pre-push hook: minimum "needs review" probability to deny |
 | `risk_confident_class`, `risk_confident_min_probability` | `0.9`, `0.5` | risk_gate and the pre-push hook: when Jev's confidence in the risk category reaches `risk_confident_class`, the lower `risk_confident_min_probability` is enough to deny. A small change to an auth check is rated almost certainly `security` but only about as likely as not to need review. The rule only adds denials: it never raises `risk_min_probability`. To turn it off, set `risk_confident_min_probability` equal to `risk_min_probability` (no value of `risk_confident_class` turns it off). On upgrade the defaults apply to a `config.json` without these keys, so a change whose risk category is not `none`, rated with a confidence of at least `risk_confident_class`, and with a "needs review" probability from `risk_confident_min_probability` up to `risk_min_probability` is now denied |
-| `report_roles` | scout, runner, builder, critic | report_check: roles whose reports are checked |
+| `report_roles` | scout, runner, builder, critic, critic-risk | report_check: roles whose reports are checked |
 | `report_min_support`, `report_max_gap` | `0.5`, `0.5` | report_check: evidence-support floor and material-gap ceiling |
 | `max_report_chars` | `8000` | report_check: report text considered |
 | `handoff_min_score` | `2` | handoff_grade: minimum score (0–4) to save without `--accept-weak` |
@@ -902,7 +903,7 @@ runner. No credentials are included.
 | `codex/install.sh`, `codex/install.py`, `codex/config.example.toml` | Codex installation and new-home defaults |
 | `codex/PROMPT.md`, `codex/CONTEXT-GAUGE.md` | Validation brief and optional gauge proposal |
 | `docs/codex-reference.md`, `docs/client-validation.md` | Port history and native client acceptance checks |
-| `bin/spawn-guard.py` | `PreToolUse` `Agent\|Task` hook, always installed: denies `general-purpose`/`claude` spawns without a `ROLE-EXCEPTION:` line and a Fable critic without a `RISK:` line |
+| `bin/spawn-guard.py` | `PreToolUse` `Agent\|Task` hook, always installed: denies `general-purpose`/`claude` spawns without a `ROLE-EXCEPTION:` line and a Fable critic or `critic-risk` without a `RISK:` line |
 | `bin/pr-status` | Shared PR/CI helper |
 | `bin/session-focus.py` | Switch VS Code to a running Claude Code session's tab (used by `/sessions`) |
 | `bin/rollover-open.py`, `vscode/handoff-bridge/` | Shared handoff protocol and VS Code tab bridge |

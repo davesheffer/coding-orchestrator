@@ -77,6 +77,8 @@ except ImportError:
 # in claude/install.py, leaving margin for interpreter start-up.
 GATE_BUDGET_SECONDS = 8.0
 SHORT_HOOK_BUDGET_SECONDS = 4.0
+# Roles whose handback feeds the critic ledger and the risk gate.
+CRITIC_ROLES = ("critic", "critic-risk")
 # Per-call timeout of each git subprocess run by _run_git (still capped by the
 # invocation's shared deadline). Tests raise it so a loaded host does not time out git.
 GIT_CALL_SECONDS = 2.0
@@ -3395,7 +3397,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     session_id = payload.get("session_id")
 
     if tool_name == "SubagentHandback":
-        if payload.get("agent_type") == "critic" and feature_enabled(cfg, "risk_gate"):
+        if payload.get("agent_type") in CRITIC_ROLES and feature_enabled(cfg, "risk_gate"):
             agent_id = payload.get("agent_id")
             now_value = now()
             launch = {}
@@ -3450,7 +3452,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
     if isinstance(tool_response, dict):
         status = tool_response.get("status")
         if status == "async_launched":
-            if subagent_type == "critic" and feature_enabled(cfg, "risk_gate"):
+            if subagent_type in CRITIC_ROLES and feature_enabled(cfg, "risk_gate"):
                 agent_id = tool_response.get("agentId") or tool_response.get("agent_id")
                 now_value = now()
                 state_path = session_state_path(session_id, state_dir)
@@ -3557,7 +3559,7 @@ def agent_done(payload, cfg, classify_fn=None, log_fn=None, now=time.time, state
             return None
     completed = tool_response
 
-    if subagent_type == "critic" and feature_enabled(cfg, "risk_gate"):
+    if subagent_type in CRITIC_ROLES and feature_enabled(cfg, "risk_gate"):
         # The launched critic's own id, as the launch reads it. Never the payload's
         # agent_id: that can name the caller (a subagent that launched this critic),
         # whose launch time and snapshot belong to its own later report.

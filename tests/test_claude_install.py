@@ -74,7 +74,7 @@ class ClaudeInstallTests(unittest.TestCase):
                     for group in groups for h in group["hooks"] if "spawn-guard.py" not in h["command"]]
         self.assertTrue(all(str(self.home / "relay/relay.py") in command for command in commands))
         self.assertTrue(all("$HOME/.claude" not in command for command in commands))
-        for role in ("scout", "runner", "builder", "critic"):
+        for role in ("scout", "runner", "builder", "critic", "critic-risk"):
             self.assertTrue((self.home / "agents" / f"{role}.md").exists())
         helper = self.home / "bin/pr-status"
         self.assertEqual((self.home / "bin/rollover-open.py").read_bytes(),
@@ -113,8 +113,8 @@ class ClaudeInstallTests(unittest.TestCase):
         guard = (self.home / "bin/turn-guard.py").as_posix()
         self.assertEqual((self.home / "bin/turn-guard.py").read_bytes(), (ROOT / "bin/turn-guard.py").read_bytes())
         routing = {"scout": ("haiku", "low"), "runner": ("haiku", "low"),
-                   "builder": ("sonnet", "low"), "critic": ("opus", "medium")}
-        for name, cap in (("scout", 20), ("runner", 15), ("builder", 60), ("critic", 40)):
+                   "builder": ("sonnet", "low"), "critic": ("opus", "medium"), "critic-risk": ("fable", "high")}
+        for name, cap in (("scout", 20), ("runner", 15), ("builder", 60), ("critic", 40), ("critic-risk", 40)):
             text = (self.home / "agents" / f"{name}.md").read_text(encoding="utf-8")
             self.assertNotIn("__TURN_GUARD__", text)
             front = text.replace("\r\n", "\n").split("---\n")[1]
@@ -1014,9 +1014,9 @@ class ClaudeInstallTests(unittest.TestCase):
         jev = self.read_json("relay/config.json")["jev"]
         self.assertTrue(jev["enabled"])
         self.assertEqual(jev["labels"], {"fable": None})
-        self.assertEqual(jev["pinned_agents"], ["critic", "fork", "scout", "runner", "builder"])
+        self.assertEqual(jev["pinned_agents"], ["critic", "critic-risk", "fork", "scout", "runner", "builder"])
         self.assertEqual(jev["upgrade_min_confidence"], 0.6)
-        self.assertEqual(jev["fable_agents"], ["critic"])
+        self.assertEqual(jev["fable_agents"], ["critic", "critic-risk"])
         self.assertNotIn("risk_min_probability", jev)
 
     def test_lean_drops_only_the_long_context_suffix(self):
@@ -1047,7 +1047,7 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(config["jev"], {"enabled": True, "log": False,
                                          "labels": {"opus": "custom rubric", "fable": None},
                                          "pinned_agents": ["critic", "scout", "builder"],
-                                         "fable_agents": ["critic"],
+                                         "fable_agents": ["critic", "critic-risk"],
                                          "upgrade_min_confidence": 0.6})
         before = self.home.joinpath("relay/config.json").read_bytes()
         result = self.run_install("--jev", "--lean")

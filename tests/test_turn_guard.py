@@ -120,7 +120,7 @@ class TurnGuardTests(unittest.TestCase):
         self.assertIn("nearly spent", messages[4])
 
     def test_critic_and_scout_are_not_told_to_write_a_file(self):
-        for role in ("critic", "scout"):
+        for role in ("critic", "critic-risk", "scout"):
             messages = [self.context(self.tick(20, agent=role, agent_type=role)) for _ in range(15)]
             half, last = messages[9], messages[14]
             self.assertIn("findings so far in your final message", half)

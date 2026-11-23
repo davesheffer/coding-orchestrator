@@ -28,7 +28,8 @@ building. Works with **Claude Code** and **Codex**.
 | `scout` | Finds and reads code | Haiku | GPT-6 Luna |
 | `runner` | Runs tests and builds, reports exact results | Haiku | GPT-6 Luna |
 | `builder` | Makes a change that's already been decided | Sonnet | GPT-6.1 Sol |
-| `critic` | Fresh eyes: tries to prove the work is wrong | Opus (Fable for `RISK:` reviews) | GPT-6 Astra |
+| `critic` | Fresh eyes: tries to prove the work is wrong | Opus, medium effort | GPT-6 Astra |
+| `critic-risk` | Same review for risky work (security, migrations, data loss, concurrency, public API, irreversible); needs a `RISK:` line | Fable, high effort | GPT-6 Astra |
 
 ## 🚀 Quick start
 

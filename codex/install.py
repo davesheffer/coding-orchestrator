@@ -21,10 +21,10 @@ from pathlib import Path
 
 START = b"<!-- CODEX-ORCHESTRATOR:START -->"
 END = b"<!-- CODEX-ORCHESTRATOR:END -->"
-ROLE_NAMES = ("scout", "runner", "builder", "critic")
+ROLE_NAMES = ("scout", "runner", "builder", "critic", "critic-risk")
 ROLE_SANDBOX = {
     "scout": "read-only", "runner": "workspace-write",
-    "builder": "workspace-write", "critic": "read-only",
+    "builder": "workspace-write", "critic": "read-only", "critic-risk": "read-only",
 }
 DISABLED_FEATURES = (
     'apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_external',
@@ -273,7 +273,7 @@ def merge_jev_hooks(path: Path, prior: bytes | None, dest: Path, enabled: bool) 
     command = hook_command(dest)
     script = str(dest / "bin" / "jev-hook.py")
     events = {"PreToolUse": (JEV_SHELL_MATCHER + "|Agent|Task|spawn_agent", 10),
-              "SubagentStart": ("critic", 5), "SubagentStop": ("scout|runner|builder|critic", 5),
+              "SubagentStart": ("critic|critic-risk", 5), "SubagentStop": ("scout|runner|builder|critic|critic-risk", 5),
               "UserPromptSubmit": (None, 5)}
     result = {name: list(groups) if isinstance(groups, list) else fail(f"invalid hook groups in {path}")
               for name, groups in hooks.items()}

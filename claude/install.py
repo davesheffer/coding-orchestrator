@@ -22,7 +22,7 @@ from pathlib import Path
 
 START = b"<!-- CLAUDE-ORCHESTRATOR:START -->"
 END = b"<!-- CLAUDE-ORCHESTRATOR:END -->"
-ROLE_NAMES = ("scout", "runner", "builder", "critic")
+ROLE_NAMES = ("scout", "runner", "builder", "critic", "critic-risk")
 # Accept upstream bytes and the earlier reconstruction with one extra newline.
 LEGACY_CLAUDE_HASHES = {
     "2d088cea485f8163401de27809757fe692c647278234a5fc5f353f9af10270c9",
@@ -60,10 +60,10 @@ JEV_SCRIPTS = ("jev_client.py", "jev-route.py", "jev-guard.py", "jev-report.py",
 # --lean: Claude Code's long-context model suffix, and the Jev keys it merges into relay/config.json.
 LONG_CONTEXT_SUFFIX = "[1m]"
 # Mirrors jev_client.DEFAULTS["pinned_agents"]; a list a user sets replaces that default.
-JEV_DEFAULT_PINNED = ("critic", "fork", "scout", "runner")
+JEV_DEFAULT_PINNED = ("critic", "critic-risk", "fork", "scout", "runner")
 LEAN_PINNED = ("builder",)
 # Agents allowed to run on an explicitly requested Fable model; a list the user set is kept.
-LEAN_FABLE_AGENTS = ("critic",)
+LEAN_FABLE_AGENTS = ("critic", "critic-risk")
 # Floors: a stricter (higher) value the user already set is kept.
 LEAN_JEV_NUMBERS = {"upgrade_min_confidence": 0.6}
 

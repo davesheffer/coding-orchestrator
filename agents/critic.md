@@ -1,6 +1,6 @@
 ---
 name: critic
-description: Fresh adversarial review of a risky diff or unresolved claim, read-only by instruction; Bash is not sandboxed. Reserve for security, migrations, concurrency, data-loss risk, public APIs, or low-confidence conclusions.
+description: Fresh adversarial review of a diff or unresolved claim (the routine pre-push pass), read-only by instruction; Bash is not sandboxed. Risky work (security, migrations, concurrency, data loss, public APIs, irreversible operations) goes to critic-risk.
 model: opus
 effort: medium
 tools: Read, Grep, Glob, Bash

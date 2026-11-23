@@ -63,7 +63,7 @@ DEFAULTS = {
     "escalate_mass": 0.4,
     "respect_explicit_model": False,
     # scout and runner are pinned so Jev never moves them off Haiku (scout was benchmarked on lookups).
-    "pinned_agents": ["critic", "fork", "scout", "runner"],
+    "pinned_agents": ["critic", "critic-risk", "fork", "scout", "runner"],
     # route: when a list, an Agent call that names a Fable model for any other agent runs on
     # opus instead (null: off). --lean sets ["critic"].
     "fable_agents": None,
@@ -94,7 +94,7 @@ DEFAULTS = {
     "risk_confident_class": 0.9,
     "risk_confident_min_probability": 0.5,
     # report_check
-    "report_roles": ["scout", "runner", "builder", "critic"],
+    "report_roles": ["scout", "runner", "builder", "critic", "critic-risk"],
     "report_min_support": 0.5,
     "report_max_gap": 0.5,
     "max_report_chars": 8000,
@@ -134,6 +134,12 @@ def load_config(path=CONFIG_PATH):
     cfg["features"] = features
     if not isinstance(cfg.get("pinned_agents"), list):
         cfg["pinned_agents"] = []
+    # critic-risk is critic's risky-work sibling: a user list written before it existed that
+    # names critic covers critic-risk too, so it keeps its pin, reports and Fable allowance.
+    for key in ("pinned_agents", "report_roles", "fable_agents"):
+        roles = cfg.get(key)
+        if isinstance(roles, list) and "critic" in roles and "critic-risk" not in roles:
+            cfg[key] = [*roles, "critic-risk"]
     # A bad number falls back to its default, so it can't make every hook raise (and fail open
     # silently) later.
     for key in THRESHOLDS:

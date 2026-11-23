@@ -1,6 +1,6 @@
 # Codex role translated from the bundled agents/critic.md.
 name = "critic"
-description = "Fresh, read-only adversarial review of a risky diff or unresolved claim. Reserve for security, migrations, concurrency, data-loss risk, public APIs, or low-confidence conclusions."
+description = "Fresh, read-only adversarial review of a diff or unresolved claim (the routine pre-push pass). Risky work (security, migrations, concurrency, data loss, public APIs, irreversible operations) goes to critic-risk."
 model = "gpt-6-astra"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"

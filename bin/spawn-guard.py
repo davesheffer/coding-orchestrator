@@ -25,13 +25,13 @@ HEAVY_REASON = (
     "spawn-guard: `{kind}` starts with every tool and skill loaded (about 58K tokens against "
     "about 23K for a named role). Use a named role instead: implementer or plan/document "
     "writing -> builder (add `model: opus` for a plan), lookup or summary -> scout, exact "
-    "command -> runner, review -> critic (with `model: opus` unless risky). If this task truly "
+    "command -> runner, review -> critic (opus; critic-risk for risky work). If this task truly "
     "needs tools no role has, add a "
     "line `ROLE-EXCEPTION: <reason>` to the prompt and spawn again."
 )
 FABLE_REASON = (
-    "spawn-guard: a Fable critic is reserved for risky work. For a routine pre-push pass set "
-    "`model: opus`; for a per-task review inside a plan set `model: sonnet` and leave out "
+    "spawn-guard: a Fable critic (the `critic-risk` role) is reserved for risky work. For a routine "
+    "pre-push pass use `critic` (opus); for a per-task review inside a plan set `model: sonnet` and leave out "
     "REVIEW-SCOPE. If this is risky work (security/auth, migration, data loss, concurrency, "
     "public API, irreversible) or a low-confidence conclusion, add a line "
     "`RISK: <category>` to the prompt and spawn again."
@@ -111,8 +111,8 @@ def decide(payload, home=ROOT):
         if EXCEPTION.search(prompt):
             return None
         return HEAVY_REASON.format(kind=kind or "general-purpose (no subagent_type)")
-    if kind == "critic":
-        model = str(tool_input.get("model") or "").lower() or frontmatter_model("critic", home, payload.get("cwd"))
+    if kind in ("critic", "critic-risk"):
+        model = str(tool_input.get("model") or "").lower() or frontmatter_model(kind, home, payload.get("cwd"))
         if "fable" in model and not RISK.search(prompt):
             return FABLE_REASON
     return None
