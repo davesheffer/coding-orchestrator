@@ -10,7 +10,7 @@ The main session owns the request, design, root cause, judgment, verification, a
 | Locate, read, summarize | scout | Haiku |
 | Run exact test/build commands and distill output | runner | Haiku |
 | Implement an already specified change | builder | Sonnet |
-| Adversarial review of risky changes or claims | critic | Fable |
+| Adversarial review of risky changes or claims | critic | Opus (Fable via `model: fable` + `RISK:` line for risky work) |
 | Design, ambiguity, security/concurrency decisions | main session | Opus 5.5 |
 
 Use the installed named roles. For built-in agents, explicitly select `haiku` for exact checks and lookups and `sonnet` for bounded analysis and specified implementation; reserve `fable` for the critic on risky work (routine pre-push critic passes use `opus`, see Briefing and trust). Never pass `model: fable` to builder, scout, runner, general-purpose or a fork: a builder whose brief needs Fable-level judgment means the design is not settled, so settle it in the main session first (with `--jev --lean`, the route hook moves such a call to `opus`). The main session uses `claude-opus-5-5`. Avoid expensive model inheritance for bounded work. If a Fable critic fails with a rate limit or overload (429/529), retry it once; if it fails again, run the same fresh critic brief on `opus` and report the substitution with the verdict. Never skip a required review or replace it with a self-review.
