@@ -49,6 +49,19 @@ class SpawnGuardTests(unittest.TestCase):
         prompt = "review\nRISK: security\n"
         self.assertIsNone(guard.decide(spawn(prompt, subagent_type="critic", model="fable")))
 
+    def test_critic_risk_fable_without_risk_denied(self):
+        reason = guard.decide(spawn(subagent_type="critic-risk", model="fable"))
+        self.assertIn("RISK", reason)
+        self.assertIn("critic-risk", reason)
+
+    def test_critic_risk_frontmatter_fable_denied_then_allowed_with_risk(self):
+        home = Path(tempfile.mkdtemp())
+        (home / "agents").mkdir()
+        (home / "agents" / "critic-risk.md").write_text(
+            "---\nname: critic-risk\nmodel: fable\n---\n", encoding="utf-8")
+        self.assertIn("RISK", guard.decide(spawn(subagent_type="critic-risk"), home=home))
+        self.assertIsNone(guard.decide(spawn("review\nRISK: data loss\n", subagent_type="critic-risk"), home=home))
+
     def test_critic_opus_allowed(self):
         self.assertIsNone(guard.decide(spawn(subagent_type="critic", model="opus")))
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ROLES = ("scout", "runner", "builder", "critic")
+ROLES = ("scout", "runner", "builder", "critic", "critic-risk")
 
 
 def frontmatter(path):
@@ -27,6 +27,7 @@ class BundleContractTests(unittest.TestCase):
             "runner": ("haiku", "gpt-6-luna", "workspace-write"),
             "builder": ("sonnet", "gpt-6.1-sol", "workspace-write"),
             "critic": ("opus", "gpt-6-astra", "read-only"),
+            "critic-risk": ("fable", "gpt-6-astra", "read-only"),
         }
         for name in ROLES:
             with self.subTest(role=name):

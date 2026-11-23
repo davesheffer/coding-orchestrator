@@ -3241,6 +3241,20 @@ class AgentDoneTests(unittest.TestCase):
         state = jev.load_session_state("sess1", self.state_dir)
         self.assertGreaterEqual(state["critic_ts"], before)
 
+    def test_posttooluse_handback_critic_risk_sets_critic_ts(self):
+        before = time.time()
+        out = self.agent_done(self.handback_payload(agent_type="critic-risk"))
+        self.assertIsNone(out)
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertGreaterEqual(state["critic_ts"], before)
+
+    def test_async_launch_critic_risk_records_critic_started(self):
+        payload = self.report_payload(subagent_type="critic-risk", status="async_launched")
+        payload["tool_response"]["agentId"] = "crit-1"
+        self.agent_done(payload)
+        state = jev.load_session_state("sess1", self.state_dir)
+        self.assertIn("crit-1", state["critic_started"])
+
     def test_posttooluse_handback_builder_does_nothing(self):
         out = self.agent_done(self.handback_payload(agent_type="builder"))
         self.assertIsNone(out)

@@ -12,7 +12,8 @@ Own the request, design, root cause, judgment, verification, and final answer. D
 | Locate, read, summarize | scout | gpt-6-luna / low |
 | Run an exact test/build command and report results | runner | gpt-6-luna / low |
 | Implement an already specified change | builder | gpt-6.1-sol / medium |
-| Adversarial review of risky changes or claims | critic | gpt-6-astra / high |
+| Adversarial review of routine changes (pre-push pass) | critic | gpt-6-astra / high |
+| Adversarial review of risky work (security/auth, migrations, data loss, concurrency, public APIs, irreversible operations) | critic-risk | gpt-6-astra / high |
 | Design, ambiguity, root cause, security/concurrency decisions | main session | gpt-6.1-sol / medium; escalate demanding cases to Astra |
 
 - Select installed native roles in `~/.codex/agents/*.toml`. If using a built-in role, explicitly supply the configured model, reasoning, role instructions, and brief through supported host parameters. Never invent parameters or silently use an expensive inherited model for easy work.
@@ -37,18 +38,18 @@ UNVERIFIED: remaining gaps, or none
 
 Read builder diffs yourself and require an acceptance check after the final edit. Missing reports, low/medium confidence, or material UNVERIFIED claims require direct verification or escalation (scout/runner to builder/main; builder to main), not the same retry. Escalation never expands authority.
 
-Risky or irreversible work (security/auth, data migrations or data-loss paths, concurrency, public API changes, irreversible operations) needs a critic pass before being called done. Every other code change gets one critic pass on the final diff before push, not one per fix round: fix its findings and rerun the checks, and run the critic again only when it reported a blocker. Docs- and comment-only changes get no critic. Resolve findings and preserve `SHIP | FIX FIRST | RETHINK` plus `[blocker|major|minor] path:line` evidence. Distinguish reproduced failures from suspicions; never invent a verdict.
+Risky or irreversible work (security/auth, data migrations or data-loss paths, concurrency, public API changes, irreversible operations) needs a critic-risk pass before being called done. Every other code change gets one critic pass on the final diff before push, not one per fix round: fix its findings and rerun the checks, and run the critic again only when it reported a blocker. Docs- and comment-only changes get no critic. Resolve findings and preserve `SHIP | FIX FIRST | RETHINK` plus `[blocker|major|minor] path:line` evidence. Distinguish reproduced failures from suspicions; never invent a verdict.
 
 Keep push, publish, deploy, delete, and send actions in the main session within existing user authorization. Batch genuinely outstanding approvals into one brief: PR, fix, CI, critic verdict, order, decisions. Continue independent authorized work while waiting. State the actual work split and unresolved verification briefly in the final answer.
 
 ## Permission boundaries
 
-Scout/critic require read-only. Runner/builder require workspace-write restricted to the repository. Runner may create artifacts from its exact check; it must not edit source, install dependencies, or repair failures. Subagents have network disabled unless explicitly authorized.
+Scout/critic/critic-risk require read-only. Runner/builder require workspace-write restricted to the repository. Runner may create artifacts from its exact check; it must not edit source, install dependencies, or repair failures. Subagents have network disabled unless explicitly authorized.
 
 Verify effective permissions before delegation: parent overrides can supersede role settings. Prompts do not enforce isolation. On Windows, if native boundaries cannot be verified, use the installed launcher immediately instead of doing delegation-sized work on the main model:
 
 ```text
-python <CODEX_HOME>/bin/agent-run.py <scout|runner|builder|critic> --cd <repository> --brief <brief.txt>
+python <CODEX_HOME>/bin/agent-run.py <scout|runner|builder|critic|critic-risk> --cd <repository> --brief <brief.txt>
 ```
 
 Resolve CODEX_HOME from the environment or ~/.codex. The UTF-8 brief must name the task, file ownership, applicable project rules, acceptance command and expected report. The launcher probes restricted backends, verifies filesystem/tool boundaries and records actual model/effort and exit results in ~/.codex/agent-runs/. `--probe-only` checks boundaries without a model call; `--no-network-fallback` requires isolation even if local approval exists. Its runtime is Windows-only; on other platforms use verified native roles or a separately restricted `codex exec` with the native role's model, reasoning, developer instructions, and brief. Set `--cd`, `-s read-only` or `-s workspace-write`, and explicit configuration:
@@ -69,10 +70,10 @@ Verify the resulting sandbox and network restrictions. If a restricted runtime i
 ### Launcher model and network fallbacks
 
 - Fresh installs default unnamed subagents to Luna/low; named roles retain their own settings. Existing configurations are preserved unless the user opts into `--configure-routing`, which fills missing subagent model/effort defaults while preserving explicit choices.
-- The Windows launcher tries scout/runner on Luna -> 6.1 Sol -> 6 Sol, builder on 6.1 Sol -> 6 Sol, and critic on Astra only. Only a recognized model-unavailable error before any work can advance the chain. Authentication/rate limits, failed tests, started work, malformed logs and unknown errors return to the main session without an automatic retry. Inspect partial edits and evidence before continuing. No silent Astra fallback for routine work.
+- The Windows launcher tries scout/runner on Luna -> 6.1 Sol -> 6 Sol, builder on 6.1 Sol -> 6 Sol, and critic/critic-risk on Astra only. Only a recognized model-unavailable error before any work can advance the chain. Authentication/rate limits, failed tests, started work, malformed logs and unknown errors return to the main session without an automatic retry. Inspect partial edits and evidence before continuing. No silent Astra fallback for routine work.
 - Network fallback is off by default for every role. If isolation fails but file limits hold, explain that the shell could access the network even with web tools disabled. Ask which roles, if any, may use that exception and whether to remember the choice. Existing session authorization is sufficient; never ask again for approval already given. Installation, `--force`, repository examples and silence do not grant consent.
 - Store remembered launcher approval only in the user-owned ~/.codex/agent-routing.json `network_fallback_roles` list. An empty list denies fallback. List only roles the user explicitly approved; removing a role revokes its exception. The installer creates an empty policy and preserves existing policies even during forced upgrades. Never copy another user's policy into this bundle. Reconcile any conflicting saved instructions with the user's latest answer before updating the policy.
-- The launcher requires that Codex home be outside the delegated workspace. It always attempts isolation first and never relaxes filesystem restrictions. Scout/critic stay read-only; runner/builder can write only in the named workspace. Effective web/MCP/apps/plugins/browser/computer/image/nested-agent tools remain disabled. Agents must make no external requests; report missing network isolation under UNVERIFIED. Config errors or failed file/tool checks never authorize a weaker launch.
+- The launcher requires that Codex home be outside the delegated workspace. It always attempts isolation first and never relaxes filesystem restrictions. Scout/critic/critic-risk stay read-only; runner/builder can write only in the named workspace. Effective web/MCP/apps/plugins/browser/computer/image/nested-agent tools remain disabled. Agents must make no external requests; report missing network isolation under UNVERIFIED. Config errors or failed file/tool checks never authorize a weaker launch.
 - Report which models actually ran, the fallback used, and unresolved checks. A zero CLI exit says the agent finished, not that its task passed: inspect RESULT, exact command exit codes and builder diffs. The launcher verifies model identity using the local CLI thread database; unknown identity remains unverified.
 
 ### Optional critic network fallback

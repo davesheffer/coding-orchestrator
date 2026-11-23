@@ -521,7 +521,7 @@ class DecideTests(unittest.TestCase):
         cfg = self.load({"labels": {"gpt": "y", "haiku": "tiny"}, "min_confidence": 0.9})
         self.assertEqual(set(cfg["labels"]), {"sonnet", "opus", "fable", "haiku"})
         self.assertEqual(cfg["min_confidence"], 0.9)
-        self.assertEqual(cfg["pinned_agents"], ["critic", "fork", "scout", "runner"])
+        self.assertEqual(cfg["pinned_agents"], ["critic", "critic-risk", "fork", "scout", "runner"])
 
     def test_partial_label_override_keeps_other_defaults(self):
         cfg = self.load({"labels": {"opus": "custom opus rubric"}})

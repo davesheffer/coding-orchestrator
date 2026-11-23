@@ -40,6 +40,20 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(cfg["shift_low"], 0.1)
         self.assertFalse(jev_client.feature_enabled(self.config({"enabled": False}), "route"))
 
+    def test_explicit_lists_naming_critic_cover_critic_risk(self):
+        old = ["critic", "scout"]
+        cfg = self.config({"pinned_agents": old, "report_roles": old, "fable_agents": ["critic"]})
+        self.assertEqual(cfg["pinned_agents"], ["critic", "scout", "critic-risk"])
+        self.assertEqual(cfg["report_roles"], ["critic", "scout", "critic-risk"])
+        self.assertEqual(cfg["fable_agents"], ["critic", "critic-risk"])
+        # A list without critic is a deliberate choice and stays as written; no duplicates.
+        cfg = self.config({"pinned_agents": ["scout"], "report_roles": ["critic", "critic-risk"],
+                           "fable_agents": []})
+        self.assertEqual(cfg["pinned_agents"], ["scout"])
+        self.assertEqual(cfg["report_roles"], ["critic", "critic-risk"])
+        self.assertEqual(cfg["fable_agents"], [])
+        self.assertIsNone(jev_client.load_config(self.dir / "missing.json")["fable_agents"])
+
     def test_bad_thresholds_fall_back_to_defaults(self):
         keys = ("min_confidence", "upgrade_min_confidence", "downgrade_min_confidence", "escalate_mass",
                 "shift_low", "shift_high", "risk_min_probability", "risk_confident_class",

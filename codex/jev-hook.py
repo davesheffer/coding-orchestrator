@@ -29,7 +29,7 @@ MODELS = {"luna": "gpt-6-luna", "sol": "gpt-6.1-sol", "astra": "gpt-6-astra"}
 RANK = {"luna": 0, "sol": 1, "astra": 2}
 INSTRUCTIONS = ("Choose the least expensive Codex model that will reliably complete this task well; "
                 "when torn between two models, choose the stronger one.")
-PINNED = {"scout", "runner", "builder", "critic"}
+PINNED = {"scout", "runner", "builder", "critic", "critic-risk"}
 # Codex shell tool names; codex/install.py's PreToolUse matcher must list the same names.
 SHELL_TOOLS = ("Bash", "PowerShell", "shell", "local_shell", "exec_command")
 LABELS = {
@@ -181,7 +181,7 @@ def risk(payload, cfg, classify_fn=None):
 
 
 def subagent_start(payload, cfg):
-    if payload.get("agent_type") != "critic" or not client.feature_enabled(cfg, "risk_gate"):
+    if payload.get("agent_type") not in ("critic", "critic-risk") or not client.feature_enabled(cfg, "risk_gate"):
         return None
     guard = guard_module()
     deadline = time.monotonic() + guard.SHORT_HOOK_BUDGET_SECONDS
@@ -203,7 +203,7 @@ def subagent_stop(payload, cfg, classify_fn=None):
         return None
     guard = guard_module()
     deadline = time.monotonic() + guard.SHORT_HOOK_BUDGET_SECONDS
-    if role == "critic" and client.feature_enabled(cfg, "risk_gate"):
+    if role in ("critic", "critic-risk") and client.feature_enabled(cfg, "risk_gate"):
         sid, aid = payload.get("session_id"), payload.get("agent_id")
         if sid and aid:
             def complete(s):

@@ -17,7 +17,7 @@ Local environment: Windows, Python 3.12, Codex CLI 0.155.1, Claude Code 2.1.278.
 > Historical snapshot: the test and job counts below describe the commit tested at
 > the time and are not current. Role models named in this record (Haiku scout and
 > Sonnet runner in the 2.1.278 row, Sonnet scout in the 2.1.280 row) reflect the routing then in effect; the current routing is
-> scout and runner on Haiku (low effort), builder on Sonnet (low effort), critic on Opus (medium effort; Fable via `model: fable` + `RISK:`, also at medium).
+> scout and runner on Haiku (low effort), builder on Sonnet (low effort), critic on Opus (medium effort); critic-risk on Fable (high effort, `RISK:` line).
 
 Each installer was run against a disposable assistant home; no credentials were
 copied into that home or into this repository.

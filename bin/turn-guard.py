@@ -25,7 +25,7 @@ STATE = Path(__file__).resolve().parent.parent / "state" / "turn-guard"
 REPORT = re.compile(r"^[ \t#>\-*_`|]{0,40}(?:\d+[.)][ \t]*)?[ \t*_`]{0,40}(?:RESULT|VERDICT)[*_`|]*[ \t]*(?::|\||\r?$)",
                     re.I | re.M)
 MAX_AGE = 24 * 3600
-READ_ONLY = ("critic", "scout")
+READ_ONLY = ("critic", "critic-risk", "scout")
 HALF = "Turn budget: {count} of ~{max} tool calls used. {save}, then continue."
 LAST = ("Turn budget nearly spent ({count} of ~{max} tool calls). Write your report now ({where}): RESULT / "
         "EVIDENCE / CONFIDENCE / UNVERIFIED (critic: VERDICT line). Then finish only what fits in the "

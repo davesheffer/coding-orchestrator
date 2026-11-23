@@ -24,6 +24,7 @@ MODELS = {
     'runner': [('gpt-6-luna', 'low'), ('gpt-6.1-sol', 'low'), ('gpt-6-sol', 'low')],
     'builder': [('gpt-6.1-sol', 'medium'), ('gpt-6-sol', 'medium')],
     'critic': [('gpt-6-astra', 'high')],
+    'critic-risk': [('gpt-6-astra', 'high')],
 }
 DISABLED = ('apps', 'plugins', 'remote_plugin', 'browser_use', 'browser_use_external',
             'browser_use_full_cdp_access', 'in_app_browser', 'computer_use',
